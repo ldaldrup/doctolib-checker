@@ -8,6 +8,8 @@ import urllib.parse
 from datetime import date
 import requests
 from colorama import init, Fore, Style
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Initialize colorama
 init(autoreset=True)
@@ -212,17 +214,47 @@ def fetch_slot_total(booking_url, config):
 
 # --- 5. Notifications & Telegram ---
 
+def create_session():
+    """Create a requests.Session with retry strategy and connection pooling."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,                    # max retry attempts
+        backoff_factor=2,           # exponential: 2, 4, 8, 16, 32 seconds
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+# Create a module-level session for connection reuse
+TELEGRAM_SESSION = None
+
+
+def get_telegram_session():
+    global TELEGRAM_SESSION
+    if TELEGRAM_SESSION is None:
+        TELEGRAM_SESSION = create_session()
+    return TELEGRAM_SESSION
+
+
 def should_notify(prev_state, new_total):
     prev_notified = prev_state.get('last_notified_total', 0)
     if new_total > 0 and (prev_notified == 0 or new_total > prev_notified):
         return True
     return False
 
-def send_telegram(config, text):
+
+def send_telegram(config, text, max_attempts=5):
+    """Send a Telegram message with manual retry on connection errors."""
     token = config.get('telegram_bot_token')
     chat_id = config.get('telegram_chat_id')
     if not token or not chat_id:
-        return
+        logging.warning("Telegram credentials missing. Skipping notification.")
+        return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -231,8 +263,50 @@ def send_telegram(config, text):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    resp = requests.post(url, json=payload, timeout=10)
-    resp.raise_for_status()
+    headers = {
+        "User-Agent": "Doctolib-Checker/1.0",
+        "Connection": "keep-alive",
+    }
+
+    session = get_telegram_session()
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.post(url, json=payload, headers=headers, timeout=30)
+
+            # Check for Telegram API errors (e.g., bad token, bad chat_id)
+            if resp.status_code != 200:
+                try:
+                    err_data = resp.json()
+                    err_desc = err_data.get('description', 'Unknown error')
+                except Exception:
+                    err_desc = resp.text[:200]
+
+                # 401/404 = permanent errors, no point retrying
+                if resp.status_code in (401, 403, 404):
+                    logging.error(f"Telegram API permanent error ({resp.status_code}): {err_desc}")
+                    logging.error("Check your bot token and chat ID in config.json.")
+                    return False
+
+                logging.warning(f"Telegram API returned {resp.status_code}: {err_desc} (attempt {attempt}/{max_attempts})")
+            else:
+                return True  # success
+
+        except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
+            logging.warning(f"Connection error on attempt {attempt}/{max_attempts}: {e}")
+        except requests.exceptions.Timeout:
+            logging.warning(f"Timeout on attempt {attempt}/{max_attempts}")
+        except Exception as e:
+            logging.error(f"Unexpected error sending Telegram message (attempt {attempt}/{max_attempts}): {e}")
+
+        # If this wasn't the last attempt, wait before retrying
+        if attempt < max_attempts:
+            wait_time = min(2 ** attempt, 32)  # 2, 4, 8, 16, 32 (capped)
+            logging.info(f"  Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+
+    logging.error(f"Failed to send Telegram message after {max_attempts} attempts.")
+    return False
 
 # --- 6. Execution Cycle ---
 
@@ -263,9 +337,11 @@ def run_once(config, state):
                     practice=practice,
                     booking_url=booking_url
                 )
-                logging.info(f"    {Fore.YELLOW}🔔 Matches criteria! Dispatched Telegram notification.{Style.RESET_ALL}")
-                send_telegram(config, msg)
-                state[state_key]['last_notified_total'] = total
+                logging.info(f"    {Fore.YELLOW}🔔 Matches criteria! Dispatching Telegram notification.{Style.RESET_ALL}")
+                if send_telegram(config, msg):
+                    state[state_key]['last_notified_total'] = total
+                else:
+                    logging.warning(f"    {Fore.YELLOW}Notification failed — will retry next cycle.{Style.RESET_ALL}")
                 
             elif total == 0 and prev_state.get('last_notified_total', 0) > 0:
                 logging.info(f"    {Fore.LIGHTBLACK_EX}Slots dropped to 0. Resetting notifier.{Style.RESET_ALL}")
@@ -347,10 +423,12 @@ def main():
                     doctor_count=len(config['urls']), 
                     practitioner_list=practitioner_list_text.strip()
                 )
-                send_telegram(config, formatted_msg)
-                logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
+                if send_telegram(config, formatted_msg):
+                    logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
+                else:
+                    logging.error(f"Failed to send startup notification.\n")
             except Exception as e:
-                logging.error(f"Failed to send startup notification: {e}\n")
+                logging.error(f"Failed to format startup notification: {e}\n")
 
         # Primary polling loop
         while True:
@@ -363,10 +441,7 @@ def main():
         shutdown_msg = config.get('shutdown_message')
         if shutdown_msg:
             logging.info(f"{Fore.YELLOW}Sending shutdown notification to Telegram...{Style.RESET_ALL}")
-            try:
-                send_telegram(config, shutdown_msg)
-            except Exception as e:
-                logging.error(f"Failed to send shutdown notification: {e}")
+            send_telegram(config, shutdown_msg)
 
 if __name__ == '__main__':
     main()
