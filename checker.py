@@ -44,11 +44,9 @@ def setup_directories_and_logging():
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # File handler (standard text, no colors for the log file)
     file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
     file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 
-    # Console handler (rich colored format)
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(ColorFormatter())
 
@@ -67,11 +65,19 @@ def load_config():
             logging.error(f"Failed to parse '{CONFIG_FILE}'. Please check for JSON syntax errors: {e}")
             sys.exit(1)
             
+    # Legacy config migration string replacements
+    msg_template = config.get('message_template', '')
+    if '{clinic}' in msg_template:
+        config['message_template'] = msg_template.replace('{clinic}', '{practice}')
+        config['message_template'] = config['message_template'].replace('Surgeon', 'Practitioner')
+
     # Fallback configuration variables
     config.setdefault('check_interval_seconds', 300)
     config.setdefault('delay_between_urls_seconds', 3)
     config.setdefault('upcoming_days', 15)
-    config.setdefault('startup_message', '🚀 <b>Doctolib Checker Started!</b>\nMonitoring {doctor_count} doctor(s) every 5 minutes.')
+    config.setdefault('startup_message', '🚀 <b>Doctolib Checker Started!</b>\nMonitoring {doctor_count} practitioner(s):\n{practitioner_list}')
+    config.setdefault('shutdown_message', '🛑 <b>Doctolib Checker Stopped!</b>\nNo longer monitoring availabilities.')
+    config.setdefault('message_template', "🎉 <b>{total} slot(s) available!</b>\n👨‍⚕️ Practitioner: <b>{practitioner}</b>\n🏥 Practice: <b>{practice}</b>\n🔗 <a href='{booking_url}'>Click here to book now!</a>")
     config.setdefault('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
     if not config.get('telegram_bot_token') or not config.get('telegram_chat_id'):
@@ -100,7 +106,8 @@ def save_state(state):
 
 # --- 4. Doctolib API Fetching ---
 
-def fetch_slot_total(booking_url, config):
+def get_booking_metadata(booking_url, config):
+    """Fetches practice and practitioner info from info.json API."""
     parsed = urllib.parse.urlparse(booking_url)
     path_parts = parsed.path.split('/')
 
@@ -117,7 +124,7 @@ def fetch_slot_total(booking_url, config):
 
     try:
         raw_place_id = query_params.get('placeId', [None])[0]
-        practice_id = raw_place_id.split('-')[1] if '-' in raw_place_id else raw_place_id
+        practice_id = raw_place_id.split('-')[1] if raw_place_id and '-' in raw_place_id else raw_place_id
         motive_id = query_params.get('motiveIds[]', [None])[0]
         practitioner_id = query_params.get('practitionerId', [None])[0]
     except (TypeError, IndexError, AttributeError) as e:
@@ -125,7 +132,6 @@ def fetch_slot_total(booking_url, config):
 
     headers = {'User-Agent': config['user_agent']}
 
-    # 1. Fetch info.json to map agendas and discover practitioner details
     info_url = f"https://www.doctolib.de/online_booking/api/slot_selection_funnel/v1/info.json?profile_slug={slug}"
     info_resp = requests.get(info_url, headers=headers, timeout=10)
     info_resp.raise_for_status()
@@ -135,8 +141,7 @@ def fetch_slot_total(booking_url, config):
     practitioners = info_data.get('practitioners', [])
     profile_name = info_data.get('profile', {}).get('name') or slug
 
-    # Map clinic/profile name and doctor name
-    clinic_name = profile_name
+    practice_name = profile_name
     practitioner_name = None
 
     if practitioner_id and practitioner_id != 'NO_PREFERENCE':
@@ -151,14 +156,14 @@ def fetch_slot_total(booking_url, config):
                     practitioner_name = f"Dr. {first_name} {last_name}".strip()
                 break
         if not practitioner_name:
-            practitioner_name = f"Doctor (ID: {practitioner_id})"
+            practitioner_name = f"Practitioner (ID: {practitioner_id})"
     else:
         practitioner_name = "First Available (No Preference)"
 
     # Filter to find matching agendas
     valid_agenda_ids = []
     for agenda in agendas:
-        if str(agenda.get('practice_id')) != str(practice_id):
+        if practice_id and str(agenda.get('practice_id')) != str(practice_id):
             continue
         if motive_id and int(motive_id) not in agenda.get('visit_motive_ids', []):
             continue
@@ -170,16 +175,29 @@ def fetch_slot_total(booking_url, config):
     if not valid_agenda_ids:
         raise ValueError(f"No specific agenda found for motive={motive_id}, practitioner={practitioner_id}")
 
-    # Combine into unique tracking key for state.json to avoid collision
     state_key = f"{slug}_{practitioner_id}" if practitioner_id else slug
     agenda_ids_str = "-".join(valid_agenda_ids)
 
-    # 2. Fetch Availabilities
+    return {
+        'state_key': state_key,
+        'practice_name': practice_name,
+        'practitioner_name': practitioner_name,
+        'motive_id': motive_id,
+        'agenda_ids_str': agenda_ids_str,
+        'practice_id': practice_id
+    }
+
+
+def fetch_slot_total(booking_url, config):
+    """Fully polls availabilities using extracted metadata."""
+    meta = get_booking_metadata(booking_url, config)
+    headers = {'User-Agent': config['user_agent']}
+
     avail_url = "https://www.doctolib.de/availabilities.json"
     params = {
-        'visit_motive_ids': motive_id,
-        'agenda_ids': agenda_ids_str,
-        'practice_ids': practice_id,
+        'visit_motive_ids': meta['motive_id'],
+        'agenda_ids': meta['agenda_ids_str'],
+        'practice_ids': meta['practice_id'],
         'insurance_sector': 'public',
         'telehealth': 'false',
         'start_date': date.today().isoformat(),
@@ -190,7 +208,7 @@ def fetch_slot_total(booking_url, config):
     avail_resp.raise_for_status()
     avail_data = avail_resp.json()
 
-    return state_key, practitioner_name, clinic_name, avail_data.get('total', 0), booking_url
+    return meta['state_key'], meta['practitioner_name'], meta['practice_name'], avail_data.get('total', 0), booking_url
 
 # --- 5. Notifications & Telegram ---
 
@@ -219,31 +237,30 @@ def send_telegram(config, text):
 # --- 6. Execution Cycle ---
 
 def run_once(config, state):
-    logging.info(f"{Fore.CYAN}--- Starting Check Cycle for {len(config['urls'])} Doctor(s) ---{Style.RESET_ALL}")
+    logging.info(f"{Fore.CYAN}--- Starting Check Cycle for {len(config['urls'])} Practitioner(s) ---{Style.RESET_ALL}")
 
     for i, url in enumerate(config['urls'], 1):
         try:
-            state_key, practitioner, clinic, total, booking_url = fetch_slot_total(url, config)
+            state_key, practitioner, practice, total, booking_url = fetch_slot_total(url, config)
             
-            # Initialize tracking inside state if this is the first time seeing this combination
             if state_key not in state:
                 state[state_key] = {'last_total': 0, 'last_notified_total': 0}
                 
             prev_state = state[state_key]
 
-            # Clear and clean terminal output
             if total > 0:
                 status_text = f"{Fore.GREEN}✔ {total} slot(s) available!{Style.RESET_ALL}"
             else:
                 status_text = f"{Fore.LIGHTBLACK_EX}✘ No slots.{Style.RESET_ALL}"
 
-            logging.info(f"[{i}/{len(config['urls'])}] {Fore.LIGHTMAGENTA_EX}{practitioner:<32}{Style.RESET_ALL} -> {status_text}")
+            short_practice = practice if len(practice) <= 20 else practice[:17] + "..."
+            logging.info(f"[{i}/{len(config['urls'])}] {Fore.LIGHTCYAN_EX}{short_practice:<20}{Style.RESET_ALL} | {Fore.LIGHTMAGENTA_EX}{practitioner:<32}{Style.RESET_ALL} -> {status_text}")
 
             if should_notify(prev_state, total):
                 msg = config['message_template'].format(
                     total=total,
                     practitioner=practitioner,
-                    clinic=clinic,
+                    practice=practice,
                     booking_url=booking_url
                 )
                 logging.info(f"    {Fore.YELLOW}🔔 Matches criteria! Dispatched Telegram notification.{Style.RESET_ALL}")
@@ -261,7 +278,6 @@ def run_once(config, state):
         except Exception as e:
             logging.error(f"[{i}/{len(config['urls'])}] Error processing URL: {e}")
 
-        # Configurable anti-IP blocking delay between doctors
         if i < len(config['urls']):
             delay = config['delay_between_urls_seconds']
             logging.info(f"    {Fore.LIGHTBLACK_EX}Pausing {delay}s before checking the next practitioner...{Style.RESET_ALL}")
@@ -278,7 +294,7 @@ def countdown_sleep(seconds):
             sys.stdout.write(f"\r{Fore.LIGHTBLACK_EX}[INFO] Next check cycle in {remaining:02d}s... Press Ctrl+C to stop.{Style.RESET_ALL}")
             sys.stdout.flush()
             time.sleep(1)
-        sys.stdout.write("\r" + " " * 75 + "\r") # Clean line
+        sys.stdout.write("\r" + " " * 75 + "\r")
         sys.stdout.flush()
     except KeyboardInterrupt:
         sys.stdout.write("\r" + " " * 75 + f"\r{Fore.YELLOW}[WARN] Interrupted. Shutting down...{Style.RESET_ALL}\n")
@@ -297,37 +313,60 @@ def main():
         logging.warning("No URLs are configured. Open config.json to add them.")
         return
 
-    # Startup verbose stats
     logging.info(f"{Style.BRIGHT}Initialized Doctolib Tracker Configuration:{Style.RESET_ALL}")
     logging.info(f"  • Interval:     {Fore.LIGHTBLUE_EX}{config['check_interval_seconds']} seconds{Style.RESET_ALL}")
     logging.info(f"  • Pacing delay: {Fore.LIGHTBLUE_EX}{config['delay_between_urls_seconds']} seconds{Style.RESET_ALL}")
     logging.info(f"  • Date window:  {Fore.LIGHTBLUE_EX}{config['upcoming_days']} days{Style.RESET_ALL}")
-    logging.info(f"  • Total doctors:{Fore.LIGHTBLUE_EX} {len(config['urls'])}{Style.RESET_ALL}")
+    logging.info(f"  • Targets:      {Fore.LIGHTBLUE_EX}{len(config['urls'])} practitioner(s){Style.RESET_ALL}")
     print()
-
-    # Send startup notification
-    startup_msg = config.get('startup_message')
-    if startup_msg:
-        try:
-            formatted_msg = startup_msg.format(doctor_count=len(config['urls']))
-            send_telegram(config, formatted_msg)
-            logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
-        except Exception as e:
-            logging.error(f"Failed to send startup notification: {e}\n")
 
     if args.once:
         state = load_state()
         run_once(config, state)
         return
 
-    # Primary polling loop
     try:
+        # Pre-flight check to build the practitioner list for the startup notification
+        logging.info(f"{Style.BRIGHT}Fetching practice and practitioner details for startup message...{Style.RESET_ALL}")
+        practitioner_list_text = ""
+        for i, url in enumerate(config['urls']):
+            try:
+                meta = get_booking_metadata(url, config)
+                practitioner_list_text += f"• {meta['practitioner_name']} ({meta['practice_name']})\n"
+            except Exception as e:
+                practitioner_list_text += f"• Unknown Practitioner (URL {i+1})\n"
+                logging.debug(f"Error fetching metadata for URL {i+1}: {e}")
+            
+            if i < len(config['urls']) - 1:
+                time.sleep(config['delay_between_urls_seconds'])
+
+        startup_msg = config.get('startup_message')
+        if startup_msg:
+            try:
+                formatted_msg = startup_msg.format(
+                    doctor_count=len(config['urls']), 
+                    practitioner_list=practitioner_list_text.strip()
+                )
+                send_telegram(config, formatted_msg)
+                logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
+            except Exception as e:
+                logging.error(f"Failed to send startup notification: {e}\n")
+
+        # Primary polling loop
         while True:
             state = load_state()
             run_once(config, state)
             countdown_sleep(config['check_interval_seconds'])
+            
     except KeyboardInterrupt:
-        pass
+        logging.info(f"\n{Fore.YELLOW}🛑 Shutting down gracefully...{Style.RESET_ALL}")
+        shutdown_msg = config.get('shutdown_message')
+        if shutdown_msg:
+            logging.info(f"{Fore.YELLOW}Sending shutdown notification to Telegram...{Style.RESET_ALL}")
+            try:
+                send_telegram(config, shutdown_msg)
+            except Exception as e:
+                logging.error(f"Failed to send shutdown notification: {e}")
 
 if __name__ == '__main__':
     main()
