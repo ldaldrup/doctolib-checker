@@ -4,9 +4,9 @@
   "check_interval_seconds": 300,
   "delay_between_urls_seconds": 3,
   "upcoming_days": 15,
-  "startup_message": "🚀 <b>Doctolib Checker Started!</b>\nMonitoring the following {doctor_count} practitioner(s):\n{practitioner_list}",
-  "shutdown_message": "🛑 <b>Doctolib Checker Stopped!</b>\nNo longer monitoring availabilities.",
-  "message_template": "🎉 <b>{total} slot(s) available!</b>\n👨‍⚕️ Practitioner: <b>{practitioner}</b>\n🏥 Practice: <b>{practice}</b>\n🔗 <a href='{booking_url}'>Click here to book now!</a>",
+  "startup_message": "🚀 <b>Doctolib Checker Started</b>\n\n👥 Monitoring <b>{doctor_count}</b> practitioner(s):\n{practitioner_list}\n\n⏱ Interval: <code>{interval_mins}m</code>\n📅 Window: <code>{days}d</code>",
+  "shutdown_message": "🛑 <b>Doctolib Checker Stopped</b>\n\nMonitoring has been disabled.",
+  "message_template": "🎉 <b>{total} Slot(s) Found!</b>\n\n👨‍⚕️ Practitioner: <b>{practitioner}</b>\n🏥 Practice: <b>{practice}</b>\n📅 First Date: <b>{first_date}</b>\n\n👉 <a href='{booking_url}'>Click here to book now!</a>",
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "urls": [
     "https://www.doctolib.de/speciality/booking/availabilities?specialityId=XXXXX&practitionerId=XXXXX&pid=practice-XXXXX"

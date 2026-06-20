@@ -80,13 +80,25 @@ def load_config():
         config['message_template'] = msg_template.replace('{clinic}', '{practice}')
         config['message_template'] = config['message_template'].replace('Surgeon', 'Practitioner')
 
-    # Fallback configuration variables
+    # Fallback configuration variables (Updated with new HTML templates)
     config.setdefault('check_interval_seconds', 300)
     config.setdefault('delay_between_urls_seconds', 3)
     config.setdefault('upcoming_days', 15)
-    config.setdefault('startup_message', '🚀 <b>Doctolib Checker Started!</b>\nMonitoring {doctor_count} practitioner(s):\n{practitioner_list}')
-    config.setdefault('shutdown_message', '🛑 <b>Doctolib Checker Stopped!</b>\nNo longer monitoring availabilities.')
-    config.setdefault('message_template', "🎉 <b>{total} slot(s) available!</b>\n👨‍⚕️ Practitioner: <b>{practitioner}</b>\n🏥 Practice: <b>{practice}</b>\n🔗 <a href='{booking_url}'>Click here to book now!</a>")
+    config.setdefault('startup_message', 
+        "🚀 <b>Doctolib Checker Started</b>\n\n"
+        "👥 Monitoring <b>{doctor_count}</b> practitioner(s):\n"
+        "{practitioner_list}\n\n"
+        "⏱ Interval: <code>{interval_mins}m</code>\n"
+        "📅 Window: <code>{days}d</code>"
+    )
+    config.setdefault('shutdown_message', "🛑 <b>Doctolib Checker Stopped</b>\n\nMonitoring has been disabled.")
+    config.setdefault('message_template', 
+        "🎉 <b>{total} Slot(s) Found!</b>\n\n"
+        "👨‍⚕️ Practitioner: <b>{practitioner}</b>\n"
+        "🏥 Practice: <b>{practice}</b>\n"
+        "📅 First Date: <b>{first_date}</b>\n\n"
+        "👉 <a href='{booking_url}'>Click here to book now!</a>"
+    )
     config.setdefault('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
     if not config.get('telegram_bot_token') or not config.get('telegram_chat_id'):
@@ -115,7 +127,6 @@ def save_state(state):
 
 # --- 4. Session & Dataclasses ---
 
-# Refactoring 3: Consolidated Session Creation
 GLOBAL_SESSION = None
 
 def get_session():
@@ -136,7 +147,6 @@ def get_session():
         GLOBAL_SESSION = session
     return GLOBAL_SESSION
 
-# Refactoring 2: Dataclass for Booking Metadata
 @dataclass
 class BookingMeta:
     state_key: str
@@ -148,7 +158,6 @@ class BookingMeta:
 
 # --- 5. Doctolib API Fetching ---
 
-# Improvement: Apply Retries & Session to Doctolib API Calls
 def get_booking_metadata(booking_url, config, session):
     """Fetches practice and practitioner info from info.json API."""
     parsed = urllib.parse.urlparse(booking_url)
@@ -175,7 +184,6 @@ def get_booking_metadata(booking_url, config, session):
 
     headers = {'User-Agent': config['user_agent']}
 
-    # Using session and constants
     info_resp = session.get(DOCTOLIB_INFO_API, params={'profile_slug': slug}, headers=headers, timeout=10)
     info_resp.raise_for_status()
     info_data = info_resp.json().get('data', {})
@@ -203,7 +211,6 @@ def get_booking_metadata(booking_url, config, session):
     else:
         practitioner_name = "First Available (No Preference)"
 
-    # Filter to find matching agendas
     valid_agenda_ids = []
     for agenda in agendas:
         if practice_id and str(agenda.get('practice_id')) != str(practice_id):
@@ -221,7 +228,6 @@ def get_booking_metadata(booking_url, config, session):
     state_key = f"{slug}_{practitioner_id}" if practitioner_id else slug
     agenda_ids_str = "-".join(valid_agenda_ids)
 
-    # Return dataclass instance
     return BookingMeta(
         state_key=state_key,
         practice_name=practice_name,
@@ -253,13 +259,17 @@ def fetch_slot_total(booking_url, config, session):
 
     total = avail_data.get('total', 0)
     
-    # Addition: Extract & Display "Next Available Date"
-    next_slot = avail_data.get('next_slot', None)
-    if not next_slot:
-        next_slot = "Unknown"
+    # Addition: Extract First Available Date
+    # If total > 0, it's inside availabilities list. If total == 0, fallback to next_slot
+    first_date = "N/A"
+    if total > 0:
+        availabilities = avail_data.get('availabilities', [])
+        if availabilities:
+            first_date = availabilities[0].get('date', 'N/A')
+    else:
+        first_date = avail_data.get('next_slot', 'Unknown')
 
-    # Return dataclass properties and next_slot
-    return meta.state_key, meta.practitioner_name, meta.practice_name, total, booking_url, next_slot
+    return meta.state_key, meta.practitioner_name, meta.practice_name, total, booking_url, first_date
 
 # --- 6. Notifications & Telegram ---
 
@@ -335,7 +345,7 @@ def run_once(config, state):
 
     for i, url in enumerate(config['urls'], 1):
         try:
-            state_key, practitioner, practice, total, booking_url, next_slot = fetch_slot_total(url, config, session)
+            state_key, practitioner, practice, total, booking_url, first_date = fetch_slot_total(url, config, session)
             
             if state_key not in state:
                 state[state_key] = {'last_total': 0, 'last_notified_total': 0}
@@ -345,8 +355,7 @@ def run_once(config, state):
             if total > 0:
                 status_text = f"{Fore.GREEN}✔ {total} slot(s) available!{Style.RESET_ALL}"
             else:
-                # Addition: Display "Next Available Date" in logs
-                status_text = f"{Fore.LIGHTBLACK_EX}✘ No slots. Next: {next_slot}{Style.RESET_ALL}"
+                status_text = f"{Fore.LIGHTBLACK_EX}✘ No slots. Next: {first_date}{Style.RESET_ALL}"
 
             short_practice = practice if len(practice) <= 20 else practice[:17] + "..."
             logging.info(f"[{i}/{len(config['urls'])}] {Fore.LIGHTCYAN_EX}{short_practice:<20}{Style.RESET_ALL} | {Fore.LIGHTMAGENTA_EX}{practitioner:<32}{Style.RESET_ALL} -> {status_text}")
@@ -356,7 +365,8 @@ def run_once(config, state):
                     total=total,
                     practitioner=practitioner,
                     practice=practice,
-                    booking_url=booking_url
+                    booking_url=booking_url,
+                    first_date=first_date
                 )
                 logging.info(f"    {Fore.YELLOW}🔔 Matches criteria! Dispatching Telegram notification.{Style.RESET_ALL}")
                 if send_telegram(config, msg):
@@ -425,7 +435,6 @@ def main():
     try:
         session = get_session()
         
-        # Addition: Graceful Degradation on Bad URLs
         logging.info(f"{Style.BRIGHT}Fetching practice and practitioner details for startup message...{Style.RESET_ALL}")
         practitioner_list_text = ""
         active_urls = []
@@ -433,16 +442,14 @@ def main():
         for i, url in enumerate(config['urls'], 1):
             try:
                 meta = get_booking_metadata(url, config, session)
-                practitioner_list_text += f"• {meta.practitioner_name} ({meta.practice_name})\n"
+                practitioner_list_text += f"• {meta.practitioner_name} — <i>{meta.practice_name}</i>\n"
                 active_urls.append(url)
             except Exception as e:
-                # Skip bad URLs instead of bringing them into the loop
                 logging.warning(f"⚠️ Skipping malformed or invalid URL {i}: {e}")
             
             if i < len(config['urls']):
                 time.sleep(config['delay_between_urls_seconds'])
 
-        # Overwrite config URLs with only active ones to prevent spamming errors in the loop
         config['urls'] = active_urls
         
         if not config['urls']:
@@ -454,7 +461,9 @@ def main():
             try:
                 formatted_msg = startup_msg.format(
                     doctor_count=len(config['urls']), 
-                    practitioner_list=practitioner_list_text.strip()
+                    practitioner_list=practitioner_list_text.strip(),
+                    interval_mins=config['check_interval_seconds'] // 60,
+                    days=config['upcoming_days']
                 )
                 if send_telegram(config, formatted_msg):
                     logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
@@ -463,7 +472,6 @@ def main():
             except Exception as e:
                 logging.error(f"Failed to format startup notification: {e}\n")
 
-        # Primary polling loop
         while True:
             state = load_state()
             run_once(config, state)
