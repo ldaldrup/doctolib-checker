@@ -6,6 +6,7 @@ import logging
 import argparse
 import urllib.parse
 from datetime import date
+from dataclasses import dataclass
 import requests
 from colorama import init, Fore, Style
 from requests.adapters import HTTPAdapter
@@ -21,6 +22,12 @@ STATE_FILE = os.path.join(STATE_DIR, 'state.json')
 LOG_DIR = 'logs'
 LOG_FILE = os.path.join(LOG_DIR, 'checker.log')
 CONFIG_FILE = 'config.json'
+
+# Refactoring 1: API Endpoint Constants
+DOCTOLIB_BASE_URL = "https://www.doctolib.de"
+DOCTOLIB_INFO_API = f"{DOCTOLIB_BASE_URL}/online_booking/api/slot_selection_funnel/v1/info.json"
+DOCTOLIB_AVAILABILITIES_API = f"{DOCTOLIB_BASE_URL}/availabilities.json"
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
 # --- 2. Logging Setup with Color Support ---
 
@@ -106,9 +113,43 @@ def save_state(state):
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=2)
 
-# --- 4. Doctolib API Fetching ---
+# --- 4. Session & Dataclasses ---
 
-def get_booking_metadata(booking_url, config):
+# Refactoring 3: Consolidated Session Creation
+GLOBAL_SESSION = None
+
+def get_session():
+    """Returns a module-level requests.Session with retry strategy."""
+    global GLOBAL_SESSION
+    if GLOBAL_SESSION is None:
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=5)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        GLOBAL_SESSION = session
+    return GLOBAL_SESSION
+
+# Refactoring 2: Dataclass for Booking Metadata
+@dataclass
+class BookingMeta:
+    state_key: str
+    practice_name: str
+    practitioner_name: str
+    motive_id: str
+    agenda_ids_str: str
+    practice_id: str
+
+# --- 5. Doctolib API Fetching ---
+
+# Improvement: Apply Retries & Session to Doctolib API Calls
+def get_booking_metadata(booking_url, config, session):
     """Fetches practice and practitioner info from info.json API."""
     parsed = urllib.parse.urlparse(booking_url)
     path_parts = parsed.path.split('/')
@@ -134,8 +175,8 @@ def get_booking_metadata(booking_url, config):
 
     headers = {'User-Agent': config['user_agent']}
 
-    info_url = f"https://www.doctolib.de/online_booking/api/slot_selection_funnel/v1/info.json?profile_slug={slug}"
-    info_resp = requests.get(info_url, headers=headers, timeout=10)
+    # Using session and constants
+    info_resp = session.get(DOCTOLIB_INFO_API, params={'profile_slug': slug}, headers=headers, timeout=10)
     info_resp.raise_for_status()
     info_data = info_resp.json().get('data', {})
 
@@ -180,66 +221,47 @@ def get_booking_metadata(booking_url, config):
     state_key = f"{slug}_{practitioner_id}" if practitioner_id else slug
     agenda_ids_str = "-".join(valid_agenda_ids)
 
-    return {
-        'state_key': state_key,
-        'practice_name': practice_name,
-        'practitioner_name': practitioner_name,
-        'motive_id': motive_id,
-        'agenda_ids_str': agenda_ids_str,
-        'practice_id': practice_id
-    }
+    # Return dataclass instance
+    return BookingMeta(
+        state_key=state_key,
+        practice_name=practice_name,
+        practitioner_name=practitioner_name,
+        motive_id=motive_id,
+        agenda_ids_str=agenda_ids_str,
+        practice_id=practice_id
+    )
 
 
-def fetch_slot_total(booking_url, config):
+def fetch_slot_total(booking_url, config, session):
     """Fully polls availabilities using extracted metadata."""
-    meta = get_booking_metadata(booking_url, config)
+    meta = get_booking_metadata(booking_url, config, session)
     headers = {'User-Agent': config['user_agent']}
 
-    avail_url = "https://www.doctolib.de/availabilities.json"
     params = {
-        'visit_motive_ids': meta['motive_id'],
-        'agenda_ids': meta['agenda_ids_str'],
-        'practice_ids': meta['practice_id'],
+        'visit_motive_ids': meta.motive_id,
+        'agenda_ids': meta.agenda_ids_str,
+        'practice_ids': meta.practice_id,
         'insurance_sector': 'public',
         'telehealth': 'false',
         'start_date': date.today().isoformat(),
         'limit': config['upcoming_days']
     }
 
-    avail_resp = requests.get(avail_url, params=params, headers=headers, timeout=10)
+    avail_resp = session.get(DOCTOLIB_AVAILABILITIES_API, params=params, headers=headers, timeout=10)
     avail_resp.raise_for_status()
     avail_data = avail_resp.json()
 
-    return meta['state_key'], meta['practitioner_name'], meta['practice_name'], avail_data.get('total', 0), booking_url
+    total = avail_data.get('total', 0)
+    
+    # Addition: Extract & Display "Next Available Date"
+    next_slot = avail_data.get('next_slot', None)
+    if not next_slot:
+        next_slot = "Unknown"
 
-# --- 5. Notifications & Telegram ---
+    # Return dataclass properties and next_slot
+    return meta.state_key, meta.practitioner_name, meta.practice_name, total, booking_url, next_slot
 
-def create_session():
-    """Create a requests.Session with retry strategy and connection pooling."""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=5,                    # max retry attempts
-        backoff_factor=2,           # exponential: 2, 4, 8, 16, 32 seconds
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-# Create a module-level session for connection reuse
-TELEGRAM_SESSION = None
-
-
-def get_telegram_session():
-    global TELEGRAM_SESSION
-    if TELEGRAM_SESSION is None:
-        TELEGRAM_SESSION = create_session()
-    return TELEGRAM_SESSION
-
+# --- 6. Notifications & Telegram ---
 
 def should_notify(prev_state, new_total):
     prev_notified = prev_state.get('last_notified_total', 0)
@@ -256,7 +278,7 @@ def send_telegram(config, text, max_attempts=5):
         logging.warning("Telegram credentials missing. Skipping notification.")
         return False
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -268,13 +290,12 @@ def send_telegram(config, text, max_attempts=5):
         "Connection": "keep-alive",
     }
 
-    session = get_telegram_session()
+    session = get_session()
 
     for attempt in range(1, max_attempts + 1):
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=30)
 
-            # Check for Telegram API errors (e.g., bad token, bad chat_id)
             if resp.status_code != 200:
                 try:
                     err_data = resp.json()
@@ -282,7 +303,6 @@ def send_telegram(config, text, max_attempts=5):
                 except Exception:
                     err_desc = resp.text[:200]
 
-                # 401/404 = permanent errors, no point retrying
                 if resp.status_code in (401, 403, 404):
                     logging.error(f"Telegram API permanent error ({resp.status_code}): {err_desc}")
                     logging.error("Check your bot token and chat ID in config.json.")
@@ -290,7 +310,7 @@ def send_telegram(config, text, max_attempts=5):
 
                 logging.warning(f"Telegram API returned {resp.status_code}: {err_desc} (attempt {attempt}/{max_attempts})")
             else:
-                return True  # success
+                return True
 
         except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
             logging.warning(f"Connection error on attempt {attempt}/{max_attempts}: {e}")
@@ -299,23 +319,23 @@ def send_telegram(config, text, max_attempts=5):
         except Exception as e:
             logging.error(f"Unexpected error sending Telegram message (attempt {attempt}/{max_attempts}): {e}")
 
-        # If this wasn't the last attempt, wait before retrying
         if attempt < max_attempts:
-            wait_time = min(2 ** attempt, 32)  # 2, 4, 8, 16, 32 (capped)
+            wait_time = min(2 ** attempt, 32)
             logging.info(f"  Retrying in {wait_time}s...")
             time.sleep(wait_time)
 
     logging.error(f"Failed to send Telegram message after {max_attempts} attempts.")
     return False
 
-# --- 6. Execution Cycle ---
+# --- 7. Execution Cycle ---
 
 def run_once(config, state):
+    session = get_session()
     logging.info(f"{Fore.CYAN}--- Starting Check Cycle for {len(config['urls'])} Practitioner(s) ---{Style.RESET_ALL}")
 
     for i, url in enumerate(config['urls'], 1):
         try:
-            state_key, practitioner, practice, total, booking_url = fetch_slot_total(url, config)
+            state_key, practitioner, practice, total, booking_url, next_slot = fetch_slot_total(url, config, session)
             
             if state_key not in state:
                 state[state_key] = {'last_total': 0, 'last_notified_total': 0}
@@ -325,7 +345,8 @@ def run_once(config, state):
             if total > 0:
                 status_text = f"{Fore.GREEN}✔ {total} slot(s) available!{Style.RESET_ALL}"
             else:
-                status_text = f"{Fore.LIGHTBLACK_EX}✘ No slots.{Style.RESET_ALL}"
+                # Addition: Display "Next Available Date" in logs
+                status_text = f"{Fore.LIGHTBLACK_EX}✘ No slots. Next: {next_slot}{Style.RESET_ALL}"
 
             short_practice = practice if len(practice) <= 20 else practice[:17] + "..."
             logging.info(f"[{i}/{len(config['urls'])}] {Fore.LIGHTCYAN_EX}{short_practice:<20}{Style.RESET_ALL} | {Fore.LIGHTMAGENTA_EX}{practitioner:<32}{Style.RESET_ALL} -> {status_text}")
@@ -362,7 +383,7 @@ def run_once(config, state):
     save_state(state)
     logging.info(f"{Fore.CYAN}--- Check Cycle Complete ---{Style.RESET_ALL}")
 
-# --- 7. Dynamic Timer & Loops ---
+# --- 8. Dynamic Timer & Loops ---
 
 def countdown_sleep(seconds):
     try:
@@ -402,19 +423,31 @@ def main():
         return
 
     try:
-        # Pre-flight check to build the practitioner list for the startup notification
+        session = get_session()
+        
+        # Addition: Graceful Degradation on Bad URLs
         logging.info(f"{Style.BRIGHT}Fetching practice and practitioner details for startup message...{Style.RESET_ALL}")
         practitioner_list_text = ""
-        for i, url in enumerate(config['urls']):
+        active_urls = []
+        
+        for i, url in enumerate(config['urls'], 1):
             try:
-                meta = get_booking_metadata(url, config)
-                practitioner_list_text += f"• {meta['practitioner_name']} ({meta['practice_name']})\n"
+                meta = get_booking_metadata(url, config, session)
+                practitioner_list_text += f"• {meta.practitioner_name} ({meta.practice_name})\n"
+                active_urls.append(url)
             except Exception as e:
-                practitioner_list_text += f"• Unknown Practitioner (URL {i+1})\n"
-                logging.debug(f"Error fetching metadata for URL {i+1}: {e}")
+                # Skip bad URLs instead of bringing them into the loop
+                logging.warning(f"⚠️ Skipping malformed or invalid URL {i}: {e}")
             
-            if i < len(config['urls']) - 1:
+            if i < len(config['urls']):
                 time.sleep(config['delay_between_urls_seconds'])
+
+        # Overwrite config URLs with only active ones to prevent spamming errors in the loop
+        config['urls'] = active_urls
+        
+        if not config['urls']:
+            logging.error("❌ No valid URLs to monitor. Exiting.")
+            return
 
         startup_msg = config.get('startup_message')
         if startup_msg:
