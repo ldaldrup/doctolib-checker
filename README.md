@@ -32,7 +32,7 @@ The script relies on a `config.json` file in the root directory to manage its be
 * **`upcoming_days`** (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
 
 ### Notifications & Headers
-* **"`startup_message`"** (String): The Telegram message sent at script startup. You can customize this.
+* **`startup_message`** (String): The Telegram message sent at script startup. You can customize this.
 * **`message_template`** (String): The layout of the Telegram message sent when slots are found. You can customize this using the following dynamic placeholders:
     * `{total}`: Number of available slots found.
     * `{practitioner}`: The doctor's name (extracted from the URL/API).
