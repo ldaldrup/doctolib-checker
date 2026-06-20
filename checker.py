@@ -13,6 +13,7 @@ from colorama import init, Fore, Style
 init(autoreset=True)
 
 # --- 1. Constants & Paths ---
+
 STATE_DIR = 'state'
 STATE_FILE = os.path.join(STATE_DIR, 'state.json')
 LOG_DIR = 'logs'
@@ -20,6 +21,7 @@ LOG_FILE = os.path.join(LOG_DIR, 'checker.log')
 CONFIG_FILE = 'config.json'
 
 # --- 2. Logging Setup with Color Support ---
+
 class ColorFormatter(logging.Formatter):
     """Custom formatter to add colors to the console output"""
     COLORS = {
@@ -56,21 +58,22 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         logging.error(f"Configuration file '{CONFIG_FILE}' not found!")
         logging.info(f"Please copy 'config.example.json' to '{CONFIG_FILE}' and fill in your details.")
-        exit(1)
-        
+        sys.exit(1)
+
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         try:
             config = json.load(f)
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse '{CONFIG_FILE}'. Please check for JSON syntax errors: {e}")
-            exit(1)
+            sys.exit(1)
             
     # Fallback configuration variables
     config.setdefault('check_interval_seconds', 300)
     config.setdefault('delay_between_urls_seconds', 3)
     config.setdefault('upcoming_days', 15)
+    config.setdefault('startup_message', '🚀 <b>Doctolib Checker Started!</b>\nMonitoring {doctor_count} doctor(s) every 5 minutes.')
     config.setdefault('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-    
+
     if not config.get('telegram_bot_token') or not config.get('telegram_chat_id'):
         logging.warning("Telegram credentials missing in config. Alerts will fail.")
         
@@ -80,6 +83,7 @@ def load_config():
     return config
 
 # --- 3. State Management ---
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -87,6 +91,7 @@ def load_state():
                 return json.load(f)
         except json.JSONDecodeError:
             logging.error("Corrupted state.json. Starting fresh.")
+            return {}
     return {}
 
 def save_state(state):
@@ -94,10 +99,11 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 # --- 4. Doctolib API Fetching ---
+
 def fetch_slot_total(booking_url, config):
     parsed = urllib.parse.urlparse(booking_url)
     path_parts = parsed.path.split('/')
-    
+
     if 'availabilities' not in path_parts:
         logging.warning(f"URL might be incomplete (missing '/booking/availabilities')")
 
@@ -108,7 +114,7 @@ def fetch_slot_total(booking_url, config):
         slug = path_parts[3]
 
     query_params = urllib.parse.parse_qs(parsed.query)
-    
+
     try:
         raw_place_id = query_params.get('placeId', [None])[0]
         practice_id = raw_place_id.split('-')[1] if '-' in raw_place_id else raw_place_id
@@ -124,7 +130,7 @@ def fetch_slot_total(booking_url, config):
     info_resp = requests.get(info_url, headers=headers, timeout=10)
     info_resp.raise_for_status()
     info_data = info_resp.json().get('data', {})
-    
+
     agendas = info_data.get('agendas', [])
     practitioners = info_data.get('practitioners', [])
     profile_name = info_data.get('profile', {}).get('name') or slug
@@ -179,7 +185,7 @@ def fetch_slot_total(booking_url, config):
         'start_date': date.today().isoformat(),
         'limit': config['upcoming_days']
     }
-    
+
     avail_resp = requests.get(avail_url, params=params, headers=headers, timeout=10)
     avail_resp.raise_for_status()
     avail_data = avail_resp.json()
@@ -187,6 +193,7 @@ def fetch_slot_total(booking_url, config):
     return state_key, practitioner_name, clinic_name, avail_data.get('total', 0), booking_url
 
 # --- 5. Notifications & Telegram ---
+
 def should_notify(prev_state, new_total):
     prev_notified = prev_state.get('last_notified_total', 0)
     if new_total > 0 and (prev_notified == 0 or new_total > prev_notified):
@@ -198,7 +205,7 @@ def send_telegram(config, text):
     chat_id = config.get('telegram_chat_id')
     if not token or not chat_id:
         return
-        
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -210,9 +217,10 @@ def send_telegram(config, text):
     resp.raise_for_status()
 
 # --- 6. Execution Cycle ---
+
 def run_once(config, state):
     logging.info(f"{Fore.CYAN}--- Starting Check Cycle for {len(config['urls'])} Doctor(s) ---{Style.RESET_ALL}")
-    
+
     for i, url in enumerate(config['urls'], 1):
         try:
             state_key, practitioner, clinic, total, booking_url = fetch_slot_total(url, config)
@@ -263,13 +271,14 @@ def run_once(config, state):
     logging.info(f"{Fore.CYAN}--- Check Cycle Complete ---{Style.RESET_ALL}")
 
 # --- 7. Dynamic Timer & Loops ---
+
 def countdown_sleep(seconds):
     try:
         for remaining in range(seconds, 0, -1):
             sys.stdout.write(f"\r{Fore.LIGHTBLACK_EX}[INFO] Next check cycle in {remaining:02d}s... Press Ctrl+C to stop.{Style.RESET_ALL}")
             sys.stdout.flush()
             time.sleep(1)
-        sys.stdout.write("\r" + " " * 75 + "\r")  # Clean line
+        sys.stdout.write("\r" + " " * 75 + "\r") # Clean line
         sys.stdout.flush()
     except KeyboardInterrupt:
         sys.stdout.write("\r" + " " * 75 + f"\r{Fore.YELLOW}[WARN] Interrupted. Shutting down...{Style.RESET_ALL}\n")
@@ -287,7 +296,7 @@ def main():
     if not config['urls']:
         logging.warning("No URLs are configured. Open config.json to add them.")
         return
-    
+
     # Startup verbose stats
     logging.info(f"{Style.BRIGHT}Initialized Doctolib Tracker Configuration:{Style.RESET_ALL}")
     logging.info(f"  • Interval:     {Fore.LIGHTBLUE_EX}{config['check_interval_seconds']} seconds{Style.RESET_ALL}")
@@ -295,6 +304,16 @@ def main():
     logging.info(f"  • Date window:  {Fore.LIGHTBLUE_EX}{config['upcoming_days']} days{Style.RESET_ALL}")
     logging.info(f"  • Total doctors:{Fore.LIGHTBLUE_EX} {len(config['urls'])}{Style.RESET_ALL}")
     print()
+
+    # Send startup notification
+    startup_msg = config.get('startup_message')
+    if startup_msg:
+        try:
+            formatted_msg = startup_msg.format(doctor_count=len(config['urls']))
+            send_telegram(config, formatted_msg)
+            logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
+        except Exception as e:
+            logging.error(f"Failed to send startup notification: {e}\n")
 
     if args.once:
         state = load_state()
