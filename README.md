@@ -4,6 +4,17 @@ A lightweight Doctolib appointment poller for a fixed set of booking URLs (e.g.,
 
 Designed to run locally as a continuous background process.
 
+## Inspired By
+
+This project draws inspiration from the following repositories:
+
+- [seh-len/doctolib](https://github.com/seh-len/doctolib)
+- [timoles/Doctolib-Userfriendly-Appointment-Tracker](https://github.com/timoles/Doctolib-Userfriendly-Appointment-Tracker)
+
+## ⚠️ Disclaimer
+
+**This tool is not officially endorsed or allowed by DoctoLib.** Using this tool to access DoctoLib's services may violate their terms of service. Use at your own risk. The author is not responsible for any consequences, account bans, IP blocks, or other issues that may result from using this tool. By using this tool, you assume full responsibility for any and all consequences of how it interacts with DoctoLib's API and services.
+
 ## Setup
 
 1. **Install dependencies:** Ensure you have Python installed, then install the required packages:
@@ -31,12 +42,18 @@ The script relies on a `config.json` file in the root directory to manage its be
 ### Search Criteria
 * **`upcoming_days`** (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
 
-### Notifications & Headers
-* **`startup_message`** (String): The Telegram message sent at script startup. You can customize this.
+### Notifications & Messages
+* **`startup_message`** (String): The Telegram message sent at script startup. You can customize this using the following dynamic placeholders:
+    * `{doctor_count}`: Number of practitioners being monitored.
+    * `{practitioner_list}`: List of practitioner names.
+    * `{interval_mins}`: Check interval in minutes.
+    * `{days}`: Upcoming days window.
+* **`shutdown_message`** (String): The Telegram message sent when the script stops.
 * **`message_template`** (String): The layout of the Telegram message sent when slots are found. You can customize this using the following dynamic placeholders:
     * `{total}`: Number of available slots found.
-    * `{practitioner}`: The doctor's name (extracted from the URL/API).
-    * `{clinic}`: The clinic's name (extracted from the URL/API).
+    * `{practitioner}`: The doctor's name.
+    * `{practice}`: The practice/clinic name.
+    * `{first_date}`: The earliest available appointment date.
     * `{booking_url}`: The direct link to book the appointment.
 * **`user_agent`** (String): The browser User-Agent string used to mimic a real web browser. You generally do not need to change this unless Doctolib blocks the default one.
 
