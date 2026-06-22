@@ -16,65 +16,71 @@ This project draws inspiration from [seh-len/doctolib](https://github.com/seh-le
   ```bash
    pip install -r requirements.txt
   ```
-2. **Configuration:** Copy `config.json.example` to `config.json` and populate it with your specific details:
-  - **Telegram:** Add your Bot Token and Chat ID.
+2. **Telegram Setup:** 
+  - Create a bot with [BotFather](https://t.me/BotFather) to get your `bot_token`.
+  - Start a conversation with your bot and get your `chat_id` (you can send any message to the bot, then use an API call or a service like [this](https://t.me/userinfobot) to find your ID).
+3. **Configuration:** Copy `config.json.example` to `config.json` and populate it with your specific details:
+  - **Telegram:** Add your `bot_token` and `chat_id` (found above).
   - **URLs:** Add the exact Doctolib booking URLs you wish to monitor.
-  - **Timing:** Adjust `check_interval_seconds` (recommended: 300+ seconds) to avoid rate limits.
+  - **Polling:** Adjust `polling.check_interval_seconds` (recommended: 300+ seconds) to avoid rate limits.
 
 ## Configuration (`config.json`)
 
-The script relies on a `config.json` file in the root directory to manage its behavior. Below is a breakdown of all available parameters:
+The script relies on a `config.json` file in the root directory. Copy `config.json.example` as your starting point and adjust the parameters below:
 
 ### Telegram Settings
 
-- `telegram_bot_token` (String): The token provided by Telegram's BotFather when you create your bot.
-- `telegram_chat_id` (String): The numerical ID of the chat, user, or group where the bot should send notifications.
+- `telegram.bot_token` (String): Your Telegram bot token from BotFather.
+- `telegram.chat_id` (String): The numerical ID of the chat/user/group to receive notifications.
+- `telegram.silent` (Boolean, optional): If `true`, all notifications are sent silently (no sound/vibration). Defaults to `false`. Can be overridden per message.
 
-### Timing & Polling (Anti-Ban)
+### Polling & Search
 
-- `check_interval_seconds` (Integer): The wait time in seconds between full check cycles. 
-  - *Recommendation:* Set to `300` (5 minutes) or higher. Doctolib aggressively rate-limits; setting this too low will result in a temporary IP ban.
-- `delay_between_urls_seconds` (Integer): The pause in seconds between fetching individual URLs *during* a single cycle. Prevents the script from hammering the server with concurrent requests.
-  - *Recommendation:* Keep between `2` and `5` seconds.
+- `polling.check_interval_seconds` (Integer): Wait time in seconds between check cycles. **Recommended: 300+ seconds (5+ minutes)** to avoid Doctolib's rate-limiting and IP bans.
+- `polling.delay_between_urls_seconds` (Integer): Pause between fetching URLs in a single cycle. **Recommended: 2–5 seconds.**
+- `polling.upcoming_days` (Integer): How many days ahead to search for appointments (e.g., `15` = next 15 days).
+- `polling.insurance_sector` (String): Filter by insurance type: `"public"` or `"private"`. Defaults to `"public"`.
+- `polling.telehealth` (Boolean): Include remote/telehealth appointments. Defaults to `false`.
+- `polling.slot_limit` (Integer): Maximum slots per API call. Defaults to `15`. Note: the script reports the total count from the API, not limited by this.
 
-### Search Criteria
+### Messages
 
-- `upcoming_days` (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
-- `insurance_sector` (String): The insurance sector to filter by. Either `"public"` or `"private"`. Defaults to `"public"`.
-- `telehealth` (Boolean): Whether to include telehealth/remote appointments. Defaults to `false`.
-- `slot_limit` (Integer): Maximum number of individual time slots fetched per API call. Defaults to `15`. Note: this does not limit how many slots are reported—the script uses the `total` count from the API response.
+Message templates use placeholders and can be individually silenced:
 
-### Notifications & Messages
+#### Startup Message (`messages.startup`)
+- `template` (String): Message on script start. Placeholders: `{start_time}`, `{doctor_count}`, `{practice_count}`, `{practitioner_list}`, `{interval_mins}`, `{days}`, `{insurance_sector}`.
+- `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
 
-- `startup_message` (String): The Telegram message sent at script startup. Placeholders:
-  - `{start_time}`: Timestamp when the script started.
-  - `{doctor_count}`: Number of practitioners being monitored.
-  - `{practice_count}`: Number of unique practices being monitored.
-  - `{practitioner_list}`: Formatted list of practitioners grouped by practice.
-  - `{interval_mins}`: Check interval in minutes.
-  - `{days}`: Upcoming days window.
-  - `{insurance_sector}`: The configured insurance sector.
-- `shutdown_message` (String): The Telegram message sent when the script stops.
-- `message_template` (String): The layout of the Telegram message sent when slots are found. Placeholders:
-  - `{total}`: Number of available slots found.
-  - `{practitioner}`: The doctor's name.
-  - `{practice}`: The practice/clinic name.
-  - `{first_date}`: The earliest available appointment date.
-  - `{booking_url}`: The direct link to book the appointment.
-- `user_agent` (String): The browser User-Agent string used to mimic a real web browser. You generally do not need to change this unless Doctolib blocks the default one.
+#### Shutdown Message (`messages.shutdown`)
+- `template` (String): Message when script stops.
+- `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
 
-### UI & Behavior
+#### Slot Found Message (`messages.slot_found`)
+- `template` (String): Alert when slots are found. Placeholders: `{total}`, `{practitioner}`, `{practice}`, `{first_date}`, `{booking_url}`.
+- `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
+- `effect` (Object, optional): Telegram notification effect.
+  - `enabled` (Boolean): If `true`, plays a notification effect on Telegram. Defaults to `false`.
+  - `id` (String): Telegram effect ID (e.g., `"5046509860389126442"` for fireworks).
 
-- `ui` (Object): Controls terminal output formatting.
-  - `terminal_table` (Boolean): Renders results in a column-aligned table. Defaults to `false`.
-  - `show_full_names` (Boolean): Shows full names in terminal output. Defaults to `true`.
-  - `colorblind_friendly` (Boolean): Reserved for future use. Defaults to `false`.
-- `dry_run` (Boolean): If `true`, runs all checks normally but skips Telegram API calls. Useful for testing configuration. Can also be set via the `--dry-run` CLI flag. Defaults to `false`.
+#### Summary / Heartbeat Message (`messages.summary`)
+- `enabled` (Boolean): If `true`, periodically sends a monitoring status update. Defaults to `false`.
+- `interval_seconds` (Integer): Time-based interval in seconds (e.g., `3600` for hourly). Set to `0` to disable time-based sending. Defaults to `0`.
+- `every_x_cycles` (Integer): Send summary every N polling cycles (e.g., `12` with 5-minute intervals ≈ hourly). Defaults to `0` (disabled).
+- `template` (String): Message format. Placeholders: `{uptime}`, `{total_cycles}`, `{total_hits}`, `{total_errors}`, `{next_check_in}`, `{last_slot_line}`.
+- `silent` (Boolean, optional): Summary messages are silent by default. Set to `false` to enable sound. Defaults to `true`.
 
-### Target Doctors/Clinics
+### UI & Other
 
-- `urls` (Array of Strings): A list of exact Doctolib booking URLs to monitor. 
-  - *Important:* These must be the final URLs from the booking process, containing all query parameters (e.g., `specialityId`, `motiveIds`, `practitionerId`). Simply linking to a doctor's profile page will not work.
+- `ui.terminal_table` (Boolean): Display results in a table format. Defaults to `false`.
+- `ui.show_full_names` (Boolean): Show full practitioner names in terminal. Defaults to `true`.
+- `ui.colorblind_friendly` (Boolean): Reserved for future use.
+- `user_agent` (String): Browser User-Agent string. Generally do not change unless Doctolib blocks it.
+- `dry_run` (Boolean): If `true`, runs checks but skips Telegram API calls. Useful for testing. Can also be set via `--dry-run` CLI flag. Defaults to `false`.
+
+### Target URLs
+
+- `urls` (Array of Strings): Exact Doctolib booking URLs to monitor.
+  - **Important:** Must include all query parameters (`specialityId`, `motiveIds`, `practitionerId`, etc.). Copy from the final booking step in your browser—a profile page link alone will not work.
 
 ## Usage
 
