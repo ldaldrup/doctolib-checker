@@ -286,10 +286,7 @@ def _practitioner_display_name(p):
 
 
 def format_uptime(start: datetime) -> str:
-    """Format a duration as a compact human-readable string.
-
-    Examples: '45m', '2h 34m', '1d 3h', '12s'
-    """
+    """Format a duration as a compact human-readable string."""
     delta = datetime.now() - start
     total_seconds = int(delta.total_seconds())
     days, remainder = divmod(total_seconds, 86400)
@@ -309,10 +306,7 @@ def format_uptime(start: datetime) -> str:
 
 
 def format_ago(when: datetime) -> str:
-    """Format a past timestamp as a relative human-readable string.
-
-    Examples: 'just now', '5m ago', '2h 15m ago', '1d 4h ago'
-    """
+    """Format a past timestamp as a relative human-readable string."""
     delta = datetime.now() - when
     total_seconds = int(delta.total_seconds())
     if total_seconds < 60:
@@ -337,6 +331,20 @@ def format_duration(seconds: int) -> str:
         return f"{seconds // 60}m"
     else:
         return f"{seconds}s"
+
+
+def format_doctolib_datetime(dt_str: str) -> str:
+    """Format a Doctolib datetime string to a clean 'YYYY-MM-DD HH:MM' format."""
+    if not dt_str:
+        return ""
+    if "T" in dt_str:
+        try:
+            date_part = dt_str.split("T")[0]
+            time_part = dt_str.split("T")[1][:5]
+            return f"{date_part} {time_part}"
+        except IndexError:
+            return dt_str
+    return dt_str
 
 
 # ── 6. Doctolib API ─────────────────────────────────────────────────
@@ -494,10 +502,41 @@ def fetch_slot_total(booking_url, config, session, meta=None):
     first_date = "N/A"
     if total > 0:
         availabilities = avail_data.get("availabilities", [])
+        found = False
         if availabilities:
-            first_date = availabilities[0].get("date", "N/A")
+            # Find the first date that actually contains a slot
+            for day_info in availabilities:
+                slots = day_info.get("slots", [])
+                if slots:
+                    date_str = day_info.get("date", "N/A")
+                    
+                    # Handle both string and dict slot formats from Doctolib
+                    first_slot = slots[0]
+                    if isinstance(first_slot, dict):
+                        start_time_str = first_slot.get("start_time", "")
+                    elif isinstance(first_slot, str):
+                        start_time_str = first_slot
+                    else:
+                        start_time_str = ""
+                        
+                    time_str = ""
+                    if start_time_str and "T" in start_time_str:
+                        try:
+                            time_str = " " + start_time_str.split("T")[1][:5]
+                        except IndexError:
+                            pass
+                    first_date = f"{date_str}{time_str}"
+                    found = True
+                    break
+        
+        # Fallback if no slots were parsed from the list but total > 0
+        if not found:
+            first_date = format_doctolib_datetime(next_slot) if next_slot else "N/A"
     else:
-        first_date = next_slot or "no slots in window"
+        if next_slot:
+            first_date = format_doctolib_datetime(next_slot)
+        else:
+            first_date = "no slots in window"
 
     return (
         meta.state_key,

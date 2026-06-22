@@ -33,6 +33,20 @@ def _practitioner_display_name(p):
     )
 
 
+def format_doctolib_datetime(dt_str: str) -> str:
+    """Format a Doctolib datetime string to a clean 'YYYY-MM-DD HH:MM' format."""
+    if not dt_str:
+        return ""
+    if "T" in dt_str:
+        try:
+            date_part = dt_str.split("T")[0]
+            time_part = dt_str.split("T")[1][:5]
+            return f"{date_part} {time_part}"
+        except IndexError:
+            return dt_str
+    return dt_str
+
+
 def main():
     config = load_config()
 
@@ -69,6 +83,9 @@ def main():
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
         )
     }
+
+    # Extract nested polling config safely
+    polling_cfg = config.get("polling", {})
 
     print(f"Fetching metadata for '{slug}'...")
     info_url = "https://www.doctolib.de/online_booking/api/slot_selection_funnel/v1/info.json"
@@ -150,14 +167,59 @@ def main():
         "visit_motive_ids": motive_id,
         "agenda_ids": agenda_ids_str,
         "practice_ids": practice_id,
-        "insurance_sector": config.get("insurance_sector", "public"),
-        "telehealth": str(config.get("telehealth", False)).lower(),
-        "limit": config.get("slot_limit", 15),
+        "insurance_sector": polling_cfg.get("insurance_sector", "public"),
+        "telehealth": str(polling_cfg.get("telehealth", False)).lower(),
+        "limit": polling_cfg.get("slot_limit", 15),
     }
 
     avail_resp = requests.get(avail_url, params=avail_params, headers=headers)
     avail_resp.raise_for_status()
     avail_json = avail_resp.json()
+
+    # ── Parse & Display Results (mirrors checker.py fix) ──
+    total = avail_json.get("total", 0)
+    next_slot = avail_json.get("next_slot")
+    
+    print("\n" + "="*50)
+    print(f"Clinic:       {practice_name}")
+    print(f"Practitioner: {practitioner_name}")
+    print(f"Total Slots:  {total}")
+    
+    if total > 0:
+        availabilities = avail_json.get("availabilities", [])
+        found = False
+        if availabilities:
+            for day_info in availabilities:
+                slots = day_info.get("slots", [])
+                if slots:
+                    date_str = day_info.get("date", "N/A")
+                    
+                    # Handle both string and dict slot formats from Doctolib
+                    first_slot = slots[0]
+                    if isinstance(first_slot, dict):
+                        start_time_str = first_slot.get("start_time", "")
+                    elif isinstance(first_slot, str):
+                        start_time_str = first_slot
+                    else:
+                        start_time_str = ""
+                        
+                    time_str = ""
+                    if start_time_str and "T" in start_time_str:
+                        try:
+                            time_str = " " + start_time_str.split("T")[1][:5]
+                        except IndexError:
+                            pass
+                    print(f"First Slot:   {date_str}{time_str}")
+                    found = True
+                    break
+        if not found:
+            print(f"First Slot:   {format_doctolib_datetime(next_slot) if next_slot else 'N/A'}")
+    else:
+        if next_slot:
+            print(f"Next Slot:    {format_doctolib_datetime(next_slot)}")
+        else:
+            print(f"Next Slot:    None in window")
+    print("="*50 + "\n")
 
     final_output = {
         "metadata_header": {
