@@ -10,6 +10,7 @@ import warnings
 from datetime import date, datetime
 from dataclasses import dataclass
 from collections import OrderedDict
+from typing import Optional
 
 import requests
 from colorama import init, Fore, Style
@@ -111,15 +112,28 @@ def load_config():
             )
             sys.exit(1)
 
-    config.setdefault("check_interval_seconds", 300)
-    config.setdefault("delay_between_urls_seconds", 3)
-    config.setdefault("upcoming_days", 15)
-    config.setdefault("insurance_sector", "public")
-    config.setdefault("telehealth", False)
-    config.setdefault("slot_limit", 15)
+    # ── Telegram ──
+    config.setdefault("telegram", {})
+    config["telegram"].setdefault("bot_token", None)
+    config["telegram"].setdefault("chat_id", None)
+    config["telegram"].setdefault("silent", False)
 
-    config.setdefault(
-        "startup_message",
+    # ── Polling ──
+    config.setdefault("polling", {})
+    config["polling"].setdefault("check_interval_seconds", 300)
+    config["polling"].setdefault("delay_between_urls_seconds", 3)
+    config["polling"].setdefault("upcoming_days", 15)
+    config["polling"].setdefault("insurance_sector", "public")
+    config["polling"].setdefault("telehealth", False)
+    config["polling"].setdefault("slot_limit", 15)
+
+    # ── Messages ──
+    config.setdefault("messages", {})
+    
+    config["messages"].setdefault("startup", {})
+    config["messages"]["startup"].setdefault("silent", False)
+    config["messages"]["startup"].setdefault(
+        "template",
         "🚀 <b>Doctolib Checker Started</b>\n\n"
         "🗓 {start_time}\n"
         "🎯 Monitoring <b>{doctor_count}</b> target(s) across "
@@ -129,35 +143,57 @@ def load_config():
         "📅 Window: next <code>{days}d</code>\n"
         "🏥 Insurance: <code>{insurance_sector}</code>",
     )
-    config.setdefault(
-        "shutdown_message",
+
+    config["messages"].setdefault("shutdown", {})
+    config["messages"]["shutdown"].setdefault("silent", False)
+    config["messages"]["shutdown"].setdefault(
+        "template",
         "🛑 <b>Doctolib Checker Stopped</b>\n\nMonitoring has been disabled.",
     )
-    config.setdefault(
-        "message_template",
+
+    config["messages"].setdefault("slot_found", {})
+    config["messages"]["slot_found"].setdefault("silent", False)
+    config["messages"]["slot_found"].setdefault(
+        "template",
         "🎉 <b>{total} slot(s) available</b>\n\n"
         "👨‍⚕️ {practitioner}\n"
         "🏥 {practice}\n"
         "📅 Earliest: <b>{first_date}</b>\n\n"
         '👉 <a href="{booking_url}">Open booking</a>',
     )
-    config.setdefault(
-        "user_agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+
+    config["messages"].setdefault("summary", {})
+    config["messages"]["summary"].setdefault("enabled", False)
+    config["messages"]["summary"].setdefault("interval_seconds", 0)
+    config["messages"]["summary"].setdefault("every_x_cycles", 0)
+    config["messages"]["summary"].setdefault("silent", True)
+    config["messages"]["summary"].setdefault(
+        "template",
+        "📊 <b>Heartbeat</b> · uptime <code>{uptime}</code>\n\n"
+        "🔄 <b>{total_cycles}</b> checks · "
+        "🎯 <b>{total_hits}</b> hits · "
+        "⚠️ <b>{total_errors}</b> errors\n"
+        "{last_slot_line}\n\n"
+        "⏭ Next check in ~<code>{next_check_in}</code>",
     )
 
-    # UI / behaviour flags
+    # ── Misc ──
     config.setdefault(
         "ui",
         {"terminal_table": False, "show_full_names": True, "colorblind_friendly": False},
     )
     config.setdefault("dry_run", False)
+    config.setdefault(
+        "user_agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    )
+    config.setdefault("urls", [])
 
-    if not config.get("telegram_bot_token") or not config.get("telegram_chat_id"):
+    if not config["telegram"]["bot_token"] or not config["telegram"]["chat_id"]:
         logging.warning("Telegram credentials missing in config. Alerts will fail.")
 
-    if not config.get("urls"):
+    if not config["urls"]:
         logging.warning("No URLs configured in config.json.")
 
     return config
@@ -182,7 +218,7 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-# ── 4. Session & Dataclass ──────────────────────────────────────────
+# ── 4. Session & Dataclasses ────────────────────────────────────────
 
 GLOBAL_SESSION = None
 
@@ -218,6 +254,21 @@ class BookingMeta:
     display_name: str
 
 
+@dataclass
+class SessionStats:
+    """In-memory stats for the current run session. Resets on restart."""
+
+    session_start: datetime
+    total_cycles: int = 0
+    total_hits: int = 0
+    total_errors: int = 0
+    last_summary_sent: Optional[datetime] = None
+    last_slot_time: Optional[datetime] = None
+    last_slot_practitioner: Optional[str] = None
+    last_slot_practice: Optional[str] = None
+    last_slot_total: int = 0
+
+
 def _practitioner_display_name(p):
     """Try every name field Doctolib might expose."""
     if not p:
@@ -231,7 +282,64 @@ def _practitioner_display_name(p):
     )
 
 
-# ── 5. Doctolib API ─────────────────────────────────────────────────
+# ── 5. Time formatting helpers ──────────────────────────────────────
+
+
+def format_uptime(start: datetime) -> str:
+    """Format a duration as a compact human-readable string.
+
+    Examples: '45m', '2h 34m', '1d 3h', '12s'
+    """
+    delta = datetime.now() - start
+    total_seconds = int(delta.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def format_ago(when: datetime) -> str:
+    """Format a past timestamp as a relative human-readable string.
+
+    Examples: 'just now', '5m ago', '2h 15m ago', '1d 4h ago'
+    """
+    delta = datetime.now() - when
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 60:
+        return "just now"
+    minutes, remainder = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m ago"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h ago"
+
+
+def format_duration(seconds: int) -> str:
+    """Format a static duration in seconds to a readable string."""
+    if seconds >= 3600:
+        h, rem = divmod(seconds, 3600)
+        m = rem // 60
+        return f"{h}h" if m == 0 else f"{h}h {m}m"
+    elif seconds >= 60:
+        return f"{seconds // 60}m"
+    else:
+        return f"{seconds}s"
+
+
+# ── 6. Doctolib API ─────────────────────────────────────────────────
 
 
 def get_booking_metadata(booking_url, config, session):
@@ -291,9 +399,6 @@ def get_booking_metadata(booking_url, config, session):
         if not practitioner_name:
             practitioner_name = f"Practitioner (ID: {practitioner_id})"
     else:
-        # No practitionerId in the URL — resolve a sensible name.
-
-        # Collect unique practitioner IDs from agendas that match motive + practice.
         unique_pids = []
         seen = set()
         for agenda in agendas:
@@ -371,10 +476,10 @@ def fetch_slot_total(booking_url, config, session, meta=None):
         "visit_motive_ids": meta.motive_id,
         "agenda_ids": meta.agenda_ids_str,
         "practice_ids": meta.practice_id,
-        "insurance_sector": config["insurance_sector"],
-        "telehealth": str(config["telehealth"]).lower(),
+        "insurance_sector": config["polling"]["insurance_sector"],
+        "telehealth": str(config["polling"]["telehealth"]).lower(),
         "start_date": date.today().isoformat(),
-        "limit": config["slot_limit"],
+        "limit": config["polling"]["slot_limit"],
     }
 
     avail_resp = session.get(
@@ -405,7 +510,7 @@ def fetch_slot_total(booking_url, config, session, meta=None):
     )
 
 
-# ── 6. Notifications ────────────────────────────────────────────────
+# ── 7. Notifications ────────────────────────────────────────────────
 
 
 def should_notify(prev_state, new_total):
@@ -426,33 +531,39 @@ def html_to_terminal_text(html_str):
     return text
 
 
-def send_telegram(config, text, max_attempts=5):
+def send_telegram(config, text, silent=None, max_attempts=5):
     term_text = html_to_terminal_text(text)
     bar_color = Fore.LIGHTBLACK_EX
     bar = f"{bar_color}{'─' * 60}{Style.RESET_ALL}"
     print(f"\n{bar}")
-    print(f"{bar_color} outgoing telegram {Style.RESET_ALL}")
+    silent_flag = " (silent)" if (silent if silent is not None else config["telegram"]["silent"]) else ""
+    print(f"{bar_color} outgoing telegram{silent_flag} {Style.RESET_ALL}")
     print(bar)
     for line in term_text.split("\n"):
-        print(f"  {line}")  # default terminal colour — readable
+        print(f"  {line}")
     print(f"{bar}\n")
 
     if config.get("dry_run"):
         logging.info(f"{Fore.YELLOW}[dry-run] Telegram send skipped.{Style.RESET_ALL}")
         return True
 
-    token = config.get("telegram_bot_token")
-    chat_id = config.get("telegram_chat_id")
+    token = config["telegram"]["bot_token"]
+    chat_id = config["telegram"]["chat_id"]
     if not token or not chat_id:
         logging.warning("Telegram credentials missing. Skipping API call.")
         return False
 
     url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
+    
+    # Resolve silent flag: explicit override > message-specific > global default
+    is_silent = silent if silent is not None else config["telegram"]["silent"]
+    
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+        "disable_notification": is_silent,
     }
     headers = {"User-Agent": "Doctolib-Checker/1.0", "Connection": "keep-alive"}
     session = get_session()
@@ -485,7 +596,93 @@ def send_telegram(config, text, max_attempts=5):
     return False
 
 
-# ── 7. Startup list renderer (grouped, NO dedupe) ──────────────────
+# ── 8. Summary / Heartbeat ──────────────────────────────────────────
+
+
+def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
+    """Send a periodic summary message if time or cycle interval has elapsed.
+
+    Returns True if a message was sent, False otherwise.
+    """
+    summary_cfg = config.get("messages", {}).get("summary", {})
+    if not summary_cfg.get("enabled", False):
+        return False
+
+    interval_secs = summary_cfg.get("interval_seconds", 0)
+    cycle_target = summary_cfg.get("every_x_cycles", 0)
+
+    # If both triggers are explicitly disabled/zero, do nothing
+    if interval_secs <= 0 and cycle_target <= 0:
+        return False
+
+    now = datetime.now()
+    time_trigger_met = False
+    cycle_trigger_met = False
+
+    # 1. Evaluate Time Trigger
+    if interval_secs > 0:
+        if stats.last_summary_sent is None:
+            time_trigger_met = True  # Always send the first one if time-based is on
+        else:
+            elapsed = (now - stats.last_summary_sent).total_seconds()
+            if elapsed >= interval_secs:
+                time_trigger_met = True
+
+    # 2. Evaluate Cycle Trigger
+    if cycle_target > 0:
+        if stats.total_cycles > 0 and stats.total_cycles % cycle_target == 0:
+            cycle_trigger_met = True
+
+    # 3. Fire if either condition is met
+    if not (time_trigger_met or cycle_trigger_met):
+        return False
+
+    # ── Build the last_slot_line ──
+    if stats.last_slot_time:
+        ago = format_ago(stats.last_slot_time)
+        last_slot_line = (
+            f"📅 Last slot: <b>{stats.last_slot_practitioner}</b> "
+            f"@ {stats.last_slot_practice} · <code>{ago}</code>"
+        )
+    else:
+        last_slot_line = "📅 No slots found yet this session"
+
+    # ── Format next_check_in ──
+    check_secs = config["polling"]["check_interval_seconds"]
+    if check_secs >= 3600:
+        h, rem = divmod(check_secs, 3600)
+        m = rem // 60
+        next_check_in = f"{h}h" if m == 0 else f"{h}h {m}m"
+    elif check_secs >= 60:
+        next_check_in = f"{check_secs // 60}m"
+    else:
+        next_check_in = f"{check_secs}s"
+
+    template = summary_cfg.get("template")
+
+    text = template.format(
+        uptime=format_uptime(stats.session_start),
+        total_cycles=stats.total_cycles,
+        total_hits=stats.total_hits,
+        total_errors=stats.total_errors,
+        last_slot_line=last_slot_line,
+        next_check_in=next_check_in,
+    )
+
+    # Resolve silent flag for summary (defaults to True in config)
+    is_summary_silent = summary_cfg.get("silent", True)
+    
+    sent = send_telegram(config, text, silent=is_summary_silent)
+    if sent:
+        stats.last_summary_sent = now
+        logging.info(
+            f"{Fore.LIGHTBLACK_EX}📊 Summary dispatched "
+            f"(cycle {stats.total_cycles}).{Style.RESET_ALL}"
+        )
+    return sent
+
+
+# ── 9. Startup list renderer (grouped, NO dedupe) ──────────────────
 
 
 def render_startup_list(preflight_meta, urls):
@@ -507,10 +704,10 @@ def render_startup_list(preflight_meta, urls):
     return "\n".join(lines).strip()
 
 
-# ── 8. Execution Cycle ──────────────────────────────────────────────
+# ── 10. Execution Cycle ─────────────────────────────────────────────
 
 
-def run_once(config, state, preflight_meta):
+def run_once(config, state, preflight_meta, stats: SessionStats):
     session = get_session()
     total_urls = len(config["urls"])
     logging.info(
@@ -520,6 +717,8 @@ def run_once(config, state, preflight_meta):
     hits = 0
     errors = 0
     empty = 0
+
+    stats.total_cycles += 1
 
     for i, url in enumerate(config["urls"], 1):
         try:
@@ -560,6 +759,12 @@ def run_once(config, state, preflight_meta):
             if total > 0:
                 status_text = f"{Fore.GREEN}✔ {total} slot(s) available{Style.RESET_ALL}"
                 hits += 1
+
+                # Update session stats with this slot hit
+                stats.last_slot_time = datetime.now()
+                stats.last_slot_practitioner = practitioner
+                stats.last_slot_practice = practice
+                stats.last_slot_total = total
             else:
                 status_text = f"{Fore.LIGHTBLACK_EX}no slots in window{Style.RESET_ALL}"
                 empty += 1
@@ -571,7 +776,7 @@ def run_once(config, state, preflight_meta):
             )
 
             if should_notify(prev_state, total):
-                msg = config["message_template"].format(
+                msg = config["messages"]["slot_found"]["template"].format(
                     total=total,
                     practitioner=practitioner,
                     practice=practice,
@@ -582,7 +787,8 @@ def run_once(config, state, preflight_meta):
                     f"    {Fore.YELLOW}🔔 Matches criteria! "
                     f"Dispatching notification.{Style.RESET_ALL}"
                 )
-                if send_telegram(config, msg):
+                is_slot_silent = config["messages"]["slot_found"].get("silent", False)
+                if send_telegram(config, msg, silent=is_slot_silent):
                     state[instance_key]["last_notified_total"] = total
                 else:
                     logging.warning(
@@ -610,7 +816,12 @@ def run_once(config, state, preflight_meta):
             )
 
         if i < total_urls:
-            time.sleep(config["delay_between_urls_seconds"])
+            time.sleep(config["polling"]["delay_between_urls_seconds"])
+
+    # Accumulate into session stats
+    if hits > 0:
+        stats.total_hits += 1
+    stats.total_errors += errors
 
     save_state(state)
     logging.info(
@@ -618,12 +829,12 @@ def run_once(config, state, preflight_meta):
         f"{Fore.GREEN}{hits} hit(s){Style.RESET_ALL} · "
         f"{empty} empty · "
         f"{Fore.RED}{errors} error(s){Style.RESET_ALL} · "
-        f"next in {config['check_interval_seconds']}s"
+        f"next in {config['polling']['check_interval_seconds']}s"
     )
     return hits, errors
 
 
-# ── 9. Timer & Main ─────────────────────────────────────────────────
+# ── 11. Timer & Main ────────────────────────────────────────────────
 
 
 def countdown_sleep(seconds):
@@ -668,18 +879,37 @@ def main():
         return
 
     logging.info(f"{Style.BRIGHT}Initialized Doctolib Tracker Configuration:{Style.RESET_ALL}")
-    logging.info(f"  • Interval:     {Fore.LIGHTBLUE_EX}{config['check_interval_seconds']} seconds{Style.RESET_ALL}")
-    logging.info(f"  • Date window:  {Fore.LIGHTBLUE_EX}{config['upcoming_days']} days{Style.RESET_ALL}")
+    logging.info(f"  • Interval:     {Fore.LIGHTBLUE_EX}{config['polling']['check_interval_seconds']} seconds{Style.RESET_ALL}")
+    logging.info(f"  • Date window:  {Fore.LIGHTBLUE_EX}{config['polling']['upcoming_days']} days{Style.RESET_ALL}")
     logging.info(f"  • Targets:      {Fore.LIGHTBLUE_EX}{len(config['urls'])} endpoint(s){Style.RESET_ALL}")
     logging.info(
         f"  • Parameters:   {Fore.LIGHTBLUE_EX}"
-        f"Insurance: {config['insurance_sector']} | "
-        f"Telehealth: {config['telehealth']}{Style.RESET_ALL}"
+        f"Insurance: {config['polling']['insurance_sector']} | "
+        f"Telehealth: {config['polling']['telehealth']}{Style.RESET_ALL}"
     )
     if config.get("dry_run"):
         logging.info(
             f"  • Mode:         {Fore.YELLOW}DRY RUN (no Telegram sends){Style.RESET_ALL}"
         )
+    
+    # Display summary trigger info
+    summary_cfg = config.get("messages", {}).get("summary", {})
+    if summary_cfg.get("enabled"):
+        triggers = []
+        interval_secs = summary_cfg.get("interval_seconds", 0)
+        cycle_target = summary_cfg.get("every_x_cycles", 0)
+        
+        if interval_secs > 0:
+            triggers.append(f"every {format_duration(interval_secs)}")
+        if cycle_target > 0:
+            triggers.append(f"every {cycle_target} cycles")
+        
+        if triggers:
+            trigger_str = " or ".join(triggers)
+            silent_str = " (silent)" if summary_cfg.get("silent", True) else ""
+            logging.info(
+                f"  • Summary:      {Fore.LIGHTBLUE_EX}{trigger_str}{silent_str}{Style.RESET_ALL}"
+            )
     print()
 
     session = get_session()
@@ -710,7 +940,7 @@ def main():
             )
 
         if i < len(config["urls"]):
-            time.sleep(config["delay_between_urls_seconds"])
+            time.sleep(config["polling"]["delay_between_urls_seconds"])
 
     config["urls"] = valid_urls
     print()
@@ -719,13 +949,16 @@ def main():
         logging.error("❌ No valid URLs passed verification. Exiting.")
         return
 
+    # Initialize session stats (before --once check so run_once always receives it)
+    stats = SessionStats(session_start=datetime.now())
+
     if args.once:
         state = load_state()
-        _hits, errors = run_once(config, state, preflight_meta)
+        _hits, errors = run_once(config, state, preflight_meta, stats)
         sys.exit(0 if errors == 0 else 1)
 
     try:
-        startup_msg = config.get("startup_message")
+        startup_msg = config["messages"]["startup"]["template"]
         if startup_msg:
             grouped_list = render_startup_list(preflight_meta, config["urls"])
             practice_count = len({m.practice_name for m in preflight_meta.values()})
@@ -733,24 +966,27 @@ def main():
                 doctor_count=len(config["urls"]),
                 practice_count=practice_count,
                 practitioner_list=grouped_list,
-                interval_mins=config["check_interval_seconds"] // 60,
-                days=config["upcoming_days"],
-                insurance_sector=config["insurance_sector"],
+                interval_mins=config["polling"]["check_interval_seconds"] // 60,
+                days=config["polling"]["upcoming_days"],
+                insurance_sector=config["polling"]["insurance_sector"],
                 start_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
-            if send_telegram(config, formatted_msg):
+            is_startup_silent = config["messages"]["startup"].get("silent", False)
+            if send_telegram(config, formatted_msg, silent=is_startup_silent):
                 logging.info(f"{Fore.YELLOW}🔔 Startup notification dispatched.{Style.RESET_ALL}")
 
         while True:
             state = load_state()
-            run_once(config, state, preflight_meta)
-            countdown_sleep(config["check_interval_seconds"])
+            run_once(config, state, preflight_meta, stats)
+            maybe_send_summary(config, stats)
+            countdown_sleep(config["polling"]["check_interval_seconds"])
 
     except KeyboardInterrupt:
         logging.info(f"\n{Fore.YELLOW}🛑 Shutting down gracefully...{Style.RESET_ALL}")
-        shutdown_msg = config.get("shutdown_message")
+        shutdown_msg = config["messages"]["shutdown"]["template"]
         if shutdown_msg:
-            send_telegram(config, shutdown_msg)
+            is_shutdown_silent = config["messages"]["shutdown"].get("silent", False)
+            send_telegram(config, shutdown_msg, silent=is_shutdown_silent)
 
 
 if __name__ == "__main__":

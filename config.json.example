@@ -1,23 +1,46 @@
 {
-  "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
-  "telegram_chat_id": "YOUR_CHAT_ID_HERE",
-  "check_interval_seconds": 300,
-  "delay_between_urls_seconds": 3,
-  "upcoming_days": 15,
-  "insurance_sector": "public",
-  "telehealth": false,
-  "slot_limit": 15,
-  "startup_message": "🚀 <b>Doctolib Checker Started</b>\n\n🗓 {start_time}\n🎯 Monitoring <b>{doctor_count}</b> target(s) across <b>{practice_count}</b> practice(s)\n\n{practitioner_list}\n\n⏱ Poll: every <code>{interval_mins}m</code>\n📅 Window: next <code>{days}d</code>\n🏥 Insurance: <code>{insurance_sector}</code>",
-  "shutdown_message": "🛑 <b>Doctolib Checker Stopped</b>\n\nMonitoring has been disabled.",
-  "message_template": "🎉 <b>{total} slot(s) available</b>\n\n👨‍⚕️ {practitioner}\n🏥 {practice}\n📅 Earliest: <b>{first_date}</b>\n\n👉 <a href=\"{booking_url}\">Open booking</a>",
-  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "telegram": {
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_CHAT_ID_HERE",
+    "silent": false
+  },
+  "polling": {
+    "check_interval_seconds": 300,
+    "delay_between_urls_seconds": 3,
+    "upcoming_days": 15,
+    "insurance_sector": "public",
+    "telehealth": false,
+    "slot_limit": 15
+  },
+  "messages": {
+    "startup": {
+      "template": "🚀 <b>Doctolib Checker Started</b>\n\n🗓 {start_time}\n🎯 Monitoring <b>{doctor_count}</b> target(s) across <b>{practice_count}</b> practice(s)\n\n{practitioner_list}\n\n⏱ Poll: every <code>{interval_mins}m</code>\n📅 Window: next <code>{days}d</code>\n🏥 Insurance: <code>{insurance_sector}</code>",
+      "silent": false
+    },
+    "shutdown": {
+      "template": "🛑 <b>Doctolib Checker Stopped</b>\n\nMonitoring has been disabled.",
+      "silent": false
+    },
+    "slot_found": {
+      "template": "🎉 <b>{total} slot(s) available</b>\n\n👨‍⚕️ {practitioner}\n🏥 {practice}\n📅 Earliest: <b>{first_date}</b>\n\n👉 <a href=\"{booking_url}\">Open booking</a>",
+      "silent": false
+    },
+    "summary": {
+      "enabled": false,
+      "interval_seconds": 0,
+      "every_x_cycles": 12,
+      "template": "📊 <b>Heartbeat</b> · uptime <code>{uptime}</code>\n\n🔄 <b>{total_cycles}</b> checks · 🎯 <b>{total_hits}</b> hits · ⚠️ <b>{total_errors}</b> errors\n{last_slot_line}\n\n⏭ Next check in ~<code>{next_check_in}</code>",
+      "silent": true
+    }
+  },
   "ui": {
     "terminal_table": false,
     "show_full_names": true,
     "colorblind_friendly": false
   },
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "dry_run": false,
   "urls": [
-    "https://www.doctolib.de/SPECIALITY/CITY/DOCTOR-SLUG/booking/availabilities?specialityId=XXXX&telehealth=false&placeId=practice-XXXX&insuranceSectorEnabled=true&insuranceSector=public&motiveIds%5B%5D=XXXX&practitionerId=XXXX&pid=practice-XXXX&source=profile"
+    "https://www.doctolib.de/EXAMPLE-PATH/booking/availabilities?specialityId=9215&telehealth=false&placeId=practice-XXXXX&insuranceSectorEnabled=true&insuranceSector=public&motiveIds%5B%5D=XXXXXXX&practitionerId=XXXXXXX&pid=practice-XXXXX&source=profile"
   ]
 }
