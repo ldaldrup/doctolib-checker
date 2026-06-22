@@ -23,7 +23,11 @@
     },
     "slot_found": {
       "template": "🎉 <b>{total} slot(s) available</b>\n\n👨‍⚕️ {practitioner}\n🏥 {practice}\n📅 Earliest: <b>{first_date}</b>\n\n👉 <a href=\"{booking_url}\">Open booking</a>",
-      "silent": false
+      "silent": false,
+      "effect": {
+        "enabled": false,
+        "id": "5046509860389126442"
+      }
     },
     "summary": {
       "enabled": false,

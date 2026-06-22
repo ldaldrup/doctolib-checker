@@ -161,6 +161,11 @@ def load_config():
         "📅 Earliest: <b>{first_date}</b>\n\n"
         '👉 <a href="{booking_url}">Open booking</a>',
     )
+    
+    # ── Slot Found Effect ──
+    config["messages"]["slot_found"].setdefault("effect", {})
+    config["messages"]["slot_found"]["effect"].setdefault("enabled", False)
+    config["messages"]["slot_found"]["effect"].setdefault("id", "5046509860389126442") # 🎆 Fireworks
 
     config["messages"].setdefault("summary", {})
     config["messages"]["summary"].setdefault("enabled", False)
@@ -570,13 +575,21 @@ def html_to_terminal_text(html_str):
     return text
 
 
-def send_telegram(config, text, silent=None, max_attempts=5):
+def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
     term_text = html_to_terminal_text(text)
     bar_color = Fore.LIGHTBLACK_EX
     bar = f"{bar_color}{'─' * 60}{Style.RESET_ALL}"
     print(f"\n{bar}")
-    silent_flag = " (silent)" if (silent if silent is not None else config["telegram"]["silent"]) else ""
-    print(f"{bar_color} outgoing telegram{silent_flag} {Style.RESET_ALL}")
+    
+    # Build flags for terminal output
+    flags = []
+    if silent if silent is not None else config["telegram"]["silent"]:
+        flags.append("silent")
+    if effect_id:
+        flags.append("🎆 effect")
+    flag_str = f" ({', '.join(flags)})" if flags else ""
+        
+    print(f"{bar_color} outgoing telegram{flag_str} {Style.RESET_ALL}")
     print(bar)
     for line in term_text.split("\n"):
         print(f"  {line}")
@@ -604,6 +617,11 @@ def send_telegram(config, text, silent=None, max_attempts=5):
         "disable_web_page_preview": True,
         "disable_notification": is_silent,
     }
+    
+    # Add animated effect if provided (only works in private chats)
+    if effect_id:
+        payload["message_effect_id"] = effect_id
+        
     headers = {"User-Agent": "Doctolib-Checker/1.0", "Connection": "keep-alive"}
     session = get_session()
 
@@ -826,8 +844,13 @@ def run_once(config, state, preflight_meta, stats: SessionStats):
                     f"    {Fore.YELLOW}🔔 Matches criteria! "
                     f"Dispatching notification.{Style.RESET_ALL}"
                 )
+                
+                # Resolve silent and effect config
                 is_slot_silent = config["messages"]["slot_found"].get("silent", False)
-                if send_telegram(config, msg, silent=is_slot_silent):
+                effect_cfg = config["messages"]["slot_found"].get("effect", {})
+                effect_id = effect_cfg.get("id") if effect_cfg.get("enabled") else None
+                
+                if send_telegram(config, msg, silent=is_slot_silent, effect_id=effect_id):
                     state[instance_key]["last_notified_total"] = total
                 else:
                     logging.warning(
