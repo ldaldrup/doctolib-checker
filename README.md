@@ -27,26 +27,26 @@ The script relies on a `config.json` file in the root directory to manage its be
 
 ### Telegram Settings
 
-- **telegram_bot_token** (String): The token provided by Telegram's BotFather when you create your bot.
-- **telegram_chat_id** (String): The numerical ID of the chat, user, or group where the bot should send notifications.
+- `telegram_bot_token` (String): The token provided by Telegram's BotFather when you create your bot.
+- `telegram_chat_id` (String): The numerical ID of the chat, user, or group where the bot should send notifications.
 
 ### Timing & Polling (Anti-Ban)
 
-- **check_interval_seconds** (Integer): The wait time in seconds between full check cycles. 
+- `check_interval_seconds` (Integer): The wait time in seconds between full check cycles. 
   - *Recommendation:* Set to `300` (5 minutes) or higher. Doctolib aggressively rate-limits; setting this too low will result in a temporary IP ban.
-- **delay_between_urls_seconds** (Integer): The pause in seconds between fetching individual URLs *during* a single cycle. Prevents the script from hammering the server with concurrent requests.
+- `delay_between_urls_seconds` (Integer): The pause in seconds between fetching individual URLs *during* a single cycle. Prevents the script from hammering the server with concurrent requests.
   - *Recommendation:* Keep between `2` and `5` seconds.
 
 ### Search Criteria
 
-- **upcoming_days** (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
-- `**insurance_sector**` (String): The insurance sector to filter by. Either `"public"` or `"private"`. Defaults to `"public"`.
-- `**telehealth**` (Boolean): Whether to include telehealth/remote appointments. Defaults to `false`.
-- `**slot_limit**` (Integer): Maximum number of individual time slots fetched per API call. Defaults to `15`. Note: this does not limit how many slots are reported—the script uses the `total` count from the API response.
+- `upcoming_days` (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
+- `insurance_sector` (String): The insurance sector to filter by. Either `"public"` or `"private"`. Defaults to `"public"`.
+- `telehealth` (Boolean): Whether to include telehealth/remote appointments. Defaults to `false`.
+- `slot_limit` (Integer): Maximum number of individual time slots fetched per API call. Defaults to `15`. Note: this does not limit how many slots are reported—the script uses the `total` count from the API response.
 
 ### Notifications & Messages
 
-- `**startup_message**` (String): The Telegram message sent at script startup. Placeholders:
+- `startup_message` (String): The Telegram message sent at script startup. Placeholders:
   - `{start_time}`: Timestamp when the script started.
   - `{doctor_count}`: Number of practitioners being monitored.
   - `{practice_count}`: Number of unique practices being monitored.
@@ -54,26 +54,26 @@ The script relies on a `config.json` file in the root directory to manage its be
   - `{interval_mins}`: Check interval in minutes.
   - `{days}`: Upcoming days window.
   - `{insurance_sector}`: The configured insurance sector.
-- `**shutdown_message**` (String): The Telegram message sent when the script stops.
-- `**message_template**` (String): The layout of the Telegram message sent when slots are found. Placeholders:
+- `shutdown_message` (String): The Telegram message sent when the script stops.
+- `message_template` (String): The layout of the Telegram message sent when slots are found. Placeholders:
   - `{total}`: Number of available slots found.
   - `{practitioner}`: The doctor's name.
   - `{practice}`: The practice/clinic name.
   - `{first_date}`: The earliest available appointment date.
   - `{booking_url}`: The direct link to book the appointment.
-- `**user_agent**` (String): The browser User-Agent string used to mimic a real web browser. You generally do not need to change this unless Doctolib blocks the default one.
+- `user_agent` (String): The browser User-Agent string used to mimic a real web browser. You generally do not need to change this unless Doctolib blocks the default one.
 
 ### UI & Behavior
 
-- `**ui**` (Object): Controls terminal output formatting.
-  - `**terminal_table**` (Boolean): Renders results in a column-aligned table. Defaults to `false`.
-  - `**show_full_names**` (Boolean): Shows full names in terminal output. Defaults to `true`.
-  - `**colorblind_friendly**` (Boolean): Reserved for future use. Defaults to `false`.
-- `**dry_run**` (Boolean): If `true`, runs all checks normally but skips Telegram API calls. Useful for testing configuration. Can also be set via the `--dry-run` CLI flag. Defaults to `false`.
+- `ui` (Object): Controls terminal output formatting.
+  - `terminal_table` (Boolean): Renders results in a column-aligned table. Defaults to `false`.
+  - `show_full_names` (Boolean): Shows full names in terminal output. Defaults to `true`.
+  - `colorblind_friendly` (Boolean): Reserved for future use. Defaults to `false`.
+- `dry_run` (Boolean): If `true`, runs all checks normally but skips Telegram API calls. Useful for testing configuration. Can also be set via the `--dry-run` CLI flag. Defaults to `false`.
 
 ### Target Doctors/Clinics
 
-- `**urls**` (Array of Strings): A list of exact Doctolib booking URLs to monitor. 
+- `urls` (Array of Strings): A list of exact Doctolib booking URLs to monitor. 
   - *Important:* These must be the final URLs from the booking process, containing all query parameters (e.g., `specialityId`, `motiveIds`, `practitionerId`). Simply linking to a doctor's profile page will not work.
 
 ## Usage
