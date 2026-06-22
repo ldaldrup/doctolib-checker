@@ -60,7 +60,7 @@ Message templates use placeholders and can be individually silenced:
 - `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
 - `effect` (Object, optional): Telegram notification effect.
   - `enabled` (Boolean): If `true`, plays a notification effect on Telegram. Defaults to `false`.
-  - `id` (String): Telegram effect ID (e.g., `"5046509860389126442"` for fireworks).
+  - `id` (String): Telegram effect ID (e.g., `"5046509860389126442"` for fireworks. See [wiz0u/MessageEffectIds.txt](https://gist.github.com/wiz0u/2a6d40c8f635687be363d72251a264da) for a list of animated and non-animated message effects). 
 
 #### Summary / Heartbeat Message (`messages.summary`)
 - `enabled` (Boolean): If `true`, periodically sends a monitoring status update. Defaults to `false`.
@@ -80,7 +80,7 @@ Message templates use placeholders and can be individually silenced:
 ### Target URLs
 
 - `urls` (Array of Strings): Exact Doctolib booking URLs to monitor.
-  - **Important:** Must include all query parameters (`specialityId`, `motiveIds`, `practitionerId`, etc.). Copy from the final booking step in your browser—a profile page link alone will not work.
+  - **Important:** Must include all query parameters (`specialityId`, `motiveIds`, `practitionerId`, etc.). Copy from the final booking step in your browser. A profile page link alone will not work.
 
 ## Usage
 
