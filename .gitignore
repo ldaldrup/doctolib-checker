@@ -5,6 +5,7 @@ config.json
 # Runtime state and logs
 state/state.json
 logs/*.log
+temp/
 
 # Python
 __pycache__/

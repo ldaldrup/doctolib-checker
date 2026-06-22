@@ -5,6 +5,7 @@ import json
 import logging
 import argparse
 import urllib.parse
+import re
 from datetime import date
 from dataclasses import dataclass
 import requests
@@ -23,7 +24,6 @@ LOG_DIR = 'logs'
 LOG_FILE = os.path.join(LOG_DIR, 'checker.log')
 CONFIG_FILE = 'config.json'
 
-# Refactoring 1: API Endpoint Constants
 DOCTOLIB_BASE_URL = "https://www.doctolib.de"
 DOCTOLIB_INFO_API = f"{DOCTOLIB_BASE_URL}/online_booking/api/slot_selection_funnel/v1/info.json"
 DOCTOLIB_AVAILABILITIES_API = f"{DOCTOLIB_BASE_URL}/availabilities.json"
@@ -32,7 +32,6 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 # --- 2. Logging Setup with Color Support ---
 
 class ColorFormatter(logging.Formatter):
-    """Custom formatter to add colors to the console output"""
     COLORS = {
         logging.DEBUG: Style.DIM + Fore.CYAN,
         logging.INFO: Fore.WHITE,
@@ -64,7 +63,6 @@ def setup_directories_and_logging():
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         logging.error(f"Configuration file '{CONFIG_FILE}' not found!")
-        logging.info(f"Please copy 'config.example.json' to '{CONFIG_FILE}' and fill in your details.")
         sys.exit(1)
 
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -74,19 +72,17 @@ def load_config():
             logging.error(f"Failed to parse '{CONFIG_FILE}'. Please check for JSON syntax errors: {e}")
             sys.exit(1)
             
-    # Legacy config migration string replacements
-    msg_template = config.get('message_template', '')
-    if '{clinic}' in msg_template:
-        config['message_template'] = msg_template.replace('{clinic}', '{practice}')
-        config['message_template'] = config['message_template'].replace('Surgeon', 'Practitioner')
-
-    # Fallback configuration variables (Updated with new HTML templates)
+    # Parameterization Defaults
     config.setdefault('check_interval_seconds', 300)
     config.setdefault('delay_between_urls_seconds', 3)
     config.setdefault('upcoming_days', 15)
+    config.setdefault('insurance_sector', 'public')
+    config.setdefault('telehealth', False)
+    config.setdefault('slot_limit', 15)
+    
     config.setdefault('startup_message', 
         "🚀 <b>Doctolib Checker Started</b>\n\n"
-        "👥 Monitoring <b>{doctor_count}</b> practitioner(s):\n"
+        "👥 Monitoring <b>{doctor_count}</b> target(s):\n"
         "{practitioner_list}\n\n"
         "⏱ Interval: <code>{interval_mins}m</code>\n"
         "📅 Window: <code>{days}d</code>"
@@ -130,7 +126,6 @@ def save_state(state):
 GLOBAL_SESSION = None
 
 def get_session():
-    """Returns a module-level requests.Session with retry strategy."""
     global GLOBAL_SESSION
     if GLOBAL_SESSION is None:
         session = requests.Session()
@@ -159,12 +154,8 @@ class BookingMeta:
 # --- 5. Doctolib API Fetching ---
 
 def get_booking_metadata(booking_url, config, session):
-    """Fetches practice and practitioner info from info.json API."""
     parsed = urllib.parse.urlparse(booking_url)
     path_parts = parsed.path.split('/')
-
-    if 'availabilities' not in path_parts:
-        logging.warning(f"URL might be incomplete (missing '/booking/availabilities')")
 
     try:
         slug_idx = path_parts.index('booking') - 1
@@ -190,9 +181,12 @@ def get_booking_metadata(booking_url, config, session):
 
     agendas = info_data.get('agendas', [])
     practitioners = info_data.get('practitioners', [])
-    profile_name = info_data.get('profile', {}).get('name') or slug
-
+    
+    # Better extraction of the entity name instead of the raw slug
+    profile = info_data.get('profile', {})
+    profile_name = profile.get('name_with_title') or profile.get('name') or slug
     practice_name = profile_name
+
     practitioner_name = None
 
     if practitioner_id and practitioner_id != 'NO_PREFERENCE':
@@ -204,12 +198,13 @@ def get_booking_metadata(booking_url, config, session):
                 else:
                     first_name = p.get('first_name', '')
                     last_name = p.get('last_name', '')
-                    practitioner_name = f"Dr. {first_name} {last_name}".strip()
+                    practitioner_name = f"{first_name} {last_name}".strip()
                 break
         if not practitioner_name:
             practitioner_name = f"Practitioner (ID: {practitioner_id})"
     else:
-        practitioner_name = "First Available (No Preference)"
+        # If no practitioner ID is provided, the target is whoever the profile resolves to.
+        practitioner_name = "Any Practitioner"
 
     valid_agenda_ids = []
     for agenda in agendas:
@@ -225,6 +220,7 @@ def get_booking_metadata(booking_url, config, session):
     if not valid_agenda_ids:
         raise ValueError(f"No specific agenda found for motive={motive_id}, practitioner={practitioner_id}")
 
+    # The state key still uses slug so it remains unique across configurations
     state_key = f"{slug}_{practitioner_id}" if practitioner_id else slug
     agenda_ids_str = "-".join(valid_agenda_ids)
 
@@ -237,20 +233,20 @@ def get_booking_metadata(booking_url, config, session):
         practice_id=practice_id
     )
 
-
-def fetch_slot_total(booking_url, config, session):
-    """Fully polls availabilities using extracted metadata."""
-    meta = get_booking_metadata(booking_url, config, session)
+def fetch_slot_total(booking_url, config, session, meta=None):
+    if meta is None:
+        meta = get_booking_metadata(booking_url, config, session)
+        
     headers = {'User-Agent': config['user_agent']}
 
     params = {
         'visit_motive_ids': meta.motive_id,
         'agenda_ids': meta.agenda_ids_str,
         'practice_ids': meta.practice_id,
-        'insurance_sector': 'public',
-        'telehealth': 'false',
+        'insurance_sector': config['insurance_sector'],
+        'telehealth': str(config['telehealth']).lower(),
         'start_date': date.today().isoformat(),
-        'limit': config['upcoming_days']
+        'limit': config['slot_limit']
     }
 
     avail_resp = session.get(DOCTOLIB_AVAILABILITIES_API, params=params, headers=headers, timeout=10)
@@ -258,18 +254,17 @@ def fetch_slot_total(booking_url, config, session):
     avail_data = avail_resp.json()
 
     total = avail_data.get('total', 0)
+    next_slot = avail_data.get('next_slot') or 'None listed'
     
-    # Addition: Extract First Available Date
-    # If total > 0, it's inside availabilities list. If total == 0, fallback to next_slot
     first_date = "N/A"
     if total > 0:
         availabilities = avail_data.get('availabilities', [])
         if availabilities:
             first_date = availabilities[0].get('date', 'N/A')
     else:
-        first_date = avail_data.get('next_slot', 'Unknown')
+        first_date = next_slot
 
-    return meta.state_key, meta.practitioner_name, meta.practice_name, total, booking_url, first_date
+    return meta.state_key, meta.practitioner_name, meta.practice_name, total, booking_url, first_date, next_slot
 
 # --- 6. Notifications & Telegram ---
 
@@ -279,13 +274,28 @@ def should_notify(prev_state, new_total):
         return True
     return False
 
+def html_to_terminal_text(html_str):
+    def replace_link(match):
+        url = match.group(1)
+        text = match.group(2)
+        return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+    text = re.sub(r'<a\s+href=[\'"]([^\'"]+)[\'"]>(.*?)</a>', replace_link, html_str)
+    text = re.sub(r'</?(b|i|strong|em|code)>', '', text)
+    return text
 
 def send_telegram(config, text, max_attempts=5):
-    """Send a Telegram message with manual retry on connection errors."""
+    # Lightweight terminal echo without rigid box borders
+    term_text = html_to_terminal_text(text)
+    print(f"\n{Fore.BLUE}--- Outgoing Telegram Message ---{Style.RESET_ALL}")
+    for line in term_text.split('\n'):
+        print(f"{Fore.BLUE}  {line}{Style.RESET_ALL}")
+    print(f"{Fore.BLUE}---------------------------------{Style.RESET_ALL}\n")
+
     token = config.get('telegram_bot_token')
     chat_id = config.get('telegram_chat_id')
     if not token or not chat_id:
-        logging.warning("Telegram credentials missing. Skipping notification.")
+        logging.warning("Telegram credentials missing. Skipping API call.")
         return False
 
     url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
@@ -295,70 +305,52 @@ def send_telegram(config, text, max_attempts=5):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    headers = {
-        "User-Agent": "Doctolib-Checker/1.0",
-        "Connection": "keep-alive",
-    }
-
+    headers = {"User-Agent": "Doctolib-Checker/1.0", "Connection": "keep-alive"}
     session = get_session()
 
     for attempt in range(1, max_attempts + 1):
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=30)
-
-            if resp.status_code != 200:
-                try:
-                    err_data = resp.json()
-                    err_desc = err_data.get('description', 'Unknown error')
-                except Exception:
-                    err_desc = resp.text[:200]
-
-                if resp.status_code in (401, 403, 404):
-                    logging.error(f"Telegram API permanent error ({resp.status_code}): {err_desc}")
-                    logging.error("Check your bot token and chat ID in config.json.")
-                    return False
-
-                logging.warning(f"Telegram API returned {resp.status_code}: {err_desc} (attempt {attempt}/{max_attempts})")
-            else:
+            if resp.status_code == 200:
                 return True
-
-        except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
-            logging.warning(f"Connection error on attempt {attempt}/{max_attempts}: {e}")
-        except requests.exceptions.Timeout:
-            logging.warning(f"Timeout on attempt {attempt}/{max_attempts}")
+            logging.warning(f"Telegram API returned {resp.status_code} (attempt {attempt}/{max_attempts})")
         except Exception as e:
-            logging.error(f"Unexpected error sending Telegram message (attempt {attempt}/{max_attempts}): {e}")
+            logging.error(f"Telegram message error (attempt {attempt}/{max_attempts}): {e}")
 
         if attempt < max_attempts:
-            wait_time = min(2 ** attempt, 32)
-            logging.info(f"  Retrying in {wait_time}s...")
-            time.sleep(wait_time)
+            time.sleep(min(2 ** attempt, 32))
 
-    logging.error(f"Failed to send Telegram message after {max_attempts} attempts.")
     return False
 
 # --- 7. Execution Cycle ---
 
-def run_once(config, state):
+def run_once(config, state, preflight_meta):
     session = get_session()
-    logging.info(f"{Fore.CYAN}--- Starting Check Cycle for {len(config['urls'])} Practitioner(s) ---{Style.RESET_ALL}")
+    logging.info(f"{Fore.CYAN}--- Starting Check Cycle for {len(config['urls'])} Target(s) ---{Style.RESET_ALL}")
 
     for i, url in enumerate(config['urls'], 1):
         try:
-            state_key, practitioner, practice, total, booking_url, first_date = fetch_slot_total(url, config, session)
+            meta = preflight_meta.get(url)
+            state_key, practitioner, practice, total, booking_url, first_date, next_slot = fetch_slot_total(url, config, session, meta)
             
-            if state_key not in state:
-                state[state_key] = {'last_total': 0, 'last_notified_total': 0}
+            # Using the instance identifier since user config may have intentional duplicates
+            instance_key = f"{i}_{state_key}"
+            
+            if instance_key not in state:
+                state[instance_key] = {'last_total': 0, 'last_notified_total': 0}
                 
-            prev_state = state[state_key]
+            prev_state = state[instance_key]
 
+            # Better Layout Output
+            pract_str = practitioner if len(practitioner) <= 24 else practitioner[:21] + "..."
+            prac_str = practice if len(practice) <= 24 else practice[:21] + "..."
+            
             if total > 0:
                 status_text = f"{Fore.GREEN}✔ {total} slot(s) available!{Style.RESET_ALL}"
             else:
-                status_text = f"{Fore.LIGHTBLACK_EX}✘ No slots. Next: {first_date}{Style.RESET_ALL}"
+                status_text = f"{Fore.LIGHTBLACK_EX}✘ 0 slots (in {config['upcoming_days']}d). Next: {next_slot}{Style.RESET_ALL}"
 
-            short_practice = practice if len(practice) <= 20 else practice[:17] + "..."
-            logging.info(f"[{i}/{len(config['urls'])}] {Fore.LIGHTCYAN_EX}{short_practice:<20}{Style.RESET_ALL} | {Fore.LIGHTMAGENTA_EX}{practitioner:<32}{Style.RESET_ALL} -> {status_text}")
+            logging.info(f"[{i}/{len(config['urls'])}] {Fore.LIGHTMAGENTA_EX}{pract_str:<25}{Style.RESET_ALL} | {Fore.LIGHTCYAN_EX}{prac_str:<25}{Style.RESET_ALL} -> {status_text}")
 
             if should_notify(prev_state, total):
                 msg = config['message_template'].format(
@@ -368,27 +360,23 @@ def run_once(config, state):
                     booking_url=booking_url,
                     first_date=first_date
                 )
-                logging.info(f"    {Fore.YELLOW}🔔 Matches criteria! Dispatching Telegram notification.{Style.RESET_ALL}")
+                logging.info(f"    {Fore.YELLOW}🔔 Matches criteria! Dispatching notification.{Style.RESET_ALL}")
                 if send_telegram(config, msg):
-                    state[state_key]['last_notified_total'] = total
+                    state[instance_key]['last_notified_total'] = total
                 else:
                     logging.warning(f"    {Fore.YELLOW}Notification failed — will retry next cycle.{Style.RESET_ALL}")
                 
             elif total == 0 and prev_state.get('last_notified_total', 0) > 0:
                 logging.info(f"    {Fore.LIGHTBLACK_EX}Slots dropped to 0. Resetting notifier.{Style.RESET_ALL}")
-                state[state_key]['last_notified_total'] = 0
+                state[instance_key]['last_notified_total'] = 0
 
-            state[state_key]['last_total'] = total
+            state[instance_key]['last_total'] = total
             
-        except requests.exceptions.RequestException as e:
-            logging.error(f"[{i}/{len(config['urls'])}] Connection error: {e}")
         except Exception as e:
             logging.error(f"[{i}/{len(config['urls'])}] Error processing URL: {e}")
 
         if i < len(config['urls']):
-            delay = config['delay_between_urls_seconds']
-            logging.info(f"    {Fore.LIGHTBLACK_EX}Pausing {delay}s before checking the next practitioner...{Style.RESET_ALL}")
-            time.sleep(delay)
+            time.sleep(config['delay_between_urls_seconds'])
 
     save_state(state)
     logging.info(f"{Fore.CYAN}--- Check Cycle Complete ---{Style.RESET_ALL}")
@@ -417,71 +405,71 @@ def main():
     config = load_config()
 
     if not config['urls']:
-        logging.warning("No URLs are configured. Open config.json to add them.")
         return
 
     logging.info(f"{Style.BRIGHT}Initialized Doctolib Tracker Configuration:{Style.RESET_ALL}")
     logging.info(f"  • Interval:     {Fore.LIGHTBLUE_EX}{config['check_interval_seconds']} seconds{Style.RESET_ALL}")
-    logging.info(f"  • Pacing delay: {Fore.LIGHTBLUE_EX}{config['delay_between_urls_seconds']} seconds{Style.RESET_ALL}")
     logging.info(f"  • Date window:  {Fore.LIGHTBLUE_EX}{config['upcoming_days']} days{Style.RESET_ALL}")
-    logging.info(f"  • Targets:      {Fore.LIGHTBLUE_EX}{len(config['urls'])} practitioner(s){Style.RESET_ALL}")
+    logging.info(f"  • Targets:      {Fore.LIGHTBLUE_EX}{len(config['urls'])} endpoint(s){Style.RESET_ALL}")
+    logging.info(f"  • Parameters:   {Fore.LIGHTBLUE_EX}Insurance: {config['insurance_sector']} | Telehealth: {config['telehealth']}{Style.RESET_ALL}")
     print()
+
+    session = get_session()
+    logging.info(f"{Style.BRIGHT}Running Pre-flight Verification on URLs...{Style.RESET_ALL}")
+    
+    practitioner_list_text = ""
+    active_urls = []
+    preflight_meta = {}
+    
+    for i, url in enumerate(config['urls'], 1):
+        try:
+            meta = get_booking_metadata(url, config, session)
+            _ = fetch_slot_total(url, config, session, meta)
+            
+            # Using clean names resolved from the API
+            practitioner_list_text += f"• {meta.practitioner_name} ({meta.practice_name})\n"
+            active_urls.append(url)
+            preflight_meta[url] = meta
+            logging.info(f"[{i}/{len(config['urls'])}] {Fore.GREEN}[OK]{Style.RESET_ALL} JSON verified for {meta.practitioner_name}")
+        except Exception as e:
+            logging.error(f"[{i}/{len(config['urls'])}] {Fore.RED}[FAIL]{Style.RESET_ALL} Verification failed: {e}")
+        
+        if i < len(config['urls']):
+            time.sleep(config['delay_between_urls_seconds'])
+
+    config['urls'] = active_urls
+    print()
+    
+    if not config['urls']:
+        logging.error("❌ No valid URLs passed verification. Exiting.")
+        return
 
     if args.once:
         state = load_state()
-        run_once(config, state)
+        run_once(config, state, preflight_meta)
         return
 
     try:
-        session = get_session()
-        
-        logging.info(f"{Style.BRIGHT}Fetching practice and practitioner details for startup message...{Style.RESET_ALL}")
-        practitioner_list_text = ""
-        active_urls = []
-        
-        for i, url in enumerate(config['urls'], 1):
-            try:
-                meta = get_booking_metadata(url, config, session)
-                practitioner_list_text += f"• {meta.practitioner_name} — <i>{meta.practice_name}</i>\n"
-                active_urls.append(url)
-            except Exception as e:
-                logging.warning(f"⚠️ Skipping malformed or invalid URL {i}: {e}")
-            
-            if i < len(config['urls']):
-                time.sleep(config['delay_between_urls_seconds'])
-
-        config['urls'] = active_urls
-        
-        if not config['urls']:
-            logging.error("❌ No valid URLs to monitor. Exiting.")
-            return
-
         startup_msg = config.get('startup_message')
         if startup_msg:
-            try:
-                formatted_msg = startup_msg.format(
-                    doctor_count=len(config['urls']), 
-                    practitioner_list=practitioner_list_text.strip(),
-                    interval_mins=config['check_interval_seconds'] // 60,
-                    days=config['upcoming_days']
-                )
-                if send_telegram(config, formatted_msg):
-                    logging.info(f"{Fore.YELLOW}🔔 Startup notification sent to Telegram.{Style.RESET_ALL}\n")
-                else:
-                    logging.error(f"Failed to send startup notification.\n")
-            except Exception as e:
-                logging.error(f"Failed to format startup notification: {e}\n")
+            formatted_msg = startup_msg.format(
+                doctor_count=len(config['urls']), 
+                practitioner_list=practitioner_list_text.strip(),
+                interval_mins=config['check_interval_seconds'] // 60,
+                days=config['upcoming_days']
+            )
+            if send_telegram(config, formatted_msg):
+                logging.info(f"{Fore.YELLOW}🔔 Startup notification dispatched.{Style.RESET_ALL}\n")
 
         while True:
             state = load_state()
-            run_once(config, state)
+            run_once(config, state, preflight_meta)
             countdown_sleep(config['check_interval_seconds'])
             
     except KeyboardInterrupt:
         logging.info(f"\n{Fore.YELLOW}🛑 Shutting down gracefully...{Style.RESET_ALL}")
         shutdown_msg = config.get('shutdown_message')
         if shutdown_msg:
-            logging.info(f"{Fore.YELLOW}Sending shutdown notification to Telegram...{Style.RESET_ALL}")
             send_telegram(config, shutdown_msg)
 
 if __name__ == '__main__':
