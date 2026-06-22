@@ -16,7 +16,7 @@ This project draws inspiration from [seh-len/doctolib](https://github.com/seh-le
   ```bash
    pip install -r requirements.txt
   ```
-2. **Configuration:** Copy `config.example.json` to `config.json` and populate it with your specific details:
+2. **Configuration:** Copy `config.json.example` to `config.json` and populate it with your specific details:
   - **Telegram:** Add your Bot Token and Chat ID.
   - **URLs:** Add the exact Doctolib booking URLs you wish to monitor.
   - **Timing:** Adjust `check_interval_seconds` (recommended: 300+ seconds) to avoid rate limits.
@@ -27,19 +27,19 @@ The script relies on a `config.json` file in the root directory to manage its be
 
 ### Telegram Settings
 
-- `**telegram_bot_token`** (String): The token provided by Telegram's BotFather when you create your bot.
-- `**telegram_chat_id**` (String): The numerical ID of the chat, user, or group where the bot should send notifications.
+- **telegram_bot_token** (String): The token provided by Telegram's BotFather when you create your bot.
+- **telegram_chat_id** (String): The numerical ID of the chat, user, or group where the bot should send notifications.
 
 ### Timing & Polling (Anti-Ban)
 
-- `**check_interval_seconds**` (Integer): The wait time in seconds between full check cycles. 
+- **check_interval_seconds** (Integer): The wait time in seconds between full check cycles. 
   - *Recommendation:* Set to `300` (5 minutes) or higher. Doctolib aggressively rate-limits; setting this too low will result in a temporary IP ban.
-- `**delay_between_urls_seconds*`* (Integer): The pause in seconds between fetching individual URLs *during* a single cycle. Prevents the script from hammering the server with concurrent requests.
+- **delay_between_urls_seconds** (Integer): The pause in seconds between fetching individual URLs *during* a single cycle. Prevents the script from hammering the server with concurrent requests.
   - *Recommendation:* Keep between `2` and `5` seconds.
 
 ### Search Criteria
 
-- `**upcoming_days*`* (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
+- **upcoming_days** (Integer): How many days into the future the script should check for available slots. For example, `15` will look for appointments within the next 15 days.
 - `**insurance_sector**` (String): The insurance sector to filter by. Either `"public"` or `"private"`. Defaults to `"public"`.
 - `**telehealth**` (Boolean): Whether to include telehealth/remote appointments. Defaults to `false`.
 - `**slot_limit**` (Integer): Maximum number of individual time slots fetched per API call. Defaults to `15`. Note: this does not limit how many slots are reported—the script uses the `total` count from the API response.
