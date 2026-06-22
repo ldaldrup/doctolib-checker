@@ -1,17 +1,23 @@
 {
-  "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
-  "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID_HERE",
+  "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
+  "telegram_chat_id": "YOUR_CHAT_ID_HERE",
   "check_interval_seconds": 300,
   "delay_between_urls_seconds": 3,
   "upcoming_days": 15,
   "insurance_sector": "public",
   "telehealth": false,
   "slot_limit": 15,
-  "startup_message": "🚀 <b>Doctolib Checker Started</b>\n\n👥 Monitoring <b>{doctor_count}</b> target(s):\n{practitioner_list}\n\n⏱ Interval: <code>{interval_mins}m</code>\n📅 Window: <code>{days}d</code>",
+  "startup_message": "🚀 <b>Doctolib Checker Started</b>\n\n🗓 {start_time}\n🎯 Monitoring <b>{doctor_count}</b> target(s) across <b>{practice_count}</b> practice(s)\n\n{practitioner_list}\n\n⏱ Poll: every <code>{interval_mins}m</code>\n📅 Window: next <code>{days}d</code>\n🏥 Insurance: <code>{insurance_sector}</code>",
   "shutdown_message": "🛑 <b>Doctolib Checker Stopped</b>\n\nMonitoring has been disabled.",
-  "message_template": "🎉 <b>{total} Slot(s) Found!</b>\n\n👨‍⚕️ Practitioner: <b>{practitioner}</b>\n🏥 Practice: <b>{practice}</b>\n📅 First Date: <b>{first_date}</b>\n\n👉 <a href='{booking_url}'>Click here to book now!</a>",
+  "message_template": "🎉 <b>{total} slot(s) available</b>\n\n👨‍⚕️ {practitioner}\n🏥 {practice}\n📅 Earliest: <b>{first_date}</b>\n\n👉 <a href=\"{booking_url}\">Open booking</a>",
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "ui": {
+    "terminal_table": false,
+    "show_full_names": true,
+    "colorblind_friendly": false
+  },
+  "dry_run": false,
   "urls": [
-    "YOUR_URLS_HERE"
+    "https://www.doctolib.de/SPECIALITY/CITY/DOCTOR-SLUG/booking/availabilities?specialityId=XXXX&telehealth=false&placeId=practice-XXXX&insuranceSectorEnabled=true&insuranceSector=public&motiveIds%5B%5D=XXXX&practitionerId=XXXX&pid=practice-XXXX&source=profile"
   ]
 }

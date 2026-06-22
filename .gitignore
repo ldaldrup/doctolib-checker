@@ -1,26 +1,37 @@
-# Secrets
-.env
+# Secrets — NEVER commit
 config.json
 
-# Runtime state and logs
-state/state.json
-logs/*.log
+# State & logs
+state/
+logs/
 temp/
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-venv/
-.env.local
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# OS / IDE
-.DS_Store
-Thumbs.db
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# uv
-.uv/
-uv.lock
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Keep examples
+!config.example.json

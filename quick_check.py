@@ -6,88 +6,153 @@ from datetime import datetime
 
 import requests
 
-CONFIG_FILE = 'config.json'
+CONFIG_FILE = "config.json"
+
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         print(f"Error: {CONFIG_FILE} not found.")
         exit(1)
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def sanitize_filename(name):
-    return re.sub(r'(?u)[^-\w.]', '_', name).strip('_')
+    return re.sub(r"(?u)[^-\w.]", "_", name).strip("_")
+
+
+def _practitioner_display_name(p):
+    if not p:
+        return None
+    return (
+        p.get("name")
+        or p.get("full_name")
+        or p.get("display_name")
+        or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        or None
+    )
+
 
 def main():
     config = load_config()
-    
-    if not config.get('urls'):
+
+    if not config.get("urls"):
         print("Error: No URLs found in config.json.")
         exit(1)
 
-    target_url = config['urls'][0]
+    target_url = config["urls"][0]
     print(f"Targeting URL: {target_url}\n")
 
     parsed_url = urllib.parse.urlparse(target_url)
-    path_parts = parsed_url.path.split('/')
-    
+    path_parts = parsed_url.path.split("/")
+
     try:
-        slug_idx = path_parts.index('booking') - 1
+        slug_idx = path_parts.index("booking") - 1
         slug = path_parts[slug_idx]
     except ValueError:
         print("Error: Could not identify profile slug from URL.")
         exit(1)
 
     query_params = urllib.parse.parse_qs(parsed_url.query)
-    raw_place_id = query_params.get('placeId', [None])[0]
-    practice_id = raw_place_id.split('-')[1] if raw_place_id and '-' in raw_place_id else raw_place_id
-    motive_id = query_params.get('motiveIds[]', query_params.get('motiveIds', [None]))[0]
-    practitioner_id = query_params.get('practitionerId', [None])[0]
+    raw_place_id = query_params.get("placeId", [None])[0]
+    practice_id = (
+        raw_place_id.split("-")[1] if raw_place_id and "-" in raw_place_id else raw_place_id
+    )
+    motive_id = query_params.get("motiveIds[]", query_params.get("motiveIds", [None]))[0]
+    practitioner_id = query_params.get(
+        "practitionerId", query_params.get("practitioner_id", [None])
+    )[0]
 
-    headers = {'User-Agent': config.get('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0')}
+    headers = {
+        "User-Agent": config.get(
+            "user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        )
+    }
 
     print(f"Fetching metadata for '{slug}'...")
     info_url = "https://www.doctolib.de/online_booking/api/slot_selection_funnel/v1/info.json"
-    info_resp = requests.get(info_url, params={'profile_slug': slug}, headers=headers)
+    info_resp = requests.get(info_url, params={"profile_slug": slug}, headers=headers)
     info_resp.raise_for_status()
     info_data = info_resp.json()
 
-    profile_data = info_data.get('data', {})
-    profile = profile_data.get('profile', {})
-    practice_name = profile.get('name_with_title') or profile.get('name') or slug
-    
-    practitioner_name = "Any_Practitioner"
-    if practitioner_id and practitioner_id != 'NO_PREFERENCE':
-        for p in profile_data.get('practitioners', []):
-            if str(p.get('id')) == str(practitioner_id):
-                practitioner_name = p.get('name') or p.get('full_name') or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-                break
+    profile_data = info_data.get("data", {})
+    profile = profile_data.get("profile", {})
+    practice_name = profile.get("name_with_title") or profile.get("name") or slug
 
-    valid_agendas = []
-    for agenda in profile_data.get('agendas', []):
-        if practice_id and str(agenda.get('practice_id')) != str(practice_id):
-            continue
-        if motive_id and int(motive_id) not in agenda.get('visit_motive_ids', []):
-            continue
-        if practitioner_id and practitioner_id != 'NO_PREFERENCE':
-            if str(agenda.get('practitioner_id')) != str(practitioner_id):
+    agendas = profile_data.get("agendas", [])
+    practitioners = profile_data.get("practitioners", [])
+
+    # ── Smart practitioner-name resolution (mirrors checker.py) ──
+    practitioner_name = None
+
+    if practitioner_id and practitioner_id != "NO_PREFERENCE":
+        for p in practitioners:
+            if str(p.get("id")) == str(practitioner_id):
+                practitioner_name = _practitioner_display_name(p)
+                break
+        if not practitioner_name:
+            practitioner_name = f"Practitioner (ID: {practitioner_id})"
+    else:
+        unique_pids = []
+        seen = set()
+        for agenda in agendas:
+            if practice_id and str(agenda.get("practice_id")) != str(practice_id):
                 continue
-        valid_agendas.append(str(agenda['id']))
+            if motive_id:
+                try:
+                    if int(motive_id) not in agenda.get("visit_motive_ids", []):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            pid = agenda.get("practitioner_id")
+            if pid and pid not in seen:
+                seen.add(pid)
+                unique_pids.append(str(pid))
+
+        if len(unique_pids) == 1:
+            for p in practitioners:
+                if str(p.get("id")) == unique_pids[0]:
+                    practitioner_name = _practitioner_display_name(p)
+                    break
+            practitioner_name = practitioner_name or practice_name
+        elif len(practitioners) == 1:
+            practitioner_name = _practitioner_display_name(practitioners[0]) or practice_name
+        elif len(unique_pids) > 1:
+            practitioner_name = f"Any of {len(unique_pids)} practitioners"
+        else:
+            practitioner_name = "Any Practitioner"
+
+    # ── Filter agendas ──
+    valid_agendas = []
+    for agenda in agendas:
+        if practice_id and str(agenda.get("practice_id")) != str(practice_id):
+            continue
+        if motive_id:
+            try:
+                if int(motive_id) not in agenda.get("visit_motive_ids", []):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if practitioner_id and practitioner_id != "NO_PREFERENCE":
+            if str(agenda.get("practitioner_id")) != str(practitioner_id):
+                continue
+        valid_agendas.append(str(agenda["id"]))
 
     agenda_ids_str = "-".join(valid_agendas)
 
     print(f"Fetching availabilities using {len(valid_agendas)} agenda(s)...")
     avail_url = "https://www.doctolib.de/availabilities.json"
     current_time = datetime.now()
-    
+
     avail_params = {
-        'start_date': current_time.date().isoformat(),
-        'visit_motive_ids': motive_id,
-        'agenda_ids': agenda_ids_str,
-        'practice_ids': practice_id,
-        'insurance_sector': config.get('insurance_sector', 'public'),
-        'telehealth': str(config.get('telehealth', False)).lower(),
-        'limit': config.get('slot_limit', 15)
+        "start_date": current_time.date().isoformat(),
+        "visit_motive_ids": motive_id,
+        "agenda_ids": agenda_ids_str,
+        "practice_ids": practice_id,
+        "insurance_sector": config.get("insurance_sector", "public"),
+        "telehealth": str(config.get("telehealth", False)).lower(),
+        "limit": config.get("slot_limit", 15),
     }
 
     avail_resp = requests.get(avail_url, params=avail_params, headers=headers)
@@ -100,18 +165,18 @@ def main():
             "clinic": practice_name,
             "practitioner": practitioner_name,
             "target_url": target_url,
-            "agenda_ids": valid_agendas
+            "agenda_ids": valid_agendas,
         },
-        "doctolib_data": avail_json
+        "doctolib_data": avail_json,
     }
 
     temp_dir = "temp"
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     safe_clinic = sanitize_filename(practice_name)
     safe_practitioner = sanitize_filename(practitioner_name)
     timestamp = current_time.strftime("%Y%m%d_%H%M%S")
-    
+
     filename = f"{timestamp}_{safe_clinic}_{safe_practitioner}.json"
     file_path = os.path.join(temp_dir, filename)
 
@@ -120,5 +185,6 @@ def main():
 
     print(f"JSON successfully saved to: {os.path.abspath(file_path)}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
