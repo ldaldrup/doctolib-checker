@@ -2,7 +2,7 @@ import os
 import json
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import date, datetime
 
 import requests
 
@@ -84,8 +84,8 @@ def main():
         )
     }
 
-    # Extract nested polling config safely
     polling_cfg = config.get("polling", {})
+    upcoming_days = polling_cfg.get("upcoming_days", 365)
 
     print(f"Fetching metadata for '{slug}'...")
     info_url = "https://www.doctolib.de/online_booking/api/slot_selection_funnel/v1/info.json"
@@ -100,7 +100,6 @@ def main():
     agendas = profile_data.get("agendas", [])
     practitioners = profile_data.get("practitioners", [])
 
-    # ── Smart practitioner-name resolution (mirrors checker.py) ──
     practitioner_name = None
 
     if practitioner_id and practitioner_id != "NO_PREFERENCE":
@@ -140,7 +139,6 @@ def main():
         else:
             practitioner_name = "Any Practitioner"
 
-    # ── Filter agendas ──
     valid_agendas = []
     for agenda in agendas:
         if practice_id and str(agenda.get("practice_id")) != str(practice_id):
@@ -176,14 +174,15 @@ def main():
     avail_resp.raise_for_status()
     avail_json = avail_resp.json()
 
-    # ── Parse & Display Results (mirrors checker.py fix) ──
+    # ── Parse & Display Results (mirrors checker.py robust logic) ──
     total = avail_json.get("total", 0)
     next_slot = avail_json.get("next_slot")
     
-    print("\n" + "="*50)
+    print("\n" + "="*55)
     print(f"Clinic:       {practice_name}")
     print(f"Practitioner: {practitioner_name}")
-    print(f"Total Slots:  {total}")
+    print(f"API Total:    {total} (within API limit window)")
+    print(f"Config Window:{upcoming_days} days")
     
     if total > 0:
         availabilities = avail_json.get("availabilities", [])
@@ -194,7 +193,6 @@ def main():
                 if slots:
                     date_str = day_info.get("date", "N/A")
                     
-                    # Handle both string and dict slot formats from Doctolib
                     first_slot = slots[0]
                     if isinstance(first_slot, dict):
                         start_time_str = first_slot.get("start_time", "")
@@ -209,17 +207,38 @@ def main():
                             time_str = " " + start_time_str.split("T")[1][:5]
                         except IndexError:
                             pass
+                    
+                    print("-" * 55)
+                    print("👉 STATUS: IMMINENT SLOT (Trigger: slot_found)")
                     print(f"First Slot:   {date_str}{time_str}")
                     found = True
                     break
         if not found:
             print(f"First Slot:   {format_doctolib_datetime(next_slot) if next_slot else 'N/A'}")
-    else:
-        if next_slot:
+            
+    elif next_slot:
+        try:
+            next_dt = datetime.fromisoformat(next_slot.replace("Z", "+00:00"))
+            days_away = (next_dt.date() - date.today()).days
+            
+            if 0 <= days_away <= upcoming_days:
+                print("-" * 55)
+                print("👉 STATUS: FAR SLOT (Trigger: far_slot_found)")
+                print(f"Next Slot:    {format_doctolib_datetime(next_slot)}")
+                print(f"Distance:     {days_away} days away (WITHIN {upcoming_days}d window)")
+            else:
+                print("-" * 55)
+                print("👉 STATUS: OUT OF WINDOW (No trigger)")
+                print(f"Next Slot:    {format_doctolib_datetime(next_slot)}")
+                print(f"Distance:     {days_away} days away (OUTSIDE {upcoming_days}d window)")
+        except ValueError:
             print(f"Next Slot:    {format_doctolib_datetime(next_slot)}")
-        else:
-            print(f"Next Slot:    None in window")
-    print("="*50 + "\n")
+    else:
+        print("-" * 55)
+        print("👉 STATUS: NO SLOTS (No trigger)")
+        print(f"Next Slot:    None found on calendar")
+        
+    print("="*55 + "\n")
 
     final_output = {
         "metadata_header": {

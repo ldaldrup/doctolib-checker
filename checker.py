@@ -161,11 +161,23 @@ def load_config():
         "📅 Earliest: <b>{first_date}</b>\n\n"
         '👉 <a href="{booking_url}">Open booking</a>',
     )
-    
-    # ── Slot Found Effect ──
     config["messages"]["slot_found"].setdefault("effect", {})
     config["messages"]["slot_found"]["effect"].setdefault("enabled", False)
-    config["messages"]["slot_found"]["effect"].setdefault("id", "5046509860389126442") # 🎆 Fireworks
+    config["messages"]["slot_found"]["effect"].setdefault("id", "5046509860389126442")
+
+    # ── Far Slot Found (Detected via next_slot outside standard limit) ──
+    config["messages"].setdefault("far_slot_found", {})
+    config["messages"]["far_slot_found"].setdefault("silent", False)
+    config["messages"]["far_slot_found"].setdefault(
+        "template",
+        "📆 <b>Slot opened on calendar</b>\n\n"
+        "👨‍⚕️ {practitioner}\n"
+        "🏥 {practice}\n"
+        "📅 Date: <b>{first_date}</b>\n\n"
+        '👉 <a href="{booking_url}">Open booking</a>',
+    )
+    config["messages"]["far_slot_found"].setdefault("effect", {})
+    config["messages"]["far_slot_found"]["effect"].setdefault("enabled", False)
 
     config["messages"].setdefault("summary", {})
     config["messages"]["summary"].setdefault("enabled", False)
@@ -291,7 +303,6 @@ def _practitioner_display_name(p):
 
 
 def format_uptime(start: datetime) -> str:
-    """Format a duration as a compact human-readable string."""
     delta = datetime.now() - start
     total_seconds = int(delta.total_seconds())
     days, remainder = divmod(total_seconds, 86400)
@@ -311,7 +322,6 @@ def format_uptime(start: datetime) -> str:
 
 
 def format_ago(when: datetime) -> str:
-    """Format a past timestamp as a relative human-readable string."""
     delta = datetime.now() - when
     total_seconds = int(delta.total_seconds())
     if total_seconds < 60:
@@ -327,7 +337,6 @@ def format_ago(when: datetime) -> str:
 
 
 def format_duration(seconds: int) -> str:
-    """Format a static duration in seconds to a readable string."""
     if seconds >= 3600:
         h, rem = divmod(seconds, 3600)
         m = rem // 60
@@ -339,7 +348,6 @@ def format_duration(seconds: int) -> str:
 
 
 def format_doctolib_datetime(dt_str: str) -> str:
-    """Format a Doctolib datetime string to a clean 'YYYY-MM-DD HH:MM' format."""
     if not dt_str:
         return ""
     if "T" in dt_str:
@@ -401,7 +409,6 @@ def get_booking_metadata(booking_url, config, session):
     )
     practice_name = profile_name
 
-    # ── Smart practitioner-name resolution ──
     practitioner_name = None
 
     if practitioner_id and practitioner_id != "NO_PREFERENCE":
@@ -442,7 +449,6 @@ def get_booking_metadata(booking_url, config, session):
         else:
             practitioner_name = "Any Practitioner"
 
-    # ── Filter agendas ──
     valid_agenda_ids = []
     for agenda in agendas:
         if practice_id and str(agenda.get("practice_id")) != str(practice_id):
@@ -484,6 +490,7 @@ def fetch_slot_total(booking_url, config, session, meta=None):
         meta = get_booking_metadata(booking_url, config, session)
 
     headers = {"User-Agent": config["user_agent"]}
+    upcoming_days = config["polling"]["upcoming_days"]
 
     params = {
         "visit_motive_ids": meta.motive_id,
@@ -496,7 +503,7 @@ def fetch_slot_total(booking_url, config, session, meta=None):
     }
 
     avail_resp = session.get(
-        DOCTOLIB_AVAILABILITIES_API, params=params, headers=headers, timeout=10
+        DOCTOLIB_AVAILABILITIES_API, params=params, headers=headers, timeout=15
     )
     avail_resp.raise_for_status()
     avail_data = avail_resp.json()
@@ -505,17 +512,18 @@ def fetch_slot_total(booking_url, config, session, meta=None):
     next_slot = avail_data.get("next_slot")
 
     first_date = "N/A"
+    is_far_slot = False
+    
+    # Case 1: Slots found natively in the immediate API response
     if total > 0:
         availabilities = avail_data.get("availabilities", [])
         found = False
         if availabilities:
-            # Find the first date that actually contains a slot
             for day_info in availabilities:
                 slots = day_info.get("slots", [])
                 if slots:
                     date_str = day_info.get("date", "N/A")
                     
-                    # Handle both string and dict slot formats from Doctolib
                     first_slot = slots[0]
                     if isinstance(first_slot, dict):
                         start_time_str = first_slot.get("start_time", "")
@@ -534,14 +542,25 @@ def fetch_slot_total(booking_url, config, session, meta=None):
                     found = True
                     break
         
-        # Fallback if no slots were parsed from the list but total > 0
         if not found:
             first_date = format_doctolib_datetime(next_slot) if next_slot else "N/A"
-    else:
-        if next_slot:
+
+    # Case 2: 0 slots in response, but a future slot exists within user's window
+    elif next_slot:
+        try:
+            next_dt = datetime.fromisoformat(next_slot.replace("Z", "+00:00"))
+            days_away = (next_dt.date() - date.today()).days
+            
+            if 0 <= days_away <= upcoming_days:
+                total = 1
+                is_far_slot = True  # Flag that this was found via next_slot peek
+                first_date = format_doctolib_datetime(next_slot)
+            else:
+                first_date = f"next in {days_away}d"
+        except ValueError:
             first_date = format_doctolib_datetime(next_slot)
-        else:
-            first_date = "no slots in window"
+    else:
+        first_date = "no slots in window"
 
     return (
         meta.state_key,
@@ -551,6 +570,7 @@ def fetch_slot_total(booking_url, config, session, meta=None):
         booking_url,
         first_date,
         next_slot,
+        is_far_slot,  # NEW RETURN VALUE
     )
 
 
@@ -581,7 +601,6 @@ def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
     bar = f"{bar_color}{'─' * 60}{Style.RESET_ALL}"
     print(f"\n{bar}")
     
-    # Build flags for terminal output
     flags = []
     if silent if silent is not None else config["telegram"]["silent"]:
         flags.append("silent")
@@ -606,8 +625,6 @@ def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
         return False
 
     url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
-    
-    # Resolve silent flag: explicit override > message-specific > global default
     is_silent = silent if silent is not None else config["telegram"]["silent"]
     
     payload = {
@@ -618,7 +635,6 @@ def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
         "disable_notification": is_silent,
     }
     
-    # Add animated effect if provided (only works in private chats)
     if effect_id:
         payload["message_effect_id"] = effect_id
         
@@ -657,10 +673,6 @@ def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
 
 
 def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
-    """Send a periodic summary message if time or cycle interval has elapsed.
-
-    Returns True if a message was sent, False otherwise.
-    """
     summary_cfg = config.get("messages", {}).get("summary", {})
     if not summary_cfg.get("enabled", False):
         return False
@@ -668,7 +680,6 @@ def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
     interval_secs = summary_cfg.get("interval_seconds", 0)
     cycle_target = summary_cfg.get("every_x_cycles", 0)
 
-    # If both triggers are explicitly disabled/zero, do nothing
     if interval_secs <= 0 and cycle_target <= 0:
         return False
 
@@ -676,25 +687,21 @@ def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
     time_trigger_met = False
     cycle_trigger_met = False
 
-    # 1. Evaluate Time Trigger
     if interval_secs > 0:
         if stats.last_summary_sent is None:
-            time_trigger_met = True  # Always send the first one if time-based is on
+            time_trigger_met = True
         else:
             elapsed = (now - stats.last_summary_sent).total_seconds()
             if elapsed >= interval_secs:
                 time_trigger_met = True
 
-    # 2. Evaluate Cycle Trigger
     if cycle_target > 0:
         if stats.total_cycles > 0 and stats.total_cycles % cycle_target == 0:
             cycle_trigger_met = True
 
-    # 3. Fire if either condition is met
     if not (time_trigger_met or cycle_trigger_met):
         return False
 
-    # ── Build the last_slot_line ──
     if stats.last_slot_time:
         ago = format_ago(stats.last_slot_time)
         last_slot_line = (
@@ -704,7 +711,6 @@ def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
     else:
         last_slot_line = "📅 No slots found yet this session"
 
-    # ── Format next_check_in ──
     check_secs = config["polling"]["check_interval_seconds"]
     if check_secs >= 3600:
         h, rem = divmod(check_secs, 3600)
@@ -726,7 +732,6 @@ def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
         next_check_in=next_check_in,
     )
 
-    # Resolve silent flag for summary (defaults to True in config)
     is_summary_silent = summary_cfg.get("silent", True)
     
     sent = send_telegram(config, text, silent=is_summary_silent)
@@ -743,7 +748,6 @@ def maybe_send_summary(config: dict, stats: SessionStats) -> bool:
 
 
 def render_startup_list(preflight_meta, urls):
-    """Group targets by practice for readability — every URL is listed."""
     groups = OrderedDict()
     for idx, url in enumerate(urls, 1):
         meta = preflight_meta.get(url)
@@ -788,17 +792,20 @@ def run_once(config, state, preflight_meta, stats: SessionStats):
                 booking_url,
                 first_date,
                 next_slot,
+                is_far_slot,
             ) = fetch_slot_total(url, config, session, meta)
 
-            # Instance key keeps duplicates intentional
             instance_key = f"{i}_{state_key}"
 
             if instance_key not in state:
-                state[instance_key] = {"last_total": 0, "last_notified_total": 0}
+                state[instance_key] = {
+                    "last_total": 0, 
+                    "last_notified_total": 0,
+                    "last_notified_far_date": None
+                }
 
             prev_state = state[instance_key]
 
-            # ── Terminal row (ANSI-aware padding) ──
             pract_str = (
                 practitioner
                 if len(strip_ansi(practitioner)) <= 26
@@ -817,7 +824,6 @@ def run_once(config, state, preflight_meta, stats: SessionStats):
                 status_text = f"{Fore.GREEN}✔ {total} slot(s) available{Style.RESET_ALL}"
                 hits += 1
 
-                # Update session stats with this slot hit
                 stats.last_slot_time = datetime.now()
                 stats.last_slot_practitioner = practitioner
                 stats.last_slot_practice = practice
@@ -832,38 +838,69 @@ def run_once(config, state, preflight_meta, stats: SessionStats):
                 f"{pad_right(clinic_cell, 40)}  →  {status_text}"
             )
 
-            if should_notify(prev_state, total):
-                msg = config["messages"]["slot_found"]["template"].format(
-                    total=total,
-                    practitioner=practitioner,
-                    practice=practice,
-                    booking_url=booking_url,
-                    first_date=first_date,
-                )
-                logging.info(
-                    f"    {Fore.YELLOW}🔔 Matches criteria! "
-                    f"Dispatching notification.{Style.RESET_ALL}"
-                )
-                
-                # Resolve silent and effect config
-                is_slot_silent = config["messages"]["slot_found"].get("silent", False)
-                effect_cfg = config["messages"]["slot_found"].get("effect", {})
-                effect_id = effect_cfg.get("id") if effect_cfg.get("enabled") else None
-                
-                if send_telegram(config, msg, silent=is_slot_silent, effect_id=effect_id):
-                    state[instance_key]["last_notified_total"] = total
-                else:
-                    logging.warning(
-                        f"    {Fore.YELLOW}Notification failed — "
-                        f"will retry next cycle.{Style.RESET_ALL}"
+            # ── Notification Routing ──
+            if total > 0 and not is_far_slot:
+                # Standard immediate slot routing
+                if should_notify(prev_state, total):
+                    msg_cfg = config["messages"]["slot_found"]
+                    msg = msg_cfg["template"].format(
+                        total=total,
+                        practitioner=practitioner,
+                        practice=practice,
+                        booking_url=booking_url,
+                        first_date=first_date,
                     )
+                    logging.info(
+                        f"    {Fore.YELLOW}🔔 Imminent slot! "
+                        f"Dispatching notification.{Style.RESET_ALL}"
+                    )
+                    
+                    is_slot_silent = msg_cfg.get("silent", False)
+                    effect_cfg = msg_cfg.get("effect", {})
+                    effect_id = effect_cfg.get("id") if effect_cfg.get("enabled") else None
+                    
+                    if send_telegram(config, msg, silent=is_slot_silent, effect_id=effect_id):
+                        state[instance_key]["last_notified_total"] = total
 
-            elif total == 0 and prev_state.get("last_notified_total", 0) > 0:
-                logging.info(
-                    f"    {Fore.LIGHTBLACK_EX}Slots dropped to 0. "
-                    f"Resetting notifier.{Style.RESET_ALL}"
-                )
-                state[instance_key]["last_notified_total"] = 0
+            elif total > 0 and is_far_slot:
+                # Far slot routing (prevents "Moving Target" silence bug)
+                prev_far_date = prev_state.get("last_notified_far_date")
+                if first_date != prev_far_date:
+                    msg_cfg = config["messages"]["far_slot_found"]
+                    msg = msg_cfg["template"].format(
+                        total=total,
+                        practitioner=practitioner,
+                        practice=practice,
+                        booking_url=booking_url,
+                        first_date=first_date,
+                    )
+                    logging.info(
+                        f"    {Fore.YELLOW}📆 Far calendar slot opened! "
+                        f"Dispatching notification.{Style.RESET_ALL}"
+                    )
+                    
+                    is_slot_silent = msg_cfg.get("silent", False)
+                    effect_cfg = msg_cfg.get("effect", {})
+                    effect_id = effect_cfg.get("id") if effect_cfg.get("enabled") else None
+                    
+                    if send_telegram(config, msg, silent=is_slot_silent, effect_id=effect_id):
+                        # Track exact date string to prevent spamming same far slot,
+                        # but don't update last_notified_total so imminent slots still trigger!
+                        state[instance_key]["last_notified_far_date"] = first_date
+
+            else:
+                # total == 0 logic
+                # Silent reset for far slots if it disappeared from calendar
+                if prev_state.get("last_notified_far_date"):
+                    state[instance_key]["last_notified_far_date"] = None
+                
+                # Normal reset for immediate slots
+                elif prev_state.get("last_notified_total", 0) > 0:
+                    logging.info(
+                        f"    {Fore.LIGHTBLACK_EX}Slots dropped to 0. "
+                        f"Resetting notifier.{Style.RESET_ALL}"
+                    )
+                    state[instance_key]["last_notified_total"] = 0
 
             state[instance_key]["last_total"] = total
 
@@ -880,7 +917,6 @@ def run_once(config, state, preflight_meta, stats: SessionStats):
         if i < total_urls:
             time.sleep(config["polling"]["delay_between_urls_seconds"])
 
-    # Accumulate into session stats
     if hits > 0:
         stats.total_hits += 1
     stats.total_errors += errors
@@ -954,7 +990,6 @@ def main():
             f"  • Mode:         {Fore.YELLOW}DRY RUN (no Telegram sends){Style.RESET_ALL}"
         )
     
-    # Display summary trigger info
     summary_cfg = config.get("messages", {}).get("summary", {})
     if summary_cfg.get("enabled"):
         triggers = []
@@ -978,7 +1013,7 @@ def main():
     logging.info(f"{Style.BRIGHT}Running Pre-flight Verification on URLs...{Style.RESET_ALL}")
 
     preflight_meta = {}
-    valid_urls = []  # URLs that passed verification — no dedupe
+    valid_urls = []
 
     for i, url in enumerate(config["urls"], 1):
         try:
@@ -1011,11 +1046,17 @@ def main():
         logging.error("❌ No valid URLs passed verification. Exiting.")
         return
 
-    # Initialize session stats (before --once check so run_once always receives it)
     stats = SessionStats(session_start=datetime.now())
 
+    # ── Reset notification memory for a fresh session ──
+    state = load_state()
+    for key in state:
+        if isinstance(state[key], dict):
+            state[key]["last_notified_total"] = 0
+            state[key]["last_notified_far_date"] = None
+    save_state(state)
+
     if args.once:
-        state = load_state()
         _hits, errors = run_once(config, state, preflight_meta, stats)
         sys.exit(0 if errors == 0 else 1)
 
@@ -1038,7 +1079,6 @@ def main():
                 logging.info(f"{Fore.YELLOW}🔔 Startup notification dispatched.{Style.RESET_ALL}")
 
         while True:
-            state = load_state()
             run_once(config, state, preflight_meta, stats)
             maybe_send_summary(config, stats)
             countdown_sleep(config["polling"]["check_interval_seconds"])

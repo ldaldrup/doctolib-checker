@@ -7,7 +7,7 @@
   "polling": {
     "check_interval_seconds": 300,
     "delay_between_urls_seconds": 3,
-    "upcoming_days": 15,
+    "upcoming_days": 365,
     "insurance_sector": "public",
     "telehealth": false,
     "slot_limit": 15
@@ -27,6 +27,13 @@
       "effect": {
         "enabled": false,
         "id": "5046509860389126442"
+      }
+    },
+    "far_slot_found": {
+      "template": "📆 <b>Slot open on calendar</b>\n\n👨‍⚕️ {practitioner}\n🏥 {practice}\n📅 Date: <b>{first_date}</b>\n\n👉 <a href=\"{booking_url}\">Open booking</a>",
+      "silent": false,
+      "effect": {
+        "enabled": false
       }
     },
     "summary": {
