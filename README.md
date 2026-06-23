@@ -21,8 +21,8 @@ This project draws inspiration from [seh-len/doctolib](https://github.com/seh-le
   - Start a conversation with your bot and get your `chat_id` (you can send any message to the bot, then use an API call or a service like [this](https://t.me/userinfobot) to find your ID).
 3. **Configuration:** Copy `config.json.example` to `config.json` and populate it with your specific details:
   - **Telegram:** Add your `bot_token` and `chat_id` (found above).
-  - **URLs:** Add the exact Doctolib booking URLs you wish to monitor.
-  - **Polling:** Adjust `polling.check_interval_seconds` (recommended: 300+ seconds) to avoid rate limits.
+  - **URLs:** Add the Doctolib appointment URLs you wish to monitor (see [Obtaining Doctolib URLs](#obtaining-doctolib-urls) below).
+  - **Polling:** Adjust `polling.check_interval_seconds` (recommended: 300+ seconds) to avoid potential rate limits.
 
 ## Configuration (`config.json`)
 
@@ -36,7 +36,7 @@ The script relies on a `config.json` file in the root directory. Copy `config.js
 
 ### Polling & Search
 
-- `polling.check_interval_seconds` (Integer): Wait time in seconds between check cycles. **Recommended: 300+ seconds (5+ minutes)** to avoid Doctolib's rate-limiting and IP bans.
+- `polling.check_interval_seconds` (Integer): Wait time in seconds between check cycles. **Recommended: 300+ seconds (5+ minutes)** to avoid potential rate-limiting or IP bans.
 - `polling.delay_between_urls_seconds` (Integer): Pause between fetching URLs in a single cycle. **Recommended: 2–5 seconds.**
 - `polling.upcoming_days` (Integer): How many days ahead to search for appointments (e.g., `15` = next 15 days).
 - `polling.insurance_sector` (String): Filter by insurance type: `"public"` or `"private"`. Defaults to `"public"`.
@@ -79,8 +79,32 @@ Message templates use placeholders and can be individually silenced:
 
 ### Target URLs
 
-- `urls` (Array of Strings): Exact Doctolib booking URLs to monitor.
-  - **Important:** Must include all query parameters (`specialityId`, `motiveIds`, `practitionerId`, etc.). Copy from the final booking step in your browser. A profile page link alone will not work.
+- `urls` (Array of Strings): Doctolib booking page URLs to monitor.
+  - Copy the URL from your browser's address bar when you're on the appointment availability page.
+
+## Obtaining Doctolib URLs
+
+To monitor appointments for a specific practitioner, follow these simple steps:
+
+1. **Navigate to [doctolib.de](https://doctolib.de)** and search for your desired practitioner, specialty, or location.
+
+2. **Select your practitioner and appointment type** from the search results.
+
+3. **Navigate through the booking flow** until you reach the appointment availability view.
+
+4. **Copy the URL from your browser's address bar** when you see the availability page (regardless of whether slots show "no appointments available" or not).
+   - The URL should look similar to: `https://www.doctolib.de/praxis/berlin/hausarztrettungsstelle-adlershof/booking/availabilities?specialityId=1286&telehealth=false&placeId=practice-656116&insuranceSectorEnabled=true&insuranceSector=public&motiveIds%5B%5D=13620100&pid=practice-656116&insurance_sector=public&source=profile`
+
+5. **Paste the URL into your `config.json`** under the `urls` array.
+
+**⚠️ Important:** The URL must contain the `/availabilities?` path and include query parameters such as:
+- `specialityId` – The specialty ID
+- `motiveIds[]` (or `motiveIds`) – The appointment type ID(s)
+- `placeId` (or `pid`/`practice_id`) – The practice/clinic ID
+
+If the URL is missing these parameters or doesn't contain `/availabilities?` in the path, the tool won't be able to fetch appointments correctly. If you're unsure, re-copy the URL from the address bar and verify it contains at least these three parameters.
+
+That's it! The tool automatically parses the URL and monitors for available slots.
 
 ## Usage
 
@@ -104,7 +128,7 @@ Message templates use placeholders and can be individually silenced:
 
 ## Limitations & Considerations
 
-- **Rate Limiting:** Doctolib uses anti-bot measures. Do not set your polling intervals too aggressively. Keep the interval to at least 5 minutes to minimize the risk of a temporary IP block.
+- **Rate Limiting:** Doctolib may use anti-bot anti-ddos measures. Do not set your polling intervals too aggressively. Keep the interval to at least 5 minutes to minimize the risk of a temporary IP block.
 - **URL Accuracy:** The URLs in your `config.json` must be exact and contain the correct query parameters (`specialityId`, `motiveIds`, `practitionerId`, etc.) for the script to locate availabilities. Copy them directly from the final booking step in your browser.
 - **Always-On Requirement:** Because this runs locally, your computer must remain powered on, awake, and connected to the internet for the script to work.
 
