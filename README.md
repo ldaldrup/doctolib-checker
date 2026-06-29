@@ -24,6 +24,37 @@ This project draws inspiration from [seh-len/doctolib](https://github.com/seh-le
   - **URLs:** Add the Doctolib appointment URLs you wish to monitor (see [Obtaining Doctolib URLs](#obtaining-doctolib-urls) below).
   - **Polling:** Adjust `polling.check_interval_seconds` (recommended: 300+ seconds) to avoid potential rate limits.
 
+## Project Structure
+
+The codebase is organized as a modular Python package under `app/`:
+
+```
+app/
+├── __init__.py        # Package marker
+├── config.py          # Config loading, defaults, and validation
+├── logging_utils.py   # Logging setup and ANSI-aware formatting
+├── models.py          # Shared dataclasses (BookingMeta, SessionStats)
+├── state.py           # State persistence (state.json)
+├── doctolib.py        # Doctolib URL parsing and availability logic
+├── notifications.py   # Telegram dispatch and HTML-to-terminal formatting
+├── loop.py            # Per-cycle execution, summary dispatch, countdown
+└── runner.py          # Main orchestration (CLI, preflight, polling loop)
+```
+
+### Architecture Overview
+
+The application follows a layered architecture with clear module boundaries:
+
+- **`checker.py`** — Thin entrypoint wrapper that delegates to the modular runtime
+- **`runner.py`** — CLI argument parsing, config initialization, preflight verification, and loop orchestration
+- **`loop.py`** — Per-cycle execution logic, summary dispatch, and countdown pacing
+- **`doctolib.py`** — URL parsing, metadata resolution, and slot fetching via shared requests session
+- **`notifications.py`** — Telegram message dispatch and HTML-to-terminal text conversion
+- **`config.py`** — Centralized configuration with sensible defaults and validation
+- **`state.py`** — Persistent state tracking across runs (notification history, cycle counts)
+
+This modular design improves maintainability while preserving the original CLI interface and behavior.
+
 ## Configuration (`config.json`)
 
 The script relies on a `config.json` file in the root directory. Copy `config.json.example` as your starting point and adjust the parameters below:
@@ -113,6 +144,7 @@ That's it! The tool automatically parses the URL and monitors for available slot
   ```bash
   python checker.py
   ```
+  The CLI interface remains unchanged after the modular refactor — `checker.py` now delegates to the modular runtime under `app/`.
 - **Single Check:** To run one check cycle without starting the continuous loop:
   ```bash
   python checker.py --once
