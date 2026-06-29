@@ -121,7 +121,12 @@ That's it! The tool automatically parses the URL and monitors for available slot
   ```bash
   python checker.py --dry-run
   ```
-- **Quick Check:** To fetch raw API data for the first URL in your config (saved to `temp/`):
+- **Quick Check:** To verify the first URL in your config and save parsed Doctolib output to `temp/`:
+  - parses the first configured booking URL
+  - resolves metadata from Doctolib's `info.json`
+  - fetches availability data from `availabilities.json`
+  - prints an interpreted status such as IMMINENT SLOT, FAR SLOT, OUT OF WINDOW, or NO SLOTS
+  - saves a JSON file containing both metadata and the Doctolib API response
   ```bash
   python quick_check.py
   ```
