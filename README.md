@@ -173,4 +173,6 @@ That's it! The tool automatically parses the URL and monitors for available slot
 
 This tool is a personal utility and is provided entirely **"as-is"**. There is no planned roadmap, and active maintenance, feature requests, or bug fixes are not guaranteed. Feel free to fork the repository to modify it for your own needs.
 
-*Note: This project was primarily developed with the assistance of AI tools. While it gets the job done for its specific use case, the internal logic and structure may bypass traditional software engineering patterns.*
+The codebase has been refactored from a monolithic script into a modular Python package (`app/`) to improve maintainability and separation of concerns. The CLI interface and configuration schema remain unchanged, so existing setups continue to work without modification.
+
+*Note: This project was developed with the assistance of AI tools. The modular architecture follows conventional Python packaging patterns for better long-term maintainability.*
