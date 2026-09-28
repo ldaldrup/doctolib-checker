@@ -28,6 +28,17 @@ env/
 *.swo
 *~
 
+# Local agent instructions and planning artifacts
+AGENTS.md
+**/AGENTS.md
+.agents/
+
+plans/
+**/plans/
+*.plan.md
+*_plan.md
+*-plan.md
+
 # OS
 .DS_Store
 Thumbs.db
