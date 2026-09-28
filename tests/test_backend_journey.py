@@ -77,6 +77,11 @@ class FakeNotifier:
         return self.successful, None if self.successful else "telegram_timeout"
 
 
+class RaisingNotifier:
+    def __call__(self, settings, alert):
+        raise RuntimeError("https://api.telegram.org/botprivate-token/sendMessage")
+
+
 class RaisingDoctolib(DoctolibClient):
     """Use actual fixture checks while simulating one failing target request."""
 
@@ -189,6 +194,17 @@ def test_invalid_target_and_interval_are_rejected_without_network_access(tmp_pat
     client, _repository, _settings, doctolib = setup_backend(tmp_path)
     response = client.post("/api/v1/targets/validate", json={
         "booking_url": "https://example.org/praxis/berlin/beispiel/booking/availabilities?placeId=1&motiveIds=2"
+    })
+    assert response.status_code == 422
+    assert doctolib.fixture_session.calls == []
+
+    response = client.post("/api/v1/jobs", json={
+        "name": "Reversed dates",
+        "target_urls": [URL],
+        "interval_seconds": 300,
+        "date_mode": "custom",
+        "earliest_date": "2026-10-21",
+        "latest_date": "2026-10-20",
     })
     assert response.status_code == 422
     assert doctolib.fixture_session.calls == []
@@ -336,6 +352,19 @@ def test_failed_telegram_delivery_preserves_available_result_and_history(tmp_pat
     assert retried["status"] == "sent"
     assert retried["attempt_count"] == 2
     assert len(retry_notifier.sent) == 1
+
+
+def test_notifier_exception_is_sanitized_and_saved_for_retry(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+
+    CheckService(repository, doctolib, settings, notifier=RaisingNotifier()).run_due()
+
+    alert = client.get("/api/v1/alerts").json()[0]
+    assert alert["status"] == "failed"
+    assert alert["error_summary"] == "telegram_delivery_error"
+    assert b"private-token" not in client.get("/api/v1/alerts").content
+    assert client.get("/api/v1/jobs/" + job["id"] + "/checks").json()[0]["status"] == "available"
 
 
 def test_repeated_identical_slot_does_not_create_another_alert(tmp_path):
