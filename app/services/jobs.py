@@ -2,7 +2,7 @@
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.doctolib import BookingUrlError, DoctolibClient, MetadataResolutionError
+from app.doctolib import BookingUrlError, DoctolibClient, MetadataResolutionError, parse_booking_url
 
 
 def resolve_target(url, doctolib):
@@ -31,6 +31,16 @@ def validate_timezone(name):
         raise ValueError("time_zone must be a valid IANA time zone")
 
 
+def normalize_targets(targets):
+    normalized_urls = set()
+    for target in targets:
+        target["booking_url"] = parse_booking_url(target["booking_url"])["url"]
+        if target["booking_url"] in normalized_urls:
+            raise ValueError("Target URLs must be unique after URL normalization")
+        normalized_urls.add(target["booking_url"])
+    return targets
+
+
 def create_job(repository, doctolib, settings, values):
     validate_timezone(values["time_zone"])
     telegram_enabled = values.get("telegram_enabled")
@@ -38,10 +48,7 @@ def create_job(repository, doctolib, settings, values):
         telegram_enabled = settings.telegram_enabled
     if telegram_enabled and not settings.telegram_enabled:
         raise ValueError("Telegram is not configured on the server")
-    targets = [resolve_target(url, doctolib) for url in values["target_urls"]]
-    for target in targets:
-        from app.doctolib import parse_booking_url
-        target["booking_url"] = parse_booking_url(target["booking_url"])["url"]
+    targets = normalize_targets([resolve_target(url, doctolib) for url in values["target_urls"]])
     clean = dict(values)
     clean["telegram_enabled"] = bool(telegram_enabled)
     clean["earliest_date"] = values["earliest_date"].isoformat() if values.get("earliest_date") else None
@@ -78,9 +85,5 @@ def update_job(repository, doctolib, settings, job_id, values):
             values["horizon_days"] = values.get("horizon_days", existing["horizon_days"] or 15)
     if values.get("telegram_enabled") and not settings.telegram_enabled:
         raise ValueError("Telegram is not configured on the server")
-    targets = [resolve_target(url, doctolib) for url in target_urls] if target_urls is not None else None
-    if targets is not None:
-        from app.doctolib import parse_booking_url
-        for target in targets:
-            target["booking_url"] = parse_booking_url(target["booking_url"])["url"]
+    targets = normalize_targets([resolve_target(url, doctolib) for url in target_urls]) if target_urls is not None else None
     return repository.update_job(job_id, values, targets=targets)
