@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -12,6 +12,26 @@ class BookingMeta:
     agenda_ids_str: str
     practice_id: str
     display_name: str
+    country: str = "de"
+    profile_slug: str = ""
+    practitioner_id: Optional[str] = None
+    motive_name: Optional[str] = None
+
+
+@dataclass
+class Slot:
+    starts_at: datetime
+
+
+@dataclass
+class AvailabilityResult:
+    status: str
+    slot_count: int
+    earliest_slot: Optional[datetime]
+    slots: List[Slot] = field(default_factory=list)
+    count_complete: bool = True
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 @dataclass

@@ -1,6 +1,9 @@
 import logging
 import re
 import time
+from datetime import datetime
+from html import escape
+from zoneinfo import ZoneInfo
 
 import requests
 from colorama import Fore, Style
@@ -98,3 +101,62 @@ def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
             time.sleep(min(2 ** attempt, 32))
 
     return False
+
+
+def format_slot_alert(alert):
+    practitioner = escape(str(alert.get("practitioner_name", "Practitioner")))
+    practice = escape(str(alert.get("practice_name", "Practice")))
+    slot_value = str(alert.get("earliest_slot", ""))
+    try:
+        slot_time = datetime.fromisoformat(slot_value.replace("Z", "+00:00"))
+        slot = slot_time.astimezone(ZoneInfo(alert.get("time_zone") or "UTC")).strftime("%Y-%m-%d %H:%M %Z")
+    except (ValueError, KeyError):
+        slot = slot_value
+    slot = escape(slot)
+    booking_url = escape(str(alert.get("booking_url", "")), quote=True)
+    count = int(alert.get("slot_count", 1))
+    return (
+        f"<b>{count} matching appointment slot(s)</b>\n\n"
+        f"👨‍⚕️ {practitioner}\n"
+        f"🏥 {practice}\n"
+        f"📅 Earliest: <b>{slot}</b>\n\n"
+        f'<a href="{booking_url}">Open booking on Doctolib</a>'
+    )
+
+
+def send_telegram_alert(settings, alert, session=None):
+    """Send one structured slot alert without logging its URL or credentials."""
+    if not settings.telegram_enabled or not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return False, "telegram_not_configured"
+
+    request_session = session or requests.Session()
+    endpoint = f"{TELEGRAM_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
+    payload = {
+        "chat_id": settings.telegram_chat_id,
+        "text": format_slot_alert(alert),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    last_error = "telegram_delivery_failed"
+    for attempt in range(1, 4):
+        try:
+            response = request_session.post(
+                endpoint,
+                json=payload,
+                headers={"User-Agent": "DoctolibChecker/2.0"},
+                timeout=20,
+            )
+            if response.status_code == 200 and response.json().get("ok") is True:
+                return True, None
+            last_error = "telegram_http_" + str(response.status_code)
+        except requests.exceptions.Timeout:
+            last_error = "telegram_timeout"
+        except requests.exceptions.ConnectionError:
+            last_error = "telegram_connection_error"
+        except Exception:
+            # Never include requests' URL-bearing exception text: the URL contains the bot token.
+            last_error = "telegram_delivery_error"
+        if attempt < 3:
+            time.sleep(2 ** attempt)
+    logging.warning("Telegram delivery failed (%s)", last_error)
+    return False, last_error
