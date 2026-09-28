@@ -1,0 +1,1 @@
+"""Background polling worker."""
