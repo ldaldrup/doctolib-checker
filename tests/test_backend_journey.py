@@ -225,6 +225,21 @@ def test_job_update_rejects_null_values_instead_of_failing_in_storage(tmp_path):
     assert len(doctolib.fixture_session.calls) == 1
 
 
+def test_create_job_rejects_duplicate_urls_after_normalization(tmp_path):
+    client, _repository, _settings, doctolib = setup_backend(tmp_path)
+
+    response = client.post("/api/v1/jobs", json={
+        "name": "Duplicate normalized targets",
+        "target_urls": [URL, URL + "#ignored-fragment"],
+        "interval_seconds": 300,
+    })
+
+    assert response.status_code == 422
+    assert "unique after URL normalization" in response.text
+    assert client.get("/api/v1/jobs").json() == []
+    assert len(doctolib.fixture_session.calls) == 2
+
+
 def test_no_match_stays_active_and_does_not_alert(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path, status="no_availability")
     job = create_job(client)
