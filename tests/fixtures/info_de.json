@@ -1,0 +1,13 @@
+{
+  "data": {
+    "profile": {"name_with_title": "Praxis Beispiel"},
+    "practitioners": [{"id": 456, "name": "Dr. Ada Beispiel"}],
+    "visit_motives": [{"id": 789, "name": "Erstuntersuchung"}],
+    "agendas": [{
+      "id": 1234,
+      "practice_id": 123,
+      "practitioner_id": 456,
+      "visit_motive_ids": [789]
+    }]
+  }
+}
