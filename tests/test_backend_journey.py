@@ -50,13 +50,8 @@ class FixtureSession:
             value = json.loads((FIXTURES / "info_de.json").read_text())
             return FixtureResponse(value)
         if self.no_availability:
-            return FixtureResponse({
-                "total": 1,
-                "next_slot": "2026-10-25T08:00:00+02:00",
-                "availabilities": [{"date": "2026-10-25", "slots": [
-                    {"start_time": "2026-10-25T08:00:00+02:00"}
-                ]}],
-            })
+            value = json.loads((FIXTURES / "no_availability.json").read_text())
+            return FixtureResponse(value)
         value = json.loads((FIXTURES / "availability_window.json").read_text())
         return FixtureResponse(value)
 
