@@ -34,7 +34,9 @@ def create_router():
             last_seen = utc_now() - datetime.fromisoformat(
                 heartbeat["last_seen_at"].replace("Z", "+00:00")
             )
-            result["worker_alive"] = last_seen <= timedelta(seconds=30)
+            # Requests and Telegram retries can keep a sequential worker busy
+            # for longer than one scheduler tick; network attempts refresh this.
+            result["worker_alive"] = last_seen <= timedelta(seconds=90)
         else:
             result["worker_alive"] = False
         return result

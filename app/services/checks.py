@@ -37,15 +37,20 @@ class CheckService:
 
     def dispatch_pending(self):
         for alert in self.repository.get_pending_alerts():
-            sent, error = self.notifier(self.settings, alert)
+            try:
+                sent, error = self.notifier(self.settings, alert)
+            except Exception:
+                # Do not persist exception text; request URLs may contain
+                # credentials supplied by an upstream notification service.
+                sent, error = False, "telegram_delivery_error"
             self.repository.finish_alert(alert["id"], sent, error)
 
     def run_claim(self, run_id, job):
-        targets = self.repository.get_targets(job["id"])
         successful = 0
         failed = 0
         last_error = None
         try:
+            targets = self.repository.get_targets(job["id"])
             for target_ref in targets:
                 current_job = self.repository.get_job(job["id"])
                 if current_job is None or current_job["status"] != "active":
@@ -82,6 +87,10 @@ class CheckService:
                     last_error = code
                     self.repository.insert_error_result(run_id, current_job, target, code, message)
                     logging.warning("Availability check failed for target %s (%s)", target["id"], code)
+        except Exception as exc:
+            failed += 1
+            last_error, _message = _safe_error(exc)
+            logging.error("Unable to load or process targets for job %s (%s)", job["id"], last_error)
         finally:
             self.repository.finish_run(
                 run_id, job["id"], successful, failed, int(job["interval_seconds"]), last_error
