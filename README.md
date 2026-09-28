@@ -184,6 +184,8 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of both proce
 
 The versioned API is under `/api/v1`. It provides health and worker status, job and target management, URL validation, check history, alert history, and supported global settings. Poll intervals have a server-enforced minimum of 300 seconds; outbound Doctolib requests share the configured spacing gate. The API does not provide appointment booking, email, or webhook delivery.
 
+Alert creation is deduplicated in SQLite, and failed Telegram sends remain in alert history for retry. Telegram does not offer exactly-once delivery: if Telegram accepts a message and the worker stops before saving the success state, a later retry can send that alert again.
+
 To run the offline API/worker and checker tests:
 
 ```bash

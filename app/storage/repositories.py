@@ -359,6 +359,15 @@ class Repository:
             row = conn.execute("SELECT * FROM worker_heartbeat WHERE singleton_id=1").fetchone()
             return dict(row) if row else None
 
+    def touch_worker(self):
+        now = iso()
+        with self.database.connection() as conn:
+            conn.execute(
+                """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at)
+                VALUES(1,?,?) ON CONFLICT(singleton_id) DO UPDATE SET last_seen_at=excluded.last_seen_at""",
+                (now, now),
+            )
+
     def dashboard_status(self):
         with self.database.connection() as conn:
             counts = conn.execute(
