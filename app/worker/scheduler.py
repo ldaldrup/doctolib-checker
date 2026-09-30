@@ -16,6 +16,7 @@ def create_check_service(settings=None, repository=None, doctolib=None, notifier
         database = Database(settings.database_path)
         database.initialize()
         repository = Repository(database)
+    repository.configure_minimum(settings.minimum_poll_interval_seconds)
     if doctolib is None:
         def before_request():
             repository.touch_worker()

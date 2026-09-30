@@ -74,7 +74,7 @@ The script relies on a `config.json` file in the root directory. Copy `config.js
 
 - `polling.check_interval_seconds` (Integer): Wait time in seconds between check cycles. **Recommended: 300+ seconds (5+ minutes)** to avoid potential rate-limiting or IP bans.
 - `polling.delay_between_urls_seconds` (Integer): Pause between fetching URLs in a single cycle. **Recommended: 2–5 seconds.**
-- `polling.upcoming_days` (Integer): How many days ahead to search for appointments (e.g., `15` = next 15 days).
+- `polling.upcoming_days` (Integer): Number of calendar dates to search, including today (e.g., `15` = today and the next 14 dates).
 - `polling.insurance_sector` (String): Filter by insurance type: `"public"` or `"private"`. Defaults to `"public"`.
 - `polling.telehealth` (Boolean): Include remote/telehealth appointments. Defaults to `false`.
 - `polling.page_days` (Integer): Calendar days requested per availability page. Must be between `1` and `15`; defaults to `15`. Existing configs with `polling.slot_limit` use that value as a fallback.
@@ -184,9 +184,9 @@ DATABASE_PATH=./data/checker.sqlite3 python -m app.worker.main
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of both processes to enable alerts. Keep those values out of job records and source control. The example container environment is in `.env.example`.
 
-The versioned API is under `/api/v1`. It provides health and worker status, job and target management, URL validation, check history, alert history, and supported global settings. Poll intervals have a server-enforced minimum of 300 seconds; outbound Doctolib requests share the configured spacing gate. The API does not provide appointment booking, email, or webhook delivery.
+The versioned API is under `/api/v1`. It provides health and worker status, job and target management, URL validation, check history, alert history, and supported global settings. Poll intervals have a server-enforced minimum of at least 300 seconds, configurable through `MINIMUM_POLL_INTERVAL_SECONDS`. This minimum also applies to job edits, resume, and check-now requests; a check-now request may be queued for later. Outbound Doctolib requests share the configured spacing gate. A 15-day backend horizon includes today and the next 14 calendar dates. The API does not provide appointment booking, email, or webhook delivery.
 
-Alert creation is deduplicated in SQLite, and failed Telegram sends remain in alert history for retry. Telegram does not offer exactly-once delivery: if Telegram accepts a message and the worker stops before saving the success state, a later retry can send that alert again.
+An alert is sent once for an earliest slot while that slot remains the earliest available. A confirmed disappearance or change of earliest slot starts a new alert episode; an increased slot count with the same earliest slot does not. Failed Telegram sends remain in alert history for retry only while the target is active, the slot is in the future, and a confirming check is no older than one job interval. A newer no-availability result, changed earliest slot, removed target, or expired slot cancels a pending alert; errors do not reset an episode. Pausing a job or disabling Telegram suspends delivery until a fresh-enough check permits it. The `/api/v1/alerts` status can be `cancelled` for alerts that will not be retried. Telegram does not offer exactly-once delivery: if Telegram accepts a message and the worker stops before saving the success state, a later retry can send that alert again.
 
 To run the offline API/worker and checker tests:
 

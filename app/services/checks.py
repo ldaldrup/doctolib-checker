@@ -37,8 +37,12 @@ class CheckService:
 
     def dispatch_pending(self):
         for alert in self.repository.get_pending_alerts():
+            # A job or target may have changed after the initial batch query.
+            current = self.repository.get_pending_alerts(limit=1, alert_id=alert["id"])
+            if not current:
+                continue
             try:
-                sent, error = self.notifier(self.settings, alert)
+                sent, error = self.notifier(self.settings, current[0])
             except Exception:
                 # Do not persist exception text; request URLs may contain
                 # credentials supplied by an upstream notification service.
@@ -73,7 +77,7 @@ class CheckService:
                 }
                 try:
                     result = self.doctolib.check(target["booking_url"], search, meta=self._meta(target))
-                    self.repository.insert_result(run_id, current_job, target, result)
+                    result_id = self.repository.insert_result(run_id, current_job, target, result)
                     if result.status == "error":
                         failed += 1
                         last_error = result.error_code or "doctolib_incomplete_result"
@@ -85,7 +89,7 @@ class CheckService:
                         current_job = self.repository.get_job(job["id"])
                         if (current_job and current_job["status"] == "active"
                                 and current_job["telegram_enabled"]):
-                            self.repository.create_alert(current_job, target, self._latest_result_id(run_id, target["id"]), result.earliest_slot)
+                            self.repository.create_alert(current_job, target, result_id, result.earliest_slot)
                             self.dispatch_pending()
                 except Exception as exc:
                     failed += 1
@@ -102,9 +106,6 @@ class CheckService:
                 run_id, job["id"], successful, failed, int(job["interval_seconds"]), last_error
             )
         return {"successful_targets": successful, "failed_targets": failed}
-
-    def _latest_result_id(self, run_id, target_id):
-        return self.repository.result_id(run_id, target_id)
 
     def run_due(self, limit=10):
         self.dispatch_pending()
