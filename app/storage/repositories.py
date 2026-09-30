@@ -1,6 +1,5 @@
 """Transactional application operations over the SQLite schema."""
 
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -10,11 +9,15 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def iso(value=None):
+def iso(value=None, *, timespec="seconds"):
     value = value or utc_now()
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return value.astimezone(timezone.utc).isoformat(timespec=timespec)
+
+
+def precise_iso(value=None):
+    return iso(value, timespec="microseconds")
 
 
 def parse_time(value):
@@ -23,6 +26,11 @@ def parse_time(value):
 
 def new_id():
     return str(uuid.uuid4())
+
+
+def alert_dedupe_key(target_id, earliest_slot, episode):
+    base = target_id + ":slot:" + earliest_slot
+    return base if episode == 0 else base + ":episode:" + str(episode)
 
 
 class NotFoundError(LookupError):
@@ -34,8 +42,40 @@ class ConflictError(ValueError):
 
 
 class Repository:
-    def __init__(self, database):
+    def __init__(self, database, minimum_poll_interval_seconds=300):
         self.database = database
+        self.minimum_poll_interval_seconds = minimum_poll_interval_seconds
+
+    def configure_minimum(self, minimum_poll_interval_seconds):
+        """Apply a raised server floor to persisted settings and existing jobs."""
+        self.minimum_poll_interval_seconds = minimum_poll_interval_seconds
+        now = utc_now()
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE settings SET default_interval_seconds=?,updated_at=?
+                WHERE default_interval_seconds<?""",
+                (minimum_poll_interval_seconds, iso(now), minimum_poll_interval_seconds),
+            )
+            rows = conn.execute(
+                """SELECT id,next_check_at,last_started_at,last_finished_at FROM jobs
+                WHERE status!='deleted' AND interval_seconds<?""",
+                (minimum_poll_interval_seconds,),
+            ).fetchall()
+            for row in rows:
+                due = max(parse_time(row["next_check_at"]), self._minimum_due(row, now))
+                conn.execute(
+                    """UPDATE jobs SET interval_seconds=?,next_check_at=?,updated_at=? WHERE id=?""",
+                    (minimum_poll_interval_seconds, precise_iso(due), iso(now), row["id"]),
+                )
+
+    def _minimum_due(self, job, requested_at):
+        anchor = max(
+            (parse_time(job[key]) for key in ("last_started_at", "last_finished_at") if job[key]),
+            default=None,
+        )
+        allowed = anchor + timedelta(seconds=self.minimum_poll_interval_seconds) if anchor else requested_at
+        return max(requested_at, allowed)
 
     def _job(self, row, conn=None):
         if row is None:
@@ -51,6 +91,8 @@ class Repository:
         return item
 
     def create_job(self, values, targets):
+        if values["interval_seconds"] < self.minimum_poll_interval_seconds:
+            raise ValueError("interval_seconds is below the server minimum")
         job_id = new_id()
         now = iso()
         with self.database.connection() as conn:
@@ -110,6 +152,8 @@ class Repository:
             return result
 
     def update_job(self, job_id, values, targets=None):
+        if values.get("interval_seconds", self.minimum_poll_interval_seconds) < self.minimum_poll_interval_seconds:
+            raise ValueError("interval_seconds is below the server minimum")
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM jobs WHERE id=? AND status != 'deleted'", (job_id,)).fetchone()
@@ -151,14 +195,17 @@ class Repository:
                              target["agenda_ids_str"], target["practice_name"], target["practitioner_name"],
                              target.get("motive_name"), "ready", iso()),
                         )
-            # Re-queue after an edit while preserving the 5 minute target floor.
-            last = conn.execute("SELECT MAX(checked_at) FROM check_results WHERE job_id=?", (job_id,)).fetchone()[0]
-            allowed = parse_time(last) + timedelta(seconds=300) if last else utc_now()
-            due = max(utc_now(), allowed)
+                conn.execute(
+                    """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='target_removed'
+                    WHERE job_id=? AND status IN ('pending','failed') AND target_id IN
+                    (SELECT id FROM targets WHERE job_id=? AND active=0)""",
+                    (job_id, job_id),
+                )
+            due = self._minimum_due(row, utc_now())
             # Keep an in-flight lease intact. The worker re-reads the changed
             # settings before its next target, and finish_run schedules using
             # the updated interval.
-            conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (iso(due), job_id))
+            conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (precise_iso(due), job_id))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
     def set_status(self, job_id, status):
@@ -172,12 +219,14 @@ class Repository:
             due = row["next_check_at"]
             lock = row["lock_until"]
             if status == "active":
-                last = conn.execute("SELECT MAX(checked_at) FROM check_results WHERE job_id=?", (job_id,)).fetchone()[0]
-                allowed = parse_time(last) + timedelta(seconds=300) if last else utc_now()
-                due = iso(max(utc_now(), allowed))
+                due = precise_iso(self._minimum_due(row, utc_now()))
             if status == "deleted":
                 due = iso(utc_now() + timedelta(days=36500))
                 lock = None
+                conn.execute(
+                    """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='job_deleted'
+                    WHERE job_id=? AND status IN ('pending','failed')""", (job_id,),
+                )
             lock_run_id = row["lock_run_id"] if status != "deleted" else None
             conn.execute("UPDATE jobs SET status=?,next_check_at=?,lock_until=?,lock_run_id=?,updated_at=? WHERE id=?",
                          (status, due, lock, lock_run_id, iso(), job_id))
@@ -185,23 +234,21 @@ class Repository:
 
     def set_job_due(self, job_id, due_at):
         with self.database.connection() as conn:
-            row = conn.execute("SELECT status,lock_until FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = conn.execute("SELECT status,lock_until,last_started_at,last_finished_at FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None or row["status"] == "deleted":
                 raise NotFoundError("Job not found")
             if row["status"] == "paused":
                 raise ConflictError("Paused jobs cannot be run; resume the job first")
             if row["lock_until"] and parse_time(row["lock_until"]) > utc_now():
                 raise ConflictError("This job already has a check in progress")
-            last = conn.execute("SELECT MAX(checked_at) FROM check_results WHERE job_id=?", (job_id,)).fetchone()[0]
-            allowed = parse_time(last) + timedelta(seconds=300) if last else utc_now()
-            due = max(due_at, allowed)
+            due = self._minimum_due(row, due_at)
             conn.execute("UPDATE jobs SET next_check_at=?,updated_at=? WHERE id=?",
-                         (iso(due), iso(), job_id))
+                         (precise_iso(due), iso(), job_id))
             return due
 
     def claim_due_jobs(self, limit=10):
         now = utc_now()
-        now_text = iso(now)
+        now_text = precise_iso(now)
         claimed = []
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -215,7 +262,7 @@ class Repository:
                 changed = conn.execute(
                     """UPDATE jobs SET lock_until=?,lock_run_id=?,last_started_at=? WHERE id=? AND status='active'
                     AND (lock_until IS NULL OR lock_until<=?)""",
-                    (iso(now + timedelta(minutes=10)), run_id, now_text, row["id"], now_text),
+                    (precise_iso(now + timedelta(minutes=10)), run_id, now_text, row["id"], now_text),
                 ).rowcount
                 if not changed:
                     continue
@@ -236,7 +283,7 @@ class Repository:
         with self.database.connection() as conn:
             changed = conn.execute(
                 """UPDATE jobs SET lock_until=? WHERE id=? AND status='active' AND lock_run_id=?""",
-                (iso(utc_now() + timedelta(minutes=lease_minutes)), job_id, run_id),
+                (precise_iso(utc_now() + timedelta(minutes=lease_minutes)), job_id, run_id),
             ).rowcount
             return changed == 1
 
@@ -256,7 +303,11 @@ class Repository:
 
     def insert_result(self, run_id, job, target, result):
         result_id = new_id()
+        earliest_slot = iso(result.earliest_slot) if result.earliest_slot else None
+        if result.status == "available" and earliest_slot is None:
+            raise ValueError("An available result requires an earliest slot")
         with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """INSERT INTO check_results
                 (id,run_id,job_id,target_id,practitioner_name,practice_name,booking_url,checked_at,status,
@@ -264,9 +315,44 @@ class Repository:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (result_id, run_id, job["id"], target["id"], target["practitioner_name"],
                  target["practice_name"], target["booking_url"], iso(), result.status, result.slot_count,
-                 iso(result.earliest_slot) if result.earliest_slot else None, int(result.count_complete),
+                 earliest_slot, int(result.count_complete),
                  result.error_code, result.error_message),
             )
+            if result.status in ("available", "no_availability"):
+                state = conn.execute(
+                    "SELECT last_status,last_earliest_slot,episode FROM target_alert_state WHERE target_id=?",
+                    (target["id"],),
+                ).fetchone()
+                episode = state["episode"] if state else 0
+                if result.status == "available" and state and state["last_status"] is not None:
+                    if state["last_status"] != "available" or state["last_earliest_slot"] != earliest_slot:
+                        episode += 1
+                conn.execute(
+                    """INSERT INTO target_alert_state(target_id,last_status,last_earliest_slot,episode)
+                    VALUES(?,?,?,?) ON CONFLICT(target_id) DO UPDATE SET
+                    last_status=excluded.last_status,last_earliest_slot=excluded.last_earliest_slot,
+                    episode=excluded.episode""",
+                    (target["id"], result.status, earliest_slot, episode),
+                )
+                if result.status == "no_availability":
+                    conn.execute(
+                        """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,
+                        error_summary='availability_disappeared'
+                        WHERE target_id=? AND status IN ('pending','failed')""", (target["id"],),
+                    )
+                else:
+                    current_key = alert_dedupe_key(target["id"], earliest_slot, episode)
+                    conn.execute(
+                        """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,
+                        error_summary='earliest_slot_changed'
+                        WHERE target_id=? AND status IN ('pending','failed') AND dedupe_key!=?""",
+                        (target["id"], current_key),
+                    )
+                    conn.execute(
+                        """UPDATE alerts SET result_id=? WHERE target_id=? AND dedupe_key=?
+                        AND status IN ('pending','failed')""",
+                        (result_id, target["id"], current_key),
+                    )
         return result_id
 
     def insert_error_result(self, run_id, job, target, error_code, error_message):
@@ -291,31 +377,84 @@ class Repository:
 
     def create_alert(self, job, target, result_id, earliest_slot):
         alert_id = new_id()
-        dedupe = target["id"] + ":slot:" + iso(earliest_slot)
+        slot_text = iso(earliest_slot)
         now = iso()
-        try:
-            with self.database.connection() as conn:
-                conn.execute(
-                    """INSERT INTO alerts(id,job_id,target_id,result_id,channel,event_type,dedupe_key,
-                    status,created_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (alert_id, job["id"], target["id"], result_id, "telegram", "slot_found", dedupe,
-                     "pending", now, now),
-                )
-        except sqlite3.IntegrityError:
-            return None
-        return alert_id
-
-    def get_pending_alerts(self, limit=20):
         with self.database.connection() as conn:
-            return [dict(row) for row in conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            state = conn.execute(
+                """SELECT s.episode,s.last_status,s.last_earliest_slot,t.active,
+                j.status AS job_status,j.telegram_enabled
+                FROM target_alert_state s JOIN targets t ON t.id=s.target_id
+                JOIN jobs j ON j.id=t.job_id WHERE t.id=? AND j.id=?""",
+                (target["id"], job["id"]),
+            ).fetchone()
+            if (state is None or not state["active"] or state["job_status"] != "active" or
+                    not state["telegram_enabled"] or state["last_status"] != "available" or
+                    state["last_earliest_slot"] != slot_text):
+                return None
+            dedupe = alert_dedupe_key(target["id"], slot_text, state["episode"])
+            inserted = conn.execute(
+                """INSERT OR IGNORE INTO alerts(id,job_id,target_id,result_id,channel,event_type,dedupe_key,
+                status,created_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (alert_id, job["id"], target["id"], result_id, "telegram", "slot_found", dedupe,
+                 "pending", now, now),
+            ).rowcount
+            if inserted:
+                return alert_id
+            existing = conn.execute("SELECT id,status FROM alerts WHERE dedupe_key=?", (dedupe,)).fetchone()
+            if existing is None:
+                raise RuntimeError("Alert insert was ignored without a matching dedupe key")
+            if existing["status"] == "sent":
+                return None
+            if existing["status"] == "cancelled":
+                conn.execute(
+                    """UPDATE alerts SET status='pending',result_id=?,next_attempt_at=?,
+                    error_summary=NULL WHERE id=?""", (result_id, now, existing["id"]),
+                )
+            return existing["id"]
+
+    def get_pending_alerts(self, limit=20, alert_id=None):
+        now = utc_now()
+        ready = []
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
                 """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
-                r.booking_url,j.time_zone
+                r.booking_url,r.checked_at,j.time_zone,j.status AS job_status,j.telegram_enabled,
+                j.interval_seconds,t.active AS target_active,s.last_status,s.last_earliest_slot
                 FROM alerts a JOIN check_results r ON r.id=a.result_id
                 JOIN jobs j ON j.id=a.job_id
-                WHERE a.status IN ('pending','failed') AND j.status='active' AND j.telegram_enabled=1
-                AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=?)
-                ORDER BY a.created_at LIMIT ?""", (iso(), limit)
-            ).fetchall()]
+                LEFT JOIN targets t ON t.id=a.target_id
+                LEFT JOIN target_alert_state s ON s.target_id=a.target_id
+                WHERE a.status IN ('pending','failed') AND (? IS NULL OR a.id=?)
+                ORDER BY a.created_at""", (alert_id, alert_id),
+            ).fetchall()
+            for row in rows:
+                alert = dict(row)
+                reason = None
+                if alert["job_status"] == "deleted":
+                    reason = "job_deleted"
+                elif not alert["target_active"]:
+                    reason = "target_removed"
+                elif not alert["earliest_slot"] or parse_time(alert["earliest_slot"]) <= now:
+                    reason = "slot_expired"
+                elif (alert["last_status"] != "available" or
+                      alert["last_earliest_slot"] != alert["earliest_slot"]):
+                    reason = "availability_changed"
+                if reason:
+                    conn.execute(
+                        """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary=?
+                        WHERE id=? AND status IN ('pending','failed')""", (reason, alert["id"]),
+                    )
+                    continue
+                if (alert["job_status"] != "active" or not alert["telegram_enabled"] or
+                        now - parse_time(alert["checked_at"]) > timedelta(seconds=alert["interval_seconds"]) or
+                        (alert["next_attempt_at"] and parse_time(alert["next_attempt_at"]) > now)):
+                    continue
+                ready.append(alert)
+                if len(ready) >= limit:
+                    break
+        return ready
 
     def finish_alert(self, alert_id, sent, error_summary=None):
         with self.database.connection() as conn:
@@ -326,7 +465,8 @@ class Repository:
             delay = min(300, 2 ** min(attempt, 8))
             next_attempt = None if sent else iso(utc_now() + timedelta(seconds=delay))
             conn.execute(
-                """UPDATE alerts SET status=?,attempt_count=?,sent_at=?,error_summary=?,next_attempt_at=? WHERE id=?""",
+                """UPDATE alerts SET status=?,attempt_count=?,sent_at=?,error_summary=?,next_attempt_at=?
+                WHERE id=? AND status IN ('pending','failed')""",
                 ("sent" if sent else "failed", attempt, iso() if sent else None,
                  error_summary[:240] if error_summary else None, next_attempt, alert_id),
             )
@@ -353,7 +493,10 @@ class Repository:
             job_row = conn.execute(
                 "SELECT interval_seconds FROM jobs WHERE id=?", (job_id,)
             ).fetchone()
-            effective_interval = job_row["interval_seconds"] if job_row else interval_seconds
+            effective_interval = max(
+                self.minimum_poll_interval_seconds,
+                job_row["interval_seconds"] if job_row else interval_seconds,
+            )
             conn.execute(
                 "UPDATE check_runs SET finished_at=?,outcome=?,successful_targets=?,failed_targets=? WHERE id=?",
                 (iso(now), outcome, successful, failed, run_id),
@@ -362,7 +505,7 @@ class Repository:
                 """UPDATE jobs SET next_check_at=CASE WHEN status='active' THEN ? ELSE next_check_at END,
                 last_finished_at=?,last_outcome=?,lock_until=NULL,lock_run_id=NULL
                 WHERE id=? AND lock_run_id=?""",
-                (iso(now + timedelta(seconds=effective_interval)), iso(now), outcome, job_id, run_id),
+                (precise_iso(now + timedelta(seconds=effective_interval)), precise_iso(now), outcome, job_id, run_id),
             )
             conn.execute(
                 """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at,last_completed_run_at,last_error)
@@ -479,7 +622,7 @@ class Repository:
         default_interval = int(values.get("default_interval_seconds", current["default_interval_seconds"]))
         spacing = float(values.get("request_spacing_seconds", current["request_spacing_seconds"]))
         if default_interval < minimum_interval:
-            raise ValueError("default_interval_seconds must be at least 300")
+            raise ValueError(f"default_interval_seconds must be at least {minimum_interval}")
         if spacing < 3:
             raise ValueError("request_spacing_seconds must be at least 3")
         with self.database.connection() as conn:
@@ -499,7 +642,7 @@ class Repository:
             conn.execute(
                 """INSERT INTO request_gate(singleton_id,next_allowed_at) VALUES(1,?)
                 ON CONFLICT(singleton_id) DO UPDATE SET next_allowed_at=excluded.next_allowed_at""",
-                (iso(following),),
+                (precise_iso(following),),
             )
         wait_seconds = max(0.0, (scheduled - utc_now()).total_seconds())
         if wait_seconds:

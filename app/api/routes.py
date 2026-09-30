@@ -103,6 +103,9 @@ def create_router():
     @router.patch("/api/v1/jobs/{job_id}")
     def patch_job(job_id: str, body: JobUpdateRequest, request: Request):
         values = body.model_dump(exclude_unset=True)
+        if ("interval_seconds" in values and
+                values["interval_seconds"] < request.app.state.settings.minimum_poll_interval_seconds):
+            raise HTTPException(status_code=422, detail="interval_seconds is below the server minimum")
         if "earliest_date" in values and values["earliest_date"] is not None:
             values["earliest_date"] = values["earliest_date"].isoformat()
         if "latest_date" in values and values["latest_date"] is not None:
@@ -166,7 +169,7 @@ def create_router():
             raise HTTPException(status_code=404, detail="job_not_found")
         except ConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        return {"job_id": job_id, "queued": True, "next_check_at": iso(due)}
+        return {"job_id": job_id, "queued": True, "next_check_at": iso(due, timespec="microseconds")}
 
     @router.get("/api/v1/jobs/{job_id}/checks")
     def checks(job_id: str, request: Request, limit: int = Query(default=50, ge=1, le=100),
