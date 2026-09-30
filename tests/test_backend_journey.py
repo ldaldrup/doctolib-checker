@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+import pytest
 from fastapi.testclient import TestClient
 
 from app.api.app import create_app
@@ -126,23 +127,24 @@ class UpdatingDoctolib(DoctolibClient):
         return super().check(booking_url, search, meta=meta, now=now)
 
 
-def setup_backend(tmp_path, status="available"):
+def setup_backend(tmp_path, status="available", minimum_interval=300):
     database = Database(str(tmp_path / "checker.sqlite3"))
     database.initialize()
     repository = Repository(database)
     settings = Settings(database_path=str(tmp_path / "checker.sqlite3"),
                         telegram_bot_token="test-token-never-return-this",
-                        telegram_chat_id="12345", telegram_enabled=True)
+                        telegram_chat_id="12345", telegram_enabled=True,
+                        minimum_poll_interval_seconds=minimum_interval)
     doctolib = FixtureDoctolib(no_availability=status == "no_availability")
     app = create_app(settings=settings, repository=repository, doctolib=doctolib)
     return TestClient(app), repository, settings, doctolib
 
 
-def create_job(client):
+def create_job(client, interval_seconds=300):
     response = client.post("/api/v1/jobs", json={
         "name": "My appointment search",
         "target_urls": [URL],
-        "interval_seconds": 300,
+        "interval_seconds": interval_seconds,
         "date_mode": "custom",
         "earliest_date": "2026-10-10",
         "latest_date": "2026-10-20",
@@ -163,6 +165,17 @@ def latest_result(client, job_id):
 def lock_owner(repository, job_id):
     with repository.database.connection() as conn:
         return conn.execute("SELECT lock_run_id FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+
+
+def record_result(repository, job, status, earliest_slot=None, slot_count=0):
+    target = repository.get_job(job["id"])["targets"][0]
+    run_id = repository.checks(job["id"])[0]["id"]
+    result = AvailabilityResult(
+        status=status, slot_count=slot_count, earliest_slot=earliest_slot,
+        count_complete=True,
+    )
+    result_id = repository.insert_result(run_id, job, target, result)
+    return target, result_id
 
 
 def test_primary_user_journey_validate_create_check_alert_and_read(tmp_path):
@@ -544,7 +557,7 @@ def test_database_v1_upgrade_preserves_running_lease_owner(tmp_path):
     repository = Repository(Database(path))
     assert lock_owner(repository, "job-1") == "run-1"
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -635,6 +648,218 @@ def test_repeated_identical_slot_does_not_create_another_alert(tmp_path):
 
     assert duplicate is None
     assert len(client.get("/api/v1/alerts").json()) == 1
+
+
+def test_failed_alert_waits_for_fresh_confirmation_then_retries(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    original = client.get("/api/v1/alerts").json()[0]
+    slot = datetime.fromisoformat(original["earliest_slot"])
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE check_results SET checked_at=? WHERE id=?",
+                     (iso(utc_now() - timedelta(seconds=301)), original["result_id"]))
+        conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), original["id"]))
+
+    notifier = FakeNotifier()
+    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    checker.dispatch_pending()
+    assert notifier.sent == []
+    target, result_id = record_result(repository, job, "available", slot, 3)
+    assert result_id != original["result_id"]
+    assert repository.create_alert(job, target, result_id, slot) == original["id"]
+    checker.dispatch_pending()
+    assert len(notifier.sent) == 1
+    assert client.get("/api/v1/alerts").json()[0]["status"] == "sent"
+
+
+def test_pause_and_error_do_not_make_an_old_alert_send_without_confirmation(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    alert = client.get("/api/v1/alerts").json()[0]
+    slot = datetime.fromisoformat(alert["earliest_slot"])
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), alert["id"]))
+
+    notifier = FakeNotifier()
+    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    assert client.post("/api/v1/jobs/" + job["id"] + "/pause").status_code == 200
+    checker.dispatch_pending()
+    assert notifier.sent == []
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE check_results SET checked_at=? WHERE id=?",
+                     (iso(utc_now() - timedelta(seconds=301)), alert["result_id"]))
+    assert client.post("/api/v1/jobs/" + job["id"] + "/resume").status_code == 200
+    target = repository.get_job(job["id"])["targets"][0]
+    run_id = repository.checks(job["id"])[0]["id"]
+    repository.insert_error_result(run_id, job, target, "doctolib_request_error", "retry later")
+    assert repository.alerts()[0]["status"] == "failed"
+    checker.dispatch_pending()
+    assert notifier.sent == []
+
+    record_result(repository, job, "available", slot, 3)
+    checker.dispatch_pending()
+    assert len(notifier.sent) == 1
+
+
+@pytest.mark.parametrize("new_status,new_slot", [
+    ("no_availability", None),
+    ("available", datetime(2026, 10, 16, 7, 30, tzinfo=timezone.utc)),
+])
+def test_new_confirmed_result_cancels_contradicted_alert(tmp_path, new_status, new_slot):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    record_result(repository, job, new_status, new_slot, int(new_slot is not None))
+
+    notifier = FakeNotifier()
+    CheckService(repository, doctolib, settings, notifier=notifier).dispatch_pending()
+    assert notifier.sent == []
+    assert client.get("/api/v1/alerts").json()[0]["status"] == "cancelled"
+
+
+def test_expired_slot_and_removed_target_cancel_pending_alerts(tmp_path, monkeypatch):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    slot = datetime.fromisoformat(client.get("/api/v1/alerts").json()[0]["earliest_slot"])
+    monkeypatch.setattr("app.storage.repositories.utc_now", lambda: slot + timedelta(seconds=1))
+    assert repository.get_pending_alerts() == []
+    assert client.get("/api/v1/alerts").json()[0]["error_summary"] == "slot_expired"
+
+    monkeypatch.undo()
+    second_client, second_repository, second_settings, second_doctolib = setup_backend(tmp_path / "second")
+    second_job = create_job(second_client)
+    CheckService(second_repository, second_doctolib, second_settings,
+                 notifier=FakeNotifier(successful=False)).run_due()
+    replacement_url = URL + "&source=other"
+    assert second_client.patch("/api/v1/jobs/" + second_job["id"],
+                               json={"target_urls": [replacement_url]}).status_code == 200
+    assert second_client.get("/api/v1/alerts").json()[0]["status"] == "cancelled"
+
+
+def test_reappearance_alerts_again_but_count_change_does_not(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    first = client.get("/api/v1/alerts").json()[0]
+    slot = datetime.fromisoformat(first["earliest_slot"])
+
+    record_result(repository, job, "no_availability")
+    target, result_id = record_result(repository, job, "available", slot, 3)
+    second_id = repository.create_alert(job, target, result_id, slot)
+    assert second_id and second_id != first["id"]
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).dispatch_pending()
+
+    target, result_id = record_result(repository, job, "available", slot, 4)
+    assert repository.create_alert(job, target, result_id, slot) is None
+    alerts = client.get("/api/v1/alerts").json()
+    assert len(alerts) == 2
+    assert all(alert["status"] == "sent" for alert in alerts)
+
+
+def test_configured_minimum_applies_to_patch_and_manual_scheduling(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path, minimum_interval=600)
+    too_fast = client.post("/api/v1/jobs", json={
+        "name": "Too fast", "target_urls": [URL], "interval_seconds": 300,
+    })
+    assert too_fast.status_code == 422
+    job = create_job(client, interval_seconds=600)
+    assert client.patch("/api/v1/jobs/" + job["id"],
+                        json={"interval_seconds": 300}).status_code == 422
+    assert client.put("/api/v1/settings",
+                      json={"default_interval_seconds": 300}).status_code == 422
+
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    repository.finish_run(run_id, job["id"], 1, 0, claimed["interval_seconds"])
+    last_finished = parse_time(repository.get_job(job["id"])["last_finished_at"])
+    floor = last_finished + timedelta(seconds=600)
+    assert parse_time(repository.get_job(job["id"])["next_check_at"]) >= floor
+
+    edited = client.patch("/api/v1/jobs/" + job["id"], json={"name": "Edited"})
+    assert edited.status_code == 200
+    assert parse_time(edited.json()["next_check_at"]) >= floor
+    assert client.post("/api/v1/jobs/" + job["id"] + "/pause").status_code == 200
+    resumed = client.post("/api/v1/jobs/" + job["id"] + "/resume")
+    assert parse_time(resumed.json()["next_check_at"]) >= floor
+    check_now = client.post("/api/v1/jobs/" + job["id"] + "/check-now")
+    assert check_now.status_code == 200
+    assert parse_time(check_now.json()["next_check_at"]) >= floor
+
+
+def test_raising_server_minimum_normalizes_existing_job_and_default(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    repository.settings(300, 3)
+    repository.configure_minimum(600)
+
+    assert repository.get_job(job["id"])["interval_seconds"] == 600
+    assert repository.settings(600, 3)["default_interval_seconds"] == 600
+
+
+def test_request_spacing_keeps_fractional_seconds_across_repository_instances(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "spacing.sqlite3"))
+    database.initialize()
+    first = Repository(database)
+    second = Repository(database)
+    fixed = datetime(2026, 10, 1, 0, 0, 0, 900000, tzinfo=timezone.utc)
+    waits = []
+    monkeypatch.setattr("app.storage.repositories.utc_now", lambda: fixed)
+    monkeypatch.setattr("app.storage.repositories.time.sleep", waits.append)
+
+    first.reserve_request_turn(3)
+    second.reserve_request_turn(3)
+
+    assert waits == [3.0]
+    with database.connection() as conn:
+        stored = conn.execute("SELECT next_allowed_at FROM request_gate").fetchone()[0]
+    assert stored == "2026-10-01T00:00:06.900000+00:00"
+
+
+def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    sent_job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    failed_job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    before = {alert["job_id"]: alert for alert in client.get("/api/v1/alerts").json()}
+    assert before[sent_job["id"]]["status"] == "sent"
+    assert before[failed_job["id"]]["status"] == "failed"
+
+    # Recreate the v2 alert constraint and remove v3 episode state.
+    with repository.database.connection() as conn:
+        conn.execute("""CREATE TABLE alerts_v2 (
+            id TEXT PRIMARY KEY,job_id TEXT REFERENCES jobs(id),target_id TEXT REFERENCES targets(id),
+            result_id TEXT REFERENCES check_results(id),channel TEXT NOT NULL,event_type TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK (status IN ('pending','sent','failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,sent_at TEXT,
+            error_summary TEXT,next_attempt_at TEXT
+        )""")
+        conn.execute("INSERT INTO alerts_v2 SELECT * FROM alerts")
+        conn.execute("DROP TABLE alerts")
+        conn.execute("ALTER TABLE alerts_v2 RENAME TO alerts")
+        conn.execute("CREATE INDEX idx_alerts_created ON alerts(created_at DESC)")
+        conn.execute("DROP TABLE target_alert_state")
+        conn.execute("UPDATE schema_version SET version=2")
+
+    repository.database.initialize()
+    with repository.database.connection() as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
+    after = {alert["job_id"]: alert for alert in repository.alerts()}
+    assert {key: value["status"] for key, value in after.items()} == {
+        sent_job["id"]: "sent", failed_job["id"]: "failed",
+    }
+
+    for job in (sent_job, failed_job):
+        old_alert = before[job["id"]]
+        slot = datetime.fromisoformat(old_alert["earliest_slot"])
+        target, result_id = record_result(repository, job, "available", slot, 3)
+        duplicate = repository.create_alert(job, target, result_id, slot)
+        assert duplicate == (None if job == sent_job else old_alert["id"])
+    assert len(repository.alerts()) == 2
 
 
 def test_one_target_failure_does_not_discard_another_target_result(tmp_path):

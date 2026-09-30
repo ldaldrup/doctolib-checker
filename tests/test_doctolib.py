@@ -328,7 +328,7 @@ def test_cli_compatibility_wrappers_keep_metadata_and_availability_transports_se
     assert observed["profile"] == "safari2601"
     assert metadata_session.calls[0][1]["headers"] == {"User-Agent": "metadata-agent"}
     assert "headers" not in availability_session.calls[0][1]
-    assert availability_session.calls[0][1]["params"]["limit"] == 2
+    assert availability_session.calls[0][1]["params"]["limit"] == 1
     assert gate_calls == ["metadata", "availability"]
     assert result[3] == 0
 
@@ -349,6 +349,50 @@ def test_duplicate_availability_slots_are_counted_once():
 
     assert result.status == "available"
     assert result.slot_count == 1
+
+
+def test_malformed_slot_is_an_error_instead_of_a_midnight_appointment():
+    client = DoctolibClient(session=FakeSession([
+        {"total": 1, "availabilities": [{"date": "2026-10-01", "slots": [{}]}]}
+    ]))
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(), now=datetime(2026, 9, 30, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "invalid_availability_response"
+    assert result.earliest_slot is None
+
+
+def test_past_slots_are_not_reported_as_available():
+    client = DoctolibClient(session=FakeSession([
+        {"total": 2, "availabilities": [{"date": "2026-10-01", "slots": [
+            {"start_time": "2026-10-01T09:00:00+02:00"},
+            {"start_time": "2026-10-01T13:00:00+02:00"},
+        ]}]}
+    ]))
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(), now=datetime(2026, 10, 1, 9, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "available"
+    assert result.slot_count == 1
+    assert result.earliest_slot.isoformat() == "2026-10-01T11:00:00+00:00"
+
+
+def test_first_available_horizon_counts_calendar_dates_including_today():
+    _zone, first, last = DoctolibClient._window(
+        {"date_mode": "first_available", "horizon_days": 15, "time_zone": "Europe/Berlin"},
+        datetime(2026, 10, 1, 10, tzinfo=timezone.utc),
+    )
+    assert first.isoformat() == "2026-10-01"
+    assert last.isoformat() == "2026-10-15"
 
 
 def test_availability_redirects_are_gated_and_allowlisted():
