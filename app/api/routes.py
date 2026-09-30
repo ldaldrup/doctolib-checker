@@ -97,8 +97,7 @@ def create_router():
         job = request.app.state.repository.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job_not_found")
-        checks = request.app.state.repository.checks(job_id, limit=1)
-        job["last_result"] = checks[0] if checks else None
+        job["last_result"] = request.app.state.repository.latest_result(job_id)
         return job
 
     @router.patch("/api/v1/jobs/{job_id}")
@@ -108,11 +107,17 @@ def create_router():
             values["earliest_date"] = values["earliest_date"].isoformat()
         if "latest_date" in values and values["latest_date"] is not None:
             values["latest_date"] = values["latest_date"].isoformat()
-        if "date_mode" in values and values["date_mode"] == "custom":
-            effective = request.app.state.repository.get_job(job_id)
-            if effective is None:
-                raise HTTPException(status_code=404, detail="job_not_found")
-            if values.get("earliest_date", effective["earliest_date"]) is None or values.get("latest_date", effective["latest_date"]) is None:
+        effective = request.app.state.repository.get_job(job_id)
+        if effective is None:
+            raise HTTPException(status_code=404, detail="job_not_found")
+        date_mode = values.get("date_mode", effective["date_mode"])
+        if date_mode != "custom" and any(
+            values.get(field) is not None for field in ("earliest_date", "latest_date")
+        ):
+            raise HTTPException(status_code=422, detail="date range is only valid with custom date mode")
+        if date_mode == "custom":
+            if (values.get("earliest_date", effective["earliest_date"]) is None
+                    or values.get("latest_date", effective["latest_date"]) is None):
                 raise HTTPException(status_code=422, detail="custom date mode requires an inclusive date range")
         try:
             job = update_job(request.app.state.repository, request.app.state.doctolib,
