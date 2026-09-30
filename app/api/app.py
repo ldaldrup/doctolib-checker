@@ -15,6 +15,7 @@ def create_app(settings=None, repository=None, doctolib=None):
         database = Database(settings.database_path)
         database.initialize()
         repository = Repository(database)
+    repository.configure_minimum(settings.minimum_poll_interval_seconds)
     if doctolib is None:
         def before_request():
             values = repository.settings(

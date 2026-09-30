@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -98,6 +98,12 @@ class Database:
                     error_message TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_results_target_time ON check_results(target_id, checked_at DESC);
+                CREATE TABLE IF NOT EXISTS target_alert_state (
+                    target_id TEXT PRIMARY KEY REFERENCES targets(id),
+                    last_status TEXT CHECK (last_status IN ('available', 'no_availability')),
+                    last_earliest_slot TEXT,
+                    episode INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
                     job_id TEXT REFERENCES jobs(id),
@@ -106,7 +112,7 @@ class Database:
                     channel TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     dedupe_key TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'cancelled')),
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     sent_at TEXT,
@@ -127,21 +133,55 @@ class Database:
                 );
                 """
             )
+            conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
-            elif version[0] == 1:
-                conn.execute("ALTER TABLE jobs ADD COLUMN lock_run_id TEXT")
-                # Preserve an in-flight v1 lease across the schema upgrade.
-                conn.execute(
-                    """UPDATE jobs SET lock_run_id=(SELECT id FROM check_runs
-                    WHERE check_runs.job_id=jobs.id AND outcome='running'
-                    ORDER BY started_at DESC LIMIT 1)
-                    WHERE lock_until IS NOT NULL"""
-                )
-                conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
-            elif version[0] != SCHEMA_VERSION:
-                raise RuntimeError("Unsupported database schema version")
+            else:
+                current_version = version[0]
+                if current_version == 1:
+                    conn.execute("ALTER TABLE jobs ADD COLUMN lock_run_id TEXT")
+                    # Preserve an in-flight v1 lease across the schema upgrade.
+                    conn.execute(
+                        """UPDATE jobs SET lock_run_id=(SELECT id FROM check_runs
+                        WHERE check_runs.job_id=jobs.id AND outcome='running'
+                        ORDER BY started_at DESC LIMIT 1)
+                        WHERE lock_until IS NOT NULL"""
+                    )
+                    current_version = 2
+                if current_version == 2:
+                    # SQLite cannot extend a CHECK constraint in place.
+                    conn.execute("""CREATE TABLE alerts_v3 (
+                        id TEXT PRIMARY KEY,
+                        job_id TEXT REFERENCES jobs(id),
+                        target_id TEXT REFERENCES targets(id),
+                        result_id TEXT REFERENCES check_results(id),
+                        channel TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        dedupe_key TEXT NOT NULL UNIQUE,
+                        status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'cancelled')),
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        sent_at TEXT,
+                        error_summary TEXT,
+                        next_attempt_at TEXT
+                    )""")
+                    conn.execute("INSERT INTO alerts_v3 SELECT * FROM alerts")
+                    conn.execute("DROP TABLE alerts")
+                    conn.execute("ALTER TABLE alerts_v3 RENAME TO alerts")
+                    conn.execute("CREATE INDEX idx_alerts_created ON alerts(created_at DESC)")
+                    conn.execute("""INSERT INTO target_alert_state
+                        (target_id,last_status,last_earliest_slot,episode)
+                        SELECT t.id,r.status,r.earliest_slot,0 FROM targets t
+                        LEFT JOIN check_results r ON r.rowid=(
+                            SELECT previous.rowid FROM check_results previous
+                            WHERE previous.target_id=t.id AND previous.status IN ('available','no_availability')
+                            ORDER BY previous.rowid DESC LIMIT 1
+                        )""")
+                    conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+                elif current_version != SCHEMA_VERSION:
+                    raise RuntimeError("Unsupported database schema version")
+        with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
 
     @contextmanager
