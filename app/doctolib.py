@@ -301,7 +301,7 @@ class DoctolibClient:
             horizon = int(search.get("horizon_days", 15))
             if horizon < 1 or horizon > 365:
                 raise ValueError("horizon_days must be between 1 and 365")
-            latest = today + timedelta(days=horizon)
+            latest = today + timedelta(days=horizon - 1)
         else:
             raise ValueError("date_mode must be first_available or custom")
         return zone, earliest, latest
@@ -322,10 +322,7 @@ class DoctolibClient:
                 return datetime.combine(date.fromisoformat(day_text), local_time, zone).astimezone(timezone.utc)
             except ValueError:
                 return None
-        try:
-            return datetime.combine(date.fromisoformat(day_text), time.min, zone).astimezone(timezone.utc)
-        except ValueError:
-            return None
+        return None
 
     def check(self, booking_url, search: Dict, meta: Optional[BookingMeta] = None, now=None):
         meta = meta or self.resolve(booking_url)
@@ -367,19 +364,28 @@ class DoctolibClient:
                     returned_count += 1
                     starts_at = self._slot_datetime(day_text, slot_data, zone)
                     if starts_at is None:
-                        continue
+                        return AvailabilityResult(
+                            status="error", slot_count=0, earliest_slot=None, count_complete=False,
+                            error_code="invalid_availability_response",
+                            error_message="Doctolib returned a slot without a valid start time; retrying later.",
+                        )
                     local_day = starts_at.astimezone(zone).date()
-                    if page_start <= local_day <= page_end:
+                    if starts_at > current and page_start <= local_day <= page_end:
                         page_slots[starts_at] = Slot(starts_at=starts_at)
 
             next_slot = data.get("next_slot")
             if not page_slots and next_slot:
                 fallback = self._slot_datetime(str(next_slot)[:10], next_slot, zone)
-                if fallback:
-                    fallback_day = fallback.astimezone(zone).date()
-                    if page_start <= fallback_day <= page_end:
-                        page_slots[fallback] = Slot(starts_at=fallback)
-                        returned_count += 1
+                if fallback is None:
+                    return AvailabilityResult(
+                        status="error", slot_count=0, earliest_slot=None, count_complete=False,
+                        error_code="invalid_availability_response",
+                        error_message="Doctolib returned a slot without a valid start time; retrying later.",
+                    )
+                fallback_day = fallback.astimezone(zone).date()
+                if fallback > current and page_start <= fallback_day <= page_end:
+                    page_slots[fallback] = Slot(starts_at=fallback)
+                    returned_count += 1
 
             # Never report a partial count or trigger an alert when any page is truncated.
             if returned_count < total:
