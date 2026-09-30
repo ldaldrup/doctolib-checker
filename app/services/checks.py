@@ -55,6 +55,8 @@ class CheckService:
                 current_job = self.repository.get_job(job["id"])
                 if current_job is None or current_job["status"] != "active":
                     break
+                if not self.repository.renew_job_lock(job["id"], run_id):
+                    break
                 target = self.repository.get_target(job["id"], target_ref["id"])
                 if target is None:
                     continue
@@ -72,7 +74,11 @@ class CheckService:
                 try:
                     result = self.doctolib.check(target["booking_url"], search, meta=self._meta(target))
                     self.repository.insert_result(run_id, current_job, target, result)
-                    successful += 1
+                    if result.status == "error":
+                        failed += 1
+                        last_error = result.error_code or "doctolib_incomplete_result"
+                    else:
+                        successful += 1
                     if result.status == "available" and result.earliest_slot:
                         # Re-read state after the HTTP request so a pause or
                         # notification edit suppresses delivery for this result.
@@ -102,9 +108,12 @@ class CheckService:
 
     def run_due(self, limit=10):
         self.dispatch_pending()
-        claimed = self.repository.claim_due_jobs(limit=limit)
         outcomes = []
-        for run_id, job in claimed:
+        for _ in range(limit):
+            claimed = self.repository.claim_due_jobs(limit=1)
+            if not claimed:
+                break
+            run_id, job = claimed[0]
             try:
                 outcomes.append(self.run_claim(run_id, job))
             except Exception:
