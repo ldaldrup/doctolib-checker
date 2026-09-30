@@ -37,6 +37,8 @@ class JobCreateRequest(BaseModel):
                 raise ValueError("Custom date mode requires earliest_date and latest_date")
             if self.earliest_date > self.latest_date:
                 raise ValueError("earliest_date must be on or before latest_date")
+            if (self.latest_date - self.earliest_date).days + 1 > 366:
+                raise ValueError("Custom date range must not exceed 366 calendar dates")
         elif self.earliest_date is not None or self.latest_date is not None:
             raise ValueError("Use earliest_date and latest_date only with custom date mode")
         return self

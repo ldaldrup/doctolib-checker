@@ -41,6 +41,16 @@ def load_config():
     config["polling"].setdefault("insurance_sector", "public")
     config["polling"].setdefault("telehealth", False)
     config["polling"].setdefault("slot_limit", 15)
+    # `slot_limit` was historically used as the availability endpoint's day
+    # limit. Keep it as a fallback while exposing the clearer page_days name.
+    config["polling"].setdefault("page_days", config["polling"].get("slot_limit", 15))
+    config.setdefault("doctolib_profile", "safari2601")
+    if config["doctolib_profile"] != "safari2601":
+        raise ValueError("doctolib_profile currently supports only safari2601")
+    if (not isinstance(config["polling"]["page_days"], int)
+            or isinstance(config["polling"]["page_days"], bool)
+            or not 1 <= config["polling"]["page_days"] <= 15):
+        raise ValueError("polling.page_days must be an integer between 1 and 15")
 
     config.setdefault("messages", {})
     config["messages"].setdefault("startup", {})
