@@ -234,6 +234,30 @@ def test_invalid_target_and_interval_are_rejected_without_network_access(tmp_pat
     assert response.status_code == 422
     assert doctolib.fixture_session.calls == []
 
+    response = client.post("/api/v1/jobs", json={
+        "name": "Window too large",
+        "target_urls": [URL],
+        "interval_seconds": 300,
+        "date_mode": "custom",
+        "earliest_date": "2026-01-01",
+        "latest_date": "2027-01-02",
+    })
+    assert response.status_code == 422
+    assert doctolib.fixture_session.calls == []
+
+
+def test_job_update_rejects_custom_window_over_366_dates(tmp_path):
+    client, _repository, _settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+
+    response = client.patch("/api/v1/jobs/" + job["id"], json={
+        "latest_date": "2027-11-01",
+    })
+
+    assert response.status_code == 422
+    assert "must not exceed 366" in response.text
+    assert len(doctolib.fixture_session.calls) == 1
+
 
 def test_job_update_rejects_null_values_instead_of_failing_in_storage(tmp_path):
     client, _repository, _settings, doctolib = setup_backend(tmp_path)

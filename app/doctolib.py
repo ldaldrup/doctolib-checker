@@ -7,6 +7,7 @@ from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
+from curl_cffi import requests as curl_requests
 from requests import Session
 from requests.adapters import HTTPAdapter
 
@@ -20,6 +21,7 @@ SUPPORTED_HOSTS = {
     "doctolib.fr": "fr",
 }
 GLOBAL_SESSION = None
+GLOBAL_AVAILABILITY_SESSIONS = {}
 
 
 class BookingUrlError(ValueError):
@@ -40,6 +42,15 @@ def get_session():
         session.mount("https://", adapter)
         GLOBAL_SESSION = session
     return GLOBAL_SESSION
+
+
+def get_availability_session(profile="safari2601"):
+    """Return a reusable browser-profile session for availability requests."""
+    if profile != "safari2601":
+        raise ValueError("Unsupported Doctolib availability profile")
+    if profile not in GLOBAL_AVAILABILITY_SESSIONS:
+        GLOBAL_AVAILABILITY_SESSIONS[profile] = curl_requests.Session(impersonate=profile)
+    return GLOBAL_AVAILABILITY_SESSIONS[profile]
 
 
 def parse_booking_url(booking_url: str):
@@ -117,13 +128,30 @@ def _motive_name(info_data, motive_id):
 
 
 class DoctolibClient:
-    def __init__(self, session=None, user_agent="DoctolibChecker/2.0", before_request=None):
-        self.session = session or get_session()
+    def __init__(self, session=None, user_agent="DoctolibChecker/2.0", before_request=None,
+                 *, metadata_session=None, availability_session=None, profile="safari2601", page_days=15):
+        # `session` remains as a compatibility injection point for callers and
+        # tests that intentionally use one fake transport for both request types.
+        self.metadata_session = metadata_session if metadata_session is not None else (
+            session if session is not None else get_session()
+        )
+        self.availability_session = availability_session if availability_session is not None else session
         self.user_agent = user_agent
         self.before_request = before_request or (lambda: None)
+        if profile != "safari2601":
+            raise ValueError("Unsupported Doctolib availability profile")
+        if not isinstance(page_days, int) or isinstance(page_days, bool) or not 1 <= page_days <= 15:
+            raise ValueError("Doctolib page size must be between 1 and 15 days")
+        self.profile = profile
+        self.page_days = page_days
 
     def _get(self, url, **kwargs):
         timeout = kwargs.pop("timeout", 15)
+        availability = kwargs.pop("availability", False)
+        session = self.availability_session if availability else self.metadata_session
+        if availability and session is None:
+            session = get_availability_session(self.profile)
+            self.availability_session = session
         retryable_statuses = {429, 500, 502, 503, 504}
         last_error = None
         for attempt in range(4):
@@ -132,20 +160,22 @@ class DoctolibClient:
             for redirect_count in range(6):
                 self.before_request()
                 try:
-                    response = self.session.get(
-                        request_url,
-                        headers={"User-Agent": self.user_agent},
-                        timeout=timeout,
-                        allow_redirects=False,
-                        **request_kwargs
-                    )
-                except (requests.Timeout, requests.ConnectionError) as exc:
+                    call_kwargs = {
+                        "timeout": timeout,
+                        "allow_redirects": False,
+                        **request_kwargs,
+                    }
+                    if not availability:
+                        call_kwargs["headers"] = {"User-Agent": self.user_agent}
+                    response = session.get(request_url, **call_kwargs)
+                except (requests.Timeout, requests.ConnectionError,
+                        curl_requests.exceptions.Timeout, curl_requests.exceptions.ConnectionError) as exc:
                     last_error = exc
                     if attempt == 3:
                         raise
                     break
 
-                if response.is_redirect:
+                if response.status_code in {301, 302, 303, 307, 308} and "Location" in response.headers:
                     location = response.headers.get("Location")
                     if not location or redirect_count == 5:
                         raise BookingUrlError("Doctolib returned an invalid redirect")
@@ -264,6 +294,8 @@ class DoctolibClient:
                 raise ValueError("Custom date range requires valid earliest_date and latest_date") from exc
             if earliest > latest:
                 raise ValueError("earliest_date must be on or before latest_date")
+            if (latest - earliest).days + 1 > 366:
+                raise ValueError("Custom date range must not exceed 366 calendar dates")
         elif mode == "first_available":
             earliest = today
             horizon = int(search.get("horizon_days", 15))
@@ -304,46 +336,53 @@ class DoctolibClient:
         if host not in SUPPORTED_HOSTS:
             raise BookingUrlError("Unsupported Doctolib host")
         availability_url = "https://" + host + "/availabilities.json"
-        response = self._get(
-            availability_url,
-            params={
-                "visit_motive_ids": meta.motive_id,
-                "agenda_ids": meta.agenda_ids_str,
-                "practice_ids": meta.practice_id,
-                "insurance_sector": search.get("insurance_sector", "public"),
-                "telehealth": str(bool(search.get("telehealth", False))).lower(),
-                "start_date": earliest.isoformat(),
-                "limit": int(search.get("slot_limit", 100)),
-            },
-            timeout=15,
-        )
-        data = response.json()
-        total = int(data.get("total", 0) or 0)
-        matched = []
-        returned_count = 0
-        for day_info in data.get("availabilities", []) or []:
-            day_text = str(day_info.get("date", ""))
-            for slot_data in day_info.get("slots", []) or []:
-                returned_count += 1
-                starts_at = self._slot_datetime(day_text, slot_data, zone)
-                if starts_at is None:
-                    continue
-                local_day = starts_at.astimezone(zone).date()
-                if earliest <= local_day <= latest:
-                    matched.append(Slot(starts_at=starts_at))
-        matched.sort(key=lambda item: item.starts_at)
+        all_slots = {}
+        page_start = earliest
+        base_params = {
+            "visit_motive_ids": meta.motive_id,
+            "agenda_ids": meta.agenda_ids_str,
+            "practice_ids": meta.practice_id,
+            "insurance_sector": search.get("insurance_sector", "public"),
+            "telehealth": str(bool(search.get("telehealth", False))).lower(),
+        }
+        while page_start <= latest:
+            page_end = min(page_start + timedelta(days=self.page_days - 1), latest)
+            response = self._get(
+                availability_url,
+                params={
+                    **base_params,
+                    "start_date": page_start.isoformat(),
+                    "limit": (page_end - page_start).days + 1,
+                },
+                timeout=15,
+                availability=True,
+            )
+            data = response.json()
+            total = int(data.get("total", 0) or 0)
+            returned_count = 0
+            page_slots = {}
+            for day_info in data.get("availabilities", []) or []:
+                day_text = str(day_info.get("date", ""))
+                for slot_data in day_info.get("slots", []) or []:
+                    returned_count += 1
+                    starts_at = self._slot_datetime(day_text, slot_data, zone)
+                    if starts_at is None:
+                        continue
+                    local_day = starts_at.astimezone(zone).date()
+                    if page_start <= local_day <= page_end:
+                        page_slots[starts_at] = Slot(starts_at=starts_at)
 
-        next_slot = data.get("next_slot")
-        if not matched and next_slot:
-            fallback = self._slot_datetime(str(next_slot)[:10], next_slot, zone)
-            if fallback:
-                fallback_day = fallback.astimezone(zone).date()
-                if earliest <= fallback_day <= latest:
-                    matched.append(Slot(starts_at=fallback))
+            next_slot = data.get("next_slot")
+            if not page_slots and next_slot:
+                fallback = self._slot_datetime(str(next_slot)[:10], next_slot, zone)
+                if fallback:
+                    fallback_day = fallback.astimezone(zone).date()
+                    if page_start <= fallback_day <= page_end:
+                        page_slots[fallback] = Slot(starts_at=fallback)
+                        returned_count += 1
 
-        if not matched:
-            complete = returned_count >= total
-            if not complete:
+            # Never report a partial count or trigger an alert when any page is truncated.
+            if returned_count < total:
                 return AvailabilityResult(
                     status="error",
                     slot_count=0,
@@ -352,22 +391,32 @@ class DoctolibClient:
                     error_code="incomplete_availability_response",
                     error_message="Doctolib returned only part of the availability list; retrying later.",
                 )
+            all_slots.update(page_slots)
+            page_start = page_end + timedelta(days=1)
+
+        matched = sorted(all_slots.values(), key=lambda item: item.starts_at)
+        if not matched:
             return AvailabilityResult(
                 status="no_availability", slot_count=0, earliest_slot=None, count_complete=True
             )
-
         return AvailabilityResult(
             status="available",
             slot_count=len(matched),
             earliest_slot=matched[0].starts_at,
             slots=matched,
-            count_complete=(returned_count >= total),
+            count_complete=True,
         )
 
 
 # CLI compatibility wrappers. The web API and worker use DoctolibClient directly.
-def get_booking_metadata(booking_url, config, session: Session):
-    return DoctolibClient(session=session, user_agent=config.get("user_agent", "DoctolibChecker/2.0")).resolve(booking_url)
+def get_booking_metadata(booking_url, config, session: Session, before_request=None):
+    return DoctolibClient(
+        metadata_session=session,
+        user_agent=config.get("user_agent", "DoctolibChecker/2.0"),
+        before_request=before_request,
+        profile=config.get("doctolib_profile", "safari2601"),
+        page_days=config.get("polling", {}).get("page_days", config.get("polling", {}).get("slot_limit", 15)),
+    ).resolve(booking_url)
 
 
 def format_doctolib_datetime(dt_str: str) -> str:
@@ -380,7 +429,7 @@ def format_doctolib_datetime(dt_str: str) -> str:
         return dt_str
 
 
-def fetch_slot_total(booking_url, config, session, meta=None):
+def fetch_slot_total(booking_url, config, session, meta=None, before_request=None):
     polling = config.get("polling", {})
     search = {
         "date_mode": "first_available",
@@ -388,13 +437,19 @@ def fetch_slot_total(booking_url, config, session, meta=None):
         "time_zone": config.get("time_zone", "Europe/Berlin"),
         "insurance_sector": polling.get("insurance_sector", "public"),
         "telehealth": polling.get("telehealth", False),
-        "slot_limit": polling.get("slot_limit", 100),
     }
-    result = DoctolibClient(session=session, user_agent=config.get("user_agent", "DoctolibChecker/2.0")).check(
-        booking_url, search, meta=meta
+    client = DoctolibClient(
+        metadata_session=session,
+        user_agent=config.get("user_agent", "DoctolibChecker/2.0"),
+        before_request=before_request,
+        profile=config.get("doctolib_profile", "safari2601"),
+        page_days=polling.get("page_days", polling.get("slot_limit", 15)),
     )
+    result = client.check(booking_url, search, meta=meta)
+    if result.status == "error":
+        raise RuntimeError(result.error_code or "availability_check_incomplete")
     parsed = parse_booking_url(booking_url)
-    meta = meta or DoctolibClient(session=session, user_agent=config.get("user_agent", "DoctolibChecker/2.0")).resolve(booking_url)
+    meta = meta or client.resolve(booking_url)
     first_date = result.earliest_slot.astimezone(ZoneInfo(search["time_zone"])).strftime("%Y-%m-%d %H:%M") if result.earliest_slot else "no slots in window"
     return (
         meta.state_key,

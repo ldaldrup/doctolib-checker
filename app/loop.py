@@ -145,7 +145,7 @@ def render_startup_list(preflight_meta, urls):
     return "\n".join(lines).strip()
 
 
-def run_once(config, state, preflight_meta, stats: SessionStats):
+def run_once(config, state, preflight_meta, stats: SessionStats, before_request=None):
     from app.doctolib import get_session
 
     session = get_session()
@@ -172,7 +172,7 @@ def run_once(config, state, preflight_meta, stats: SessionStats):
                 first_date,
                 next_slot,
                 is_far_slot,
-            ) = fetch_slot_total(url, config, session, meta)
+            ) = fetch_slot_total(url, config, session, meta, before_request=before_request)
 
             instance_key = f"{i}_{state_key}"
 

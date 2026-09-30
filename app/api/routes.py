@@ -116,9 +116,16 @@ def create_router():
         ):
             raise HTTPException(status_code=422, detail="date range is only valid with custom date mode")
         if date_mode == "custom":
-            if (values.get("earliest_date", effective["earliest_date"]) is None
-                    or values.get("latest_date", effective["latest_date"]) is None):
+            earliest = values.get("earliest_date", effective["earliest_date"])
+            latest = values.get("latest_date", effective["latest_date"])
+            if earliest is None or latest is None:
                 raise HTTPException(status_code=422, detail="custom date mode requires an inclusive date range")
+            if isinstance(earliest, str):
+                earliest = datetime.fromisoformat(earliest).date()
+            if isinstance(latest, str):
+                latest = datetime.fromisoformat(latest).date()
+            if (latest - earliest).days + 1 > 366:
+                raise HTTPException(status_code=422, detail="custom date range must not exceed 366 calendar dates")
         try:
             job = update_job(request.app.state.repository, request.app.state.doctolib,
                              request.app.state.settings, job_id, values)

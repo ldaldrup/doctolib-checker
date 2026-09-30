@@ -3,8 +3,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import requests
 
-from app.doctolib import BookingUrlError, DoctolibClient, parse_booking_url
+from app.doctolib import BookingUrlError, DoctolibClient, fetch_slot_total, get_booking_metadata, parse_booking_url
+from app.models import BookingMeta
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -183,3 +185,209 @@ def test_incomplete_response_without_a_match_is_not_reported_as_empty():
     assert result.status == "error"
     assert result.error_code == "incomplete_availability_response"
     assert result.count_complete is False
+
+
+def _test_meta():
+    return BookingMeta(
+        state_key="example_any", practice_name="Example", practitioner_name="Any",
+        motive_id="789", agenda_ids_str="1234", practice_id="123",
+        display_name="Any @ Example", profile_slug="beispiel",
+    )
+
+
+@pytest.mark.parametrize(
+    ("latest_date", "expected_limits"),
+    [
+        ("2026-10-01", [1]),
+        ("2026-10-15", [15]),
+        ("2026-10-16", [15, 1]),
+    ],
+)
+def test_check_pages_inclusive_window_and_uses_short_final_page(latest_date, expected_limits):
+    session = FakeSession([{"total": 0, "availabilities": []} for _ in expected_limits])
+    client = DoctolibClient(session=session)
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": latest_date,
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(),
+        now=datetime(2026, 10, 1, 10, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "no_availability"
+    assert [call[1]["params"]["limit"] for call in session.calls] == expected_limits
+    starts = [call[1]["params"]["start_date"] for call in session.calls]
+    expected_starts = ["2026-10-01"] if len(starts) == 1 else ["2026-10-01", "2026-10-16"]
+    assert starts == expected_starts
+
+
+def test_366_date_window_uses_25_pages_with_six_day_final_page():
+    session = FakeSession([{"total": 0, "availabilities": []} for _ in range(25)])
+    client = DoctolibClient(session=session)
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-01-01", "latest_date": "2027-01-01",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(),
+        now=datetime(2025, 12, 1, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "no_availability"
+    assert len(session.calls) == 25
+    assert [call[1]["params"]["limit"] for call in session.calls] == [15] * 24 + [6]
+    assert session.calls[-1][1]["params"]["start_date"] == "2026-12-27"
+
+
+def test_custom_window_over_366_dates_is_rejected():
+    client = DoctolibClient(session=FakeSession([]))
+    with pytest.raises(ValueError, match="must not exceed 366"):
+        client.check(
+            BOOKING_URL,
+            {"date_mode": "custom", "earliest_date": "2026-01-01", "latest_date": "2027-01-02",
+             "time_zone": "Europe/Berlin"},
+            meta=_test_meta(),
+            now=datetime(2025, 12, 1, tzinfo=timezone.utc),
+        )
+
+
+def test_later_incomplete_page_discards_earlier_slots():
+    payloads = [
+        {"total": 1, "availabilities": [{"date": "2026-10-01", "slots": [
+            {"start_time": "2026-10-01T10:00:00+02:00"}
+        ]}]},
+        {"total": 2, "availabilities": [{"date": "2026-10-16", "slots": [
+            {"start_time": "2026-10-16T10:00:00+02:00"}
+        ]}]},
+    ]
+    session = FakeSession(payloads)
+    client = DoctolibClient(session=session)
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-16",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(),
+        now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "error"
+    assert result.slot_count == 0
+    assert result.error_code == "incomplete_availability_response"
+    assert result.count_complete is False
+
+
+def test_availability_transport_uses_profile_without_overriding_user_agent(monkeypatch):
+    session = FakeSession([{"total": 0, "availabilities": []}])
+    observed = {}
+
+    def session_factory(profile):
+        observed["profile"] = profile
+        return session
+
+    monkeypatch.setattr("app.doctolib.get_availability_session", session_factory)
+    client = DoctolibClient(user_agent="legacy-agent", page_days=15)
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(),
+        now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "no_availability"
+    assert observed["profile"] == "safari2601"
+    assert "headers" not in session.calls[0][1]
+    assert session.calls[0][1]["allow_redirects"] is False
+
+
+def test_cli_compatibility_wrappers_keep_metadata_and_availability_transports_separate(monkeypatch):
+    metadata_session = FakeSession([fixture("info_de.json")])
+    availability_session = FakeSession([{"total": 0, "availabilities": []}])
+    observed = {}
+    gate_calls = []
+
+    def session_factory(profile):
+        observed["profile"] = profile
+        return availability_session
+
+    monkeypatch.setattr("app.doctolib.get_availability_session", session_factory)
+    config = {
+        "user_agent": "metadata-agent",
+        "doctolib_profile": "safari2601",
+        "time_zone": "Europe/Berlin",
+        "polling": {"upcoming_days": 1, "page_days": 15, "insurance_sector": "public"},
+    }
+
+    meta = get_booking_metadata(
+        BOOKING_URL, config, metadata_session, before_request=lambda: gate_calls.append("metadata")
+    )
+    result = fetch_slot_total(
+        BOOKING_URL, config, metadata_session, meta,
+        before_request=lambda: gate_calls.append("availability"),
+    )
+
+    assert observed["profile"] == "safari2601"
+    assert metadata_session.calls[0][1]["headers"] == {"User-Agent": "metadata-agent"}
+    assert "headers" not in availability_session.calls[0][1]
+    assert availability_session.calls[0][1]["params"]["limit"] == 2
+    assert gate_calls == ["metadata", "availability"]
+    assert result[3] == 0
+
+
+def test_duplicate_availability_slots_are_counted_once():
+    payload = {"total": 2, "availabilities": [{"date": "2026-10-01", "slots": [
+        {"start_time": "2026-10-01T10:00:00+02:00"},
+        {"start_time": "2026-10-01T10:00:00+02:00"},
+    ]}]}
+    client = DoctolibClient(session=FakeSession([payload]))
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(),
+        now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "available"
+    assert result.slot_count == 1
+
+
+def test_availability_redirects_are_gated_and_allowlisted():
+    session = FakeSession([
+        Response({}, status=302, headers={"Location": "https://doctolib.de/availability"}),
+        Response({"total": 0, "availabilities": []}),
+    ])
+    gate_calls = []
+    client = DoctolibClient(
+        availability_session=session,
+        before_request=lambda: gate_calls.append(True),
+    )
+
+    assert client._get("https://www.doctolib.de/availability", availability=True).json()["total"] == 0
+    assert len(session.calls) == len(gate_calls) == 2
+    assert all("headers" not in call[1] for call in session.calls)
+
+    untrusted = FakeSession([Response({}, status=302, headers={"Location": "https://example.org/collect"})])
+    client = DoctolibClient(availability_session=untrusted)
+    with pytest.raises(BookingUrlError, match="unsupported host"):
+        client._get("https://www.doctolib.de/availability", availability=True)
+
+
+def test_failed_later_page_raises_without_returning_partial_result():
+    class SecondPageFails(FakeSession):
+        def get(self, url, **kwargs):
+            if self.calls:
+                raise requests.ConnectionError("simulated failure")
+            return super().get(url, **kwargs)
+
+    session = SecondPageFails([{"total": 1, "availabilities": [{"date": "2026-10-01", "slots": [
+        {"start_time": "2026-10-01T10:00:00+02:00"}
+    ]}]}])
+    client = DoctolibClient(session=session)
+    with pytest.raises(requests.ConnectionError):
+        client.check(
+            BOOKING_URL,
+            {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-16",
+             "time_zone": "Europe/Berlin"},
+            meta=_test_meta(),
+            now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        )
