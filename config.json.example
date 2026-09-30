@@ -10,7 +10,7 @@
     "upcoming_days": 365,
     "insurance_sector": "public",
     "telehealth": false,
-    "slot_limit": 15
+    "page_days": 15
   },
   "messages": {
     "startup": {
@@ -50,6 +50,7 @@
     "colorblind_friendly": false
   },
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "doctolib_profile": "safari2601",
   "dry_run": false,
   "urls": [
     "https://www.doctolib.de/EXAMPLE-PATH/booking/availabilities?specialityId=9215&telehealth=false&placeId=practice-XXXXX&insuranceSectorEnabled=true&insuranceSector=public&motiveIds%5B%5D=XXXXXXX&practitionerId=XXXXXXX&pid=practice-XXXXX&source=profile"
