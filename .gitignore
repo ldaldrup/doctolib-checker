@@ -1,10 +1,17 @@
 # Secrets — NEVER commit
 config.json
+.env
+.env.*
+!.env.example
 
 # State & logs
 state/
 logs/
 temp/
+data/
+*.sqlite
+*.sqlite3
+*.db
 
 # Python
 __pycache__/
@@ -27,6 +34,17 @@ env/
 *.swp
 *.swo
 *~
+
+# Local agent instructions and planning artifacts
+AGENTS.md
+**/AGENTS.md
+.agents/
+
+plans/
+**/plans/
+*.plan.md
+*_plan.md
+*-plan.md
 
 # OS
 .DS_Store

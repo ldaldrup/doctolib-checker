@@ -1,6 +1,6 @@
 # doctolib-checker
 
-A lightweight Doctolib appointment poller for a fixed set of booking URLs (e.g., multiple surgeons at one clinic). It monitors availability and sends Telegram notifications when new slots appear. 
+A lightweight Doctolib appointment checker. It can run from the existing CLI or as a job-based backend with an HTTP API, a persistent SQLite database, and a separate polling worker. It reports matching appointment availability and can send Telegram alerts; it does not reserve or book appointments.
 
 Designed to run locally as a continuous background process.
 
@@ -8,7 +8,7 @@ This project draws inspiration from [seh-len/doctolib](https://github.com/seh-le
 
 ## ⚠️ Disclaimer
 
-**This tool is not officially endorsed or allowed by DoctoLib.** Using this tool to access DoctoLib's services may violate their terms of service. Use at your own risk. The author is not responsible for any consequences, account bans, IP blocks, or other issues that may result from using this tool. By using this tool, you assume full responsibility for any and all consequences of how it interacts with DoctoLib's API and services.
+**This tool is not officially endorsed or explicitly allowed by DoctoLib.** Using this tool to access DoctoLib's services may violate their terms of service. Use at your own risk. The author is not responsible for any consequences, account bans, IP blocks, or other issues that may result from using this tool. By using this tool, you assume full responsibility for any and all consequences of how it interacts with DoctoLib's API and services.
 
 ## Setup
 
@@ -33,25 +33,30 @@ app/
 ├── __init__.py        # Package marker
 ├── config.py          # Config loading, defaults, and validation
 ├── logging_utils.py   # Logging setup and ANSI-aware formatting
-├── models.py          # Shared dataclasses (BookingMeta, SessionStats)
-├── state.py           # State persistence (state.json)
-├── doctolib.py        # Doctolib URL parsing and availability logic
-├── notifications.py   # Telegram dispatch and HTML-to-terminal formatting
-├── loop.py            # Per-cycle execution, summary dispatch, countdown
-└── runner.py          # Main orchestration (CLI, preflight, polling loop)
+├── models.py          # Shared booking and availability records
+├── state.py           # CLI state persistence (state.json)
+├── doctolib.py        # URL validation, metadata, and structured availability checks
+├── notifications.py   # Telegram adapters and message formatting
+├── loop.py            # Existing CLI polling cycle
+├── runner.py          # Existing CLI orchestration
+├── api/               # FastAPI app, routes, and request models
+├── services/          # Job operations and check execution
+├── storage/           # SQLite schema and repository operations
+└── worker/            # Separate polling worker process
 ```
 
 ### Architecture Overview
 
-The application follows a layered architecture with clear module boundaries:
+The CLI and backend share the Doctolib checking code. The backend uses these boundaries:
 
 - **`checker.py`** — Thin entrypoint wrapper that delegates to the modular runtime
-- **`runner.py`** — CLI argument parsing, config initialization, preflight verification, and loop orchestration
-- **`loop.py`** — Per-cycle execution logic, summary dispatch, and countdown pacing
-- **`doctolib.py`** — URL parsing, metadata resolution, and slot fetching via shared requests session
-- **`notifications.py`** — Telegram message dispatch and HTML-to-terminal text conversion
-- **`config.py`** — Centralized configuration with sensible defaults and validation
-- **`state.py`** — Persistent state tracking across runs (notification history, cycle counts)
+- **`doctolib.py`** — URL validation, metadata resolution, date-window filtering, and slot fetching
+- **`storage/`** — Durable jobs, targets, check runs/results, alert history, and shared request spacing
+- **`worker/`** — Sequential due-job checks, result recording, and notification dispatch
+- **`api/`** — Versioned job-control and reporting endpoints
+- **`services/`** — Job validation and coordination between the checker and repository
+- **`notifications.py`** — Telegram delivery with server-side credentials
+- **`runner.py` and `loop.py`** — Existing command-line operation
 
 This modular design improves maintainability while preserving the original CLI interface and behavior.
 
@@ -162,6 +167,31 @@ That's it! The tool automatically parses the URL and monitors for available slot
   ```bash
   python quick_check.py
   ```
+
+## Backend API and worker
+
+The backend runs as two processes that share a SQLite database: the API controls jobs and reports status/history, and the worker checks due jobs and sends Telegram alerts. The API binds to `127.0.0.1` by default for local use. Set `API_HOST=0.0.0.0` only when it runs inside a container behind the configured authenticated reverse proxy.
+
+Install the runtime dependencies, then start the API and worker in separate shells with the same environment and database path:
+
+```bash
+pip install -r requirements.txt
+DATABASE_PATH=./data/checker.sqlite3 python -m app.api.main
+DATABASE_PATH=./data/checker.sqlite3 python -m app.worker.main
+```
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of both processes to enable alerts. Keep those values out of job records and source control. The example container environment is in `.env.example`.
+
+The versioned API is under `/api/v1`. It provides health and worker status, job and target management, URL validation, check history, alert history, and supported global settings. Poll intervals have a server-enforced minimum of 300 seconds; outbound Doctolib requests share the configured spacing gate. The API does not provide appointment booking, email, or webhook delivery.
+
+Alert creation is deduplicated in SQLite, and failed Telegram sends remain in alert history for retry. Telegram does not offer exactly-once delivery: if Telegram accepts a message and the worker stops before saving the success state, a later retry can send that alert again.
+
+To run the offline API/worker and checker tests:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
 
 ## Limitations & Considerations
 
