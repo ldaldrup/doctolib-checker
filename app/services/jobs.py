@@ -67,6 +67,10 @@ def update_job(repository, doctolib, settings, job_id, values):
     new_mode = values.get("date_mode", existing["date_mode"])
     earliest = values.get("earliest_date", existing["earliest_date"])
     latest = values.get("latest_date", existing["latest_date"])
+    if new_mode != "custom" and any(
+        values.get(field) is not None for field in ("earliest_date", "latest_date")
+    ):
+        raise ValueError("Date range is only valid with custom date mode")
     if new_mode == "custom":
         if not earliest or not latest:
             raise ValueError("Custom date mode requires earliest_date and latest_date")

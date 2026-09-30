@@ -41,6 +41,7 @@ class Repository:
         if row is None:
             return None
         item = dict(row)
+        item.pop("lock_run_id", None)
         if conn is not None:
             item["targets"] = [dict(target) for target in conn.execute(
                 "SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (item["id"],)
@@ -177,8 +178,9 @@ class Repository:
             if status == "deleted":
                 due = iso(utc_now() + timedelta(days=36500))
                 lock = None
-            conn.execute("UPDATE jobs SET status=?,next_check_at=?,lock_until=?,updated_at=? WHERE id=?",
-                         (status, due, lock, iso(), job_id))
+            lock_run_id = row["lock_run_id"] if status != "deleted" else None
+            conn.execute("UPDATE jobs SET status=?,next_check_at=?,lock_until=?,lock_run_id=?,updated_at=? WHERE id=?",
+                         (status, due, lock, lock_run_id, iso(), job_id))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
     def set_job_due(self, job_id, due_at):
@@ -211,9 +213,9 @@ class Repository:
             for row in rows:
                 run_id = new_id()
                 changed = conn.execute(
-                    """UPDATE jobs SET lock_until=?,last_started_at=? WHERE id=? AND status='active'
+                    """UPDATE jobs SET lock_until=?,lock_run_id=?,last_started_at=? WHERE id=? AND status='active'
                     AND (lock_until IS NULL OR lock_until<=?)""",
-                    (iso(now + timedelta(minutes=10)), now_text, row["id"], now_text),
+                    (iso(now + timedelta(minutes=10)), run_id, now_text, row["id"], now_text),
                 ).rowcount
                 if not changed:
                     continue
@@ -228,6 +230,15 @@ class Repository:
                 (now_text, now_text),
             )
         return claimed
+
+    def renew_job_lock(self, job_id, run_id, lease_minutes=10):
+        """Extend this run's lease before another outbound request starts."""
+        with self.database.connection() as conn:
+            changed = conn.execute(
+                """UPDATE jobs SET lock_until=? WHERE id=? AND status='active' AND lock_run_id=?""",
+                (iso(utc_now() + timedelta(minutes=lease_minutes)), job_id, run_id),
+            ).rowcount
+            return changed == 1
 
     def get_targets(self, job_id):
         with self.database.connection() as conn:
@@ -300,8 +311,9 @@ class Repository:
                 """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
                 r.booking_url,j.time_zone
                 FROM alerts a JOIN check_results r ON r.id=a.result_id
-                LEFT JOIN jobs j ON j.id=a.job_id
-                WHERE a.status IN ('pending','failed') AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=?)
+                JOIN jobs j ON j.id=a.job_id
+                WHERE a.status IN ('pending','failed') AND j.status='active' AND j.telegram_enabled=1
+                AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=?)
                 ORDER BY a.created_at LIMIT ?""", (iso(), limit)
             ).fetchall()]
 
@@ -324,6 +336,20 @@ class Repository:
         outcome = "error" if failed and not successful else "partial_error" if failed else "completed"
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            owner = conn.execute(
+                "SELECT lock_run_id FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            run = conn.execute(
+                "SELECT outcome FROM check_runs WHERE id=? AND job_id=?", (run_id, job_id)
+            ).fetchone()
+            if run is None or run["outcome"] != "running":
+                return
+            if owner is None or owner["lock_run_id"] != run_id:
+                conn.execute(
+                    "UPDATE check_runs SET outcome='interrupted',finished_at=? WHERE id=?",
+                    (iso(now), run_id),
+                )
+                return
             job_row = conn.execute(
                 "SELECT interval_seconds FROM jobs WHERE id=?", (job_id,)
             ).fetchone()
@@ -334,8 +360,9 @@ class Repository:
             )
             conn.execute(
                 """UPDATE jobs SET next_check_at=CASE WHEN status='active' THEN ? ELSE next_check_at END,
-                last_finished_at=?,last_outcome=?,lock_until=NULL WHERE id=?""",
-                (iso(now + timedelta(seconds=effective_interval)), iso(now), outcome, job_id),
+                last_finished_at=?,last_outcome=?,lock_until=NULL,lock_run_id=NULL
+                WHERE id=? AND lock_run_id=?""",
+                (iso(now + timedelta(seconds=effective_interval)), iso(now), outcome, job_id, run_id),
             )
             conn.execute(
                 """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at,last_completed_run_at,last_error)
@@ -347,12 +374,22 @@ class Repository:
     def interrupt_stale_runs(self):
         now = iso()
         with self.database.connection() as conn:
-            conn.execute(
-                """UPDATE check_runs SET outcome='interrupted',finished_at=?
-                WHERE outcome='running' AND started_at < ?""",
-                (now, iso(utc_now() - timedelta(minutes=10))),
-            )
-            conn.execute("UPDATE jobs SET lock_until=NULL WHERE lock_until < ?", (now,))
+            conn.execute("BEGIN IMMEDIATE")
+            stale = conn.execute(
+                """SELECT r.id,r.job_id FROM check_runs r LEFT JOIN jobs j ON j.id=r.job_id
+                WHERE r.outcome='running' AND (j.id IS NULL OR j.lock_until IS NULL
+                OR j.lock_until<=? OR j.lock_run_id!=r.id)""", (now,)
+            ).fetchall()
+            for run in stale:
+                conn.execute(
+                    "UPDATE check_runs SET outcome='interrupted',finished_at=? WHERE id=? AND outcome='running'",
+                    (now, run["id"]),
+                )
+                conn.execute(
+                    """UPDATE jobs SET lock_until=NULL,lock_run_id=NULL
+                    WHERE id=? AND lock_run_id=?""", (run["job_id"], run["id"]),
+                )
+            conn.execute("UPDATE jobs SET lock_until=NULL,lock_run_id=NULL WHERE lock_until<=?", (now,))
 
     def worker_status(self):
         with self.database.connection() as conn:
@@ -385,13 +422,36 @@ class Repository:
 
     def checks(self, job_id, limit=50, offset=0):
         with self.database.connection() as conn:
-            return [dict(row) for row in conn.execute(
-                """SELECT r.*,c.job_name,c.started_at AS run_started_at,c.finished_at AS run_finished_at,
-                c.outcome AS run_outcome,c.successful_targets,c.failed_targets,c.triggered_by
-                FROM check_results r JOIN check_runs c ON c.id=r.run_id
-                WHERE r.job_id=? ORDER BY r.checked_at DESC LIMIT ? OFFSET ?""",
+            runs = [dict(row) for row in conn.execute(
+                """SELECT id,job_id,job_name,started_at,finished_at,outcome,successful_targets,
+                failed_targets,triggered_by FROM check_runs WHERE job_id=?
+                ORDER BY started_at DESC,rowid DESC LIMIT ? OFFSET ?""",
                 (job_id, limit, offset),
             ).fetchall()]
+            if not runs:
+                return []
+            run_ids = [run["id"] for run in runs]
+            placeholders = ",".join("?" for _run_id in run_ids)
+            results = conn.execute(
+                f"""SELECT * FROM check_results WHERE run_id IN ({placeholders})
+                ORDER BY checked_at,rowid""", run_ids,
+            ).fetchall()
+            by_run = {run_id: [] for run_id in run_ids}
+            for result in results:
+                by_run[result["run_id"]].append(dict(result))
+            for run in runs:
+                run["results"] = by_run[run["id"]]
+            return runs
+
+    def latest_result(self, job_id):
+        with self.database.connection() as conn:
+            row = conn.execute(
+                """SELECT r.*,c.started_at AS run_started_at,c.finished_at AS run_finished_at,
+                c.outcome AS run_outcome,c.successful_targets,c.failed_targets,c.triggered_by
+                FROM check_results r JOIN check_runs c ON c.id=r.run_id
+                WHERE r.job_id=? ORDER BY r.checked_at DESC,r.rowid DESC LIMIT 1""", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
     def alerts(self, limit=50, offset=0):
         with self.database.connection() as conn:

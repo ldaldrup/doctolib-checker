@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -46,7 +46,8 @@ class Database:
                     last_started_at TEXT,
                     last_finished_at TEXT,
                     last_outcome TEXT,
-                    lock_until TEXT
+                    lock_until TEXT,
+                    lock_run_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, next_check_at);
                 CREATE TABLE IF NOT EXISTS targets (
@@ -129,6 +130,16 @@ class Database:
             version = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
+            elif version[0] == 1:
+                conn.execute("ALTER TABLE jobs ADD COLUMN lock_run_id TEXT")
+                # Preserve an in-flight v1 lease across the schema upgrade.
+                conn.execute(
+                    """UPDATE jobs SET lock_run_id=(SELECT id FROM check_runs
+                    WHERE check_runs.job_id=jobs.id AND outcome='running'
+                    ORDER BY started_at DESC LIMIT 1)
+                    WHERE lock_until IS NOT NULL"""
+                )
+                conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             elif version[0] != SCHEMA_VERSION:
                 raise RuntimeError("Unsupported database schema version")
             conn.execute("PRAGMA journal_mode=WAL")
