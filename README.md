@@ -77,7 +77,9 @@ The script relies on a `config.json` file in the root directory. Copy `config.js
 - `polling.upcoming_days` (Integer): How many days ahead to search for appointments (e.g., `15` = next 15 days).
 - `polling.insurance_sector` (String): Filter by insurance type: `"public"` or `"private"`. Defaults to `"public"`.
 - `polling.telehealth` (Boolean): Include remote/telehealth appointments. Defaults to `false`.
-- `polling.slot_limit` (Integer): Maximum slots per API call. Defaults to `15`. Note: the script reports the total count from the API, not limited by this.
+- `polling.page_days` (Integer): Calendar days requested per availability page. Must be between `1` and `15`; defaults to `15`. Existing configs with `polling.slot_limit` use that value as a fallback.
+- `doctolib_profile` (String): Browser profile used by the browserless availability transport. Currently supports `safari2601`.
+- `user_agent` (String): Header used for booking metadata requests. Availability requests use the configured browser profile's matching headers and connection behavior.
 
 ### Messages
 

@@ -15,6 +15,21 @@ from app.notifications import send_telegram
 from app.state import load_state, save_state
 
 
+def _request_gate(spacing_seconds):
+    spacing = max(3.0, float(spacing_seconds))
+    last_request = [None]
+
+    def wait_for_turn():
+        now = time.monotonic()
+        if last_request[0] is not None:
+            remaining = spacing - (now - last_request[0])
+            if remaining > 0:
+                time.sleep(remaining)
+        last_request[0] = time.monotonic()
+
+    return wait_for_turn
+
+
 def format_duration(seconds: int) -> str:
     if seconds >= 3600:
         h, rem = divmod(seconds, 3600)
@@ -78,6 +93,7 @@ def main(argv=None):
     print()
 
     session = get_session()
+    before_request = _request_gate(config["polling"]["delay_between_urls_seconds"])
     logging.info(f"{Style.BRIGHT}Running Pre-flight Verification on URLs...{Style.RESET_ALL}")
 
     preflight_meta = {}
@@ -85,8 +101,8 @@ def main(argv=None):
 
     for i, url in enumerate(config["urls"], 1):
         try:
-            meta = get_booking_metadata(url, config, session)
-            _ = fetch_slot_total(url, config, session, meta)
+            meta = get_booking_metadata(url, config, session, before_request=before_request)
+            _ = fetch_slot_total(url, config, session, meta, before_request=before_request)
             preflight_meta[url] = meta
             valid_urls.append(url)
             logging.info(
@@ -123,7 +139,7 @@ def main(argv=None):
     save_state(state)
 
     if args.once:
-        _hits, errors = run_once(config, state, preflight_meta, stats)
+        _hits, errors = run_once(config, state, preflight_meta, stats, before_request=before_request)
         return 0 if errors == 0 else 1
 
     try:
@@ -145,7 +161,7 @@ def main(argv=None):
                 logging.info(f"{Fore.YELLOW}🔔 Startup notification dispatched.{Style.RESET_ALL}")
 
         while True:
-            run_once(config, state, preflight_meta, stats)
+            run_once(config, state, preflight_meta, stats, before_request=before_request)
             maybe_send_summary(config, stats)
             countdown_sleep(config["polling"]["check_interval_seconds"])
     except KeyboardInterrupt:

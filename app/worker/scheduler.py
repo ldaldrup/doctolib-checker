@@ -23,7 +23,12 @@ def create_check_service(settings=None, repository=None, doctolib=None, notifier
                 settings.minimum_poll_interval_seconds, settings.request_spacing_seconds
             )
             repository.reserve_request_turn(float(current["request_spacing_seconds"]))
-        doctolib = DoctolibClient(user_agent=settings.user_agent, before_request=before_request)
+        doctolib = DoctolibClient(
+            user_agent=settings.user_agent,
+            before_request=before_request,
+            profile=settings.doctolib_profile,
+            page_days=settings.doctolib_page_days,
+        )
     return CheckService(repository, doctolib, settings, notifier=notifier) if notifier else CheckService(repository, doctolib, settings)
 
 
