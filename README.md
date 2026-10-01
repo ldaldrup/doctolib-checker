@@ -1,225 +1,240 @@
 # doctolib-checker
 
-A lightweight Doctolib appointment checker. It can run from the existing CLI or as a job-based backend with an HTTP API, a persistent SQLite database, and a separate polling worker. It reports matching appointment availability and can send Telegram alerts; it does not reserve or book appointments.
+Monitor Doctolib appointment availability and receive optional Telegram alerts. Run a local web interface with a background worker, or use the command-line checker with a JSON configuration file.
 
-Designed to run locally as a continuous background process.
+The checker reports matching slots; booking happens on Doctolib. It does not reserve appointments.
 
-This project draws inspiration from [seh-len/doctolib](https://github.com/seh-len/doctolib) and [timoles/Doctolib-Userfriendly-Appointment-Tracker](https://github.com/timoles/Doctolib-Userfriendly-Appointment-Tracker).
+- Monitor multiple booking URLs with insurance, telehealth, and date-window filters.
+- Create, edit, pause, and resume jobs in the Jobs interface.
+- Keep check results and alert history in SQLite when using the backend.
+- Run checks without Telegram using the CLI's dry-run mode.
+- Serve the web interface directly from Python, with no Node.js or frontend build required.
 
-## ⚠️ Disclaimer
+[Installation](#installation) · [Web interface](#web-interface) · [Command line](#command-line) · [Booking URLs](#booking-urls) · [Configuration](#configuration) · [Deployment](#deployment) · [Development](#development)
 
-**This tool is not officially endorsed or explicitly allowed by DoctoLib.** Using this tool to access DoctoLib's services may violate their terms of service. Use at your own risk. The author is not responsible for any consequences, account bans, IP blocks, or other issues that may result from using this tool. By using this tool, you assume full responsibility for any and all consequences of how it interacts with DoctoLib's API and services.
+## Installation
 
-## Setup
-
-1. **Install dependencies:** Ensure you have Python installed, then install the required packages:
-  ```bash
-   pip install -r requirements.txt
-  ```
-2. **Telegram Setup:** 
-  - Create a bot with [BotFather](https://t.me/BotFather) to get your `bot_token`.
-  - Start a conversation with your bot and get your `chat_id` (you can send any message to the bot, then use an API call or a service like [this](https://t.me/userinfobot) to find your ID).
-3. **Configuration:** Copy `config.json.example` to `config.json` and populate it with your specific details:
-  - **Telegram:** Add your `bot_token` and `chat_id` (found above).
-  - **URLs:** Add the Doctolib appointment URLs you wish to monitor (see [Obtaining Doctolib URLs](#obtaining-doctolib-urls) below).
-  - **Polling:** Adjust `polling.check_interval_seconds` (recommended: 300+ seconds) to avoid potential rate limits.
-
-## Project Structure
-
-The codebase is organized as a modular Python package under `app/`:
-
-```
-app/
-├── __init__.py        # Package marker
-├── config.py          # Config loading, defaults, and validation
-├── logging_utils.py   # Logging setup and ANSI-aware formatting
-├── models.py          # Shared booking and availability records
-├── state.py           # CLI state persistence (state.json)
-├── doctolib.py        # URL validation, metadata, and structured availability checks
-├── notifications.py   # Telegram adapters and message formatting
-├── loop.py            # Existing CLI polling cycle
-├── runner.py          # Existing CLI orchestration
-├── api/               # FastAPI app, routes, and request models
-├── services/          # Job operations and check execution
-├── storage/           # SQLite schema and repository operations
-├── worker/            # Separate polling worker process
-└── web/               # Native HTML/CSS/JavaScript Jobs and Settings interface
-```
-
-### Architecture Overview
-
-The CLI and backend share the Doctolib checking code. The backend uses these boundaries:
-
-- **`checker.py`** — Thin entrypoint wrapper that delegates to the modular runtime
-- **`doctolib.py`** — URL validation, metadata resolution, date-window filtering, and slot fetching
-- **`storage/`** — Durable jobs, targets, check runs/results, alert history, and shared request spacing
-- **`worker/`** — Sequential due-job checks, result recording, and notification dispatch
-- **`api/`** — Versioned job-control and reporting endpoints
-- **`services/`** — Job validation and coordination between the checker and repository
-- **`notifications.py`** — Telegram delivery with server-side credentials
-- **`runner.py` and `loop.py`** — Existing command-line operation
-
-This modular design improves maintainability while preserving the original CLI interface and behavior.
-
-## Configuration (`config.json`)
-
-The script relies on a `config.json` file in the root directory. Copy `config.json.example` as your starting point and adjust the parameters below:
-
-### Telegram Settings
-
-- `telegram.bot_token` (String): Your Telegram bot token from BotFather.
-- `telegram.chat_id` (String): The numerical ID of the chat/user/group to receive notifications.
-- `telegram.silent` (Boolean, optional): If `true`, all notifications are sent silently (no sound/vibration). Defaults to `false`. Can be overridden per message.
-
-### Polling & Search
-
-- `polling.check_interval_seconds` (Integer): Wait time in seconds between check cycles. **Recommended: 300+ seconds (5+ minutes)** to avoid potential rate-limiting or IP bans.
-- `polling.delay_between_urls_seconds` (Integer): Pause between fetching URLs in a single cycle. **Recommended: 2–5 seconds.**
-- `polling.upcoming_days` (Integer): Number of calendar dates to search, including today (e.g., `15` = today and the next 14 dates).
-- `polling.insurance_sector` (String): Filter by insurance type: `"public"` or `"private"`. Defaults to `"public"`.
-- `polling.telehealth` (Boolean): Include remote/telehealth appointments. Defaults to `false`.
-- `polling.page_days` (Integer): Calendar days requested per availability page. Must be between `1` and `15`; defaults to `15`. Existing configs with `polling.slot_limit` use that value as a fallback.
-- `doctolib_profile` (String): Browser profile used by the browserless availability transport. Currently supports `safari2601`.
-- `user_agent` (String): Header used for booking metadata requests. Availability requests use the configured browser profile's matching headers and connection behavior.
-
-### Messages
-
-Message templates use placeholders and can be individually silenced:
-
-#### Startup Message (`messages.startup`)
-- `template` (String): Message on script start. Placeholders: `{start_time}`, `{doctor_count}`, `{practice_count}`, `{practitioner_list}`, `{interval_mins}`, `{days}`, `{insurance_sector}`.
-- `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
-
-#### Shutdown Message (`messages.shutdown`)
-- `template` (String): Message when script stops.
-- `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
-
-#### Slot Found Message (`messages.slot_found`)
-- `template` (String): Alert when slots are found. Placeholders: `{total}`, `{practitioner}`, `{practice}`, `{first_date}`, `{booking_url}`.
-- `silent` (Boolean, optional): If `true`, this specific message is silent. Defaults to `false`.
-- `effect` (Object, optional): Telegram notification effect.
-  - `enabled` (Boolean): If `true`, plays a notification effect on Telegram. Defaults to `false`.
-  - `id` (String): Telegram effect ID (e.g., `"5046509860389126442"` for fireworks. See [wiz0u/MessageEffectIds.txt](https://gist.github.com/wiz0u/2a6d40c8f635687be363d72251a264da) for a list of animated and non-animated message effects). 
-
-#### Summary / Heartbeat Message (`messages.summary`)
-- `enabled` (Boolean): If `true`, periodically sends a monitoring status update. Defaults to `false`.
-- `interval_seconds` (Integer): Time-based interval in seconds (e.g., `3600` for hourly). Set to `0` to disable time-based sending. Defaults to `0`.
-- `every_x_cycles` (Integer): Send summary every N polling cycles (e.g., `12` with 5-minute intervals ≈ hourly). Defaults to `0` (disabled).
-- `template` (String): Message format. Placeholders: `{uptime}`, `{total_cycles}`, `{total_hits}`, `{total_errors}`, `{next_check_in}`, `{last_slot_line}`.
-- `silent` (Boolean, optional): Summary messages are silent by default. Set to `false` to enable sound. Defaults to `true`.
-
-### UI & Other
-
-- `ui.terminal_table` (Boolean): Display results in a table format. Defaults to `false`.
-- `ui.show_full_names` (Boolean): Show full practitioner names in terminal. Defaults to `true`.
-- `ui.colorblind_friendly` (Boolean): Reserved for future use.
-- `user_agent` (String): Browser User-Agent string. Generally do not change unless Doctolib blocks it.
-- `dry_run` (Boolean): If `true`, runs checks but skips Telegram API calls. Useful for testing. Can also be set via `--dry-run` CLI flag. Defaults to `false`.
-
-### Target URLs
-
-- `urls` (Array of Strings): Doctolib booking page URLs to monitor.
-  - Copy the URL from your browser's address bar when you're on the appointment availability page.
-
-## Obtaining Doctolib URLs
-
-To monitor appointments for a specific practitioner, follow these simple steps:
-
-1. **Navigate to [doctolib.de](https://doctolib.de)** and search for your desired practitioner, specialty, or location.
-
-2. **Select your practitioner and appointment type** from the search results.
-
-3. **Navigate through the booking flow** until you reach the appointment availability view.
-
-4. **Copy the URL from your browser's address bar** when you see the availability page (regardless of whether slots show "no appointments available" or not).
-   - The URL should look similar to: `https://www.doctolib.de/EXAMPLE-PATH/booking/availabilities?placeId=practice-XXXXX&motiveIds%5B%5D=XXXXXXX`
-
-5. **Paste the URL into your `config.json`** under the `urls` array.
-
-**⚠️ Important:** The URL must contain the `/availabilities?` path and include query parameters such as:
-- `specialityId` – The specialty ID
-- `motiveIds[]` (or `motiveIds`) – The appointment type ID(s)
-- `placeId` (or `pid`/`practice_id`) – The practice/clinic ID
-
-If the URL is missing these parameters or doesn't contain `/availabilities?` in the path, the tool won't be able to fetch appointments correctly. If you're unsure, re-copy the URL from the address bar and verify it contains at least these three parameters.
-
-That's it! The tool automatically parses the URL and monitors for available slots.
-
-## Usage
-
-- **Windows Shortcut:** Simply double-click `run.bat`. It will activate your virtual environment (if one exists) and start the polling loop.
-- **Command Line:** Run the script manually from your terminal:
-  ```bash
-  python checker.py
-  ```
-  The CLI interface remains unchanged after the modular refactor — `checker.py` now delegates to the modular runtime under `app/`.
-- **Single Check:** To run one check cycle without starting the continuous loop:
-  ```bash
-  python checker.py --once
-  ```
-- **Dry Run:** To test without sending Telegram messages:
-  ```bash
-  python checker.py --dry-run
-  ```
-- **Quick Check:** To verify the first URL in your config and save parsed Doctolib output to `temp/`:
-  - parses the first configured booking URL
-  - resolves metadata from Doctolib's `info.json`
-  - fetches availability data from `availabilities.json`
-  - prints an interpreted status such as IMMINENT SLOT, FAR SLOT, OUT OF WINDOW, or NO SLOTS
-  - saves a JSON file containing both metadata and the Doctolib API response
-  ```bash
-  python quick_check.py
-  ```
-
-## Backend API and worker
-
-The backend runs as two processes that share a SQLite database: the API controls jobs and reports status/history, and the worker checks due jobs and sends Telegram alerts. The API binds to `127.0.0.1` by default for local use. Set `API_HOST=0.0.0.0` only when it runs inside a container behind the configured authenticated reverse proxy.
-
-Install the runtime dependencies, then start the API and worker in separate shells with the same environment and database path:
+Use Python 3.10 or newer; the Docker image uses Python 3.12. From the repository directory:
 
 ```bash
-pip install -r requirements.txt
-DATABASE_PATH=./data/checker.sqlite3 python -m app.api.main
-DATABASE_PATH=./data/checker.sqlite3 python -m app.worker.main
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of both processes to enable alerts. Keep those values out of job records and source control. The example container environment is in `.env.example`.
+On Windows, activate the environment with `.venv\Scripts\activate.bat` in Command Prompt or `.venv\Scripts\Activate.ps1` in PowerShell.
 
-### Jobs and Settings interface
+Choose a workflow below. The web interface uses environment variables and SQLite; the CLI uses `config.json`. They share the checking code, but do not share job configuration or stored state.
 
-Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/) after starting the API. The API process serves the interface and its local assets, and the browser calls relative `/api/v1/` URLs on the same origin. No Node.js, frontend build, CDN, or separate static server is required. The worker must also run to check jobs; its heartbeat is shown in the interface.
+## Web interface
 
-Jobs and settings load exclusively from the configured database through the API. A new database starts empty. Create/edit/pause/resume/delete actions persist on the server, and API failures display errors rather than substitute records. Settings can save the default job interval and request spacing; the polling floor, default time zone, and Telegram configuration remain server configuration. Activity/Alerts pages and new notification channels are not part of this interface.
-
-The served directory is only `app/web/`; repository files, configuration, tests, and database files are not public assets. Stable HTML, JavaScript, CSS, and font filenames are served with `Cache-Control: no-cache` and validators so browsers revalidate them after application updates. API reads use uncached requests. Unknown paths return 404, and hash navigation handles Jobs and Settings without a catch-all file rewrite.
-
-For remote use, put the complete origin behind the authenticated reverse proxy: UI, assets, and API must share the same access gate. The application does not implement authentication itself. Keep API container ports unpublished, and use `/healthz` internally for health checks. The `deployment-repository` configuration prepares this routing; Komodo synchronization, builds, and deployments are deliberate user-owned operations.
-
-Card detections are historical check results, not guaranteed live appointments. Partial failures remain visible alongside successful detections. The API has no search revision or creation idempotency key: results around external edits are marked uncertain, and an ambiguous creation response is reconciled before a deliberate retry is offered. Visible Jobs refresh every 30 seconds with bounded backoff; hidden pages stop polling.
-
-For offline browser verification, install `requirements-dev.txt`, create a fresh temporary directory, and run `PYTHONPATH=. python tests/ui_harness.py --directory <temporary-directory> --port 9376`. Open `/` for the connected journey, `/__test/contracts` for native JavaScript contracts, or `/__test/responsive` for fixed-width layout checks. Only this harness substitutes fixture transports; its database is separate and its routes/files are absent from the production application/image. Stop the harness and remove only its temporary directory after testing. Fault switches in that directory's `control.json` are `reads_fail`, `writes_fail`, `auth`, and `lose_create_response` (boolean values); use `{}` to recover.
-
-The versioned API is under `/api/v1`. It provides health and worker status, job and target management, URL validation, check history, alert history, and supported global settings. Poll intervals have a server-enforced minimum of at least 300 seconds, configurable through `MINIMUM_POLL_INTERVAL_SECONDS`. This minimum also applies to job edits, resume, and check-now requests; a check-now request may be queued for later. Outbound Doctolib requests share the configured spacing gate. A 15-day backend horizon includes today and the next 14 calendar dates. The API does not provide appointment booking, email, or webhook delivery.
-
-An alert is sent once for an earliest slot while that slot remains the earliest available. A confirmed disappearance or change of earliest slot starts a new alert episode; an increased slot count with the same earliest slot does not. Failed Telegram sends remain in alert history for retry only while the target is active, the slot is in the future, and a confirming check is no older than one job interval. A newer no-availability result, changed earliest slot, removed target, or expired slot cancels a pending alert; errors do not reset an episode. Pausing a job or disabling Telegram suspends delivery until a fresh-enough check permits it. The `/api/v1/alerts` status can be `cancelled` for alerts that will not be retried. Telegram does not offer exactly-once delivery: if Telegram accepts a message and the worker stops before saving the success state, a later retry can send that alert again.
-
-To run the offline API/worker and checker tests:
+Start the API and worker in **two separate terminals**, with the virtual environment activated in each:
 
 ```bash
-pip install -r requirements-dev.txt
+# Terminal 1: API and web interface
+python -m app.api.main
+```
+
+```bash
+# Terminal 2: background checks and notifications
+python -m app.worker.main
+```
+
+Run both from the repository directory so they use the same default database, `./data/checker.sqlite3`. For a custom location, set the same `DATABASE_PATH` in both terminals.
+
+1. Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
+2. Create a job with one or more [booking URLs](#booking-urls) and your search filters.
+3. Check the worker heartbeat and the job's latest results.
+4. Use Settings to adjust the default job interval and request spacing.
+
+A new database starts empty. The worker must remain running to perform checks. Results are historical observations: a detected appointment may no longer be available when you open its booking link. Partial failures remain visible alongside successful results.
+
+### Enable Telegram alerts
+
+Create a bot with [BotFather](https://t.me/BotFather), start a conversation with it, and obtain the destination chat ID. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of **both processes**, then restart them. Enable Telegram for the jobs you want to notify.
+
+The timezone, polling minimum, and Telegram credentials are server configuration; they cannot be edited in the web interface. Keep credentials out of job records and source control.
+
+### API
+
+The API lives under `/api/v1` and supports job/target management, URL validation, worker status, check history, alert history, and global settings. `/healthz` provides an internal health check.
+
+Polling intervals have a server-enforced minimum of at least **300 seconds**. The same minimum applies to edits, resume, and check-now requests, so a requested check may be queued for later. Outbound Doctolib requests share a spacing gate. A 15-day horizon includes today and the next 14 calendar dates.
+
+<details>
+<summary>Alert delivery behavior</summary>
+
+An alert is sent once for an earliest slot while that slot remains the earliest available. A confirmed disappearance or change of earliest slot starts a new alert episode; a higher slot count with the same earliest slot does not.
+
+Failed Telegram sends can be retried while the target is active, the slot is in the future, and a confirming check is no older than one job interval. A newer no-availability result, changed earliest slot, removed target, or expired slot cancels a pending alert. Errors do not reset an episode. Pausing a job or disabling Telegram suspends delivery until a fresh-enough check permits it.
+
+Cancelled alerts remain visible in `/api/v1/alerts`. Telegram does not provide exactly-once delivery: if it accepts a message and the worker stops before recording success, a retry may send a duplicate.
+
+</details>
+
+## Command line
+
+Copy the example configuration:
+
+```bash
+cp config.json.example config.json
+```
+
+On Windows, use `copy config.json.example config.json`.
+
+Edit `config.json`:
+
+1. Replace the `urls` example with your own [booking URLs](#booking-urls).
+2. Choose your polling interval and search horizon. Start with at least 300 seconds between cycles and a short horizon such as 15 days; the example currently searches 365 days.
+3. Add `telegram.bot_token` and `telegram.chat_id` for alerts, or use `--dry-run` to skip Telegram sends.
+
+Try one cycle first:
+
+```bash
+python checker.py --once --dry-run
+```
+
+| Command | Behavior |
+| --- | --- |
+| `python checker.py` | Check continuously and send configured notifications. |
+| `python checker.py --once` | Run one check cycle, then exit. |
+| `python checker.py --dry-run` | Check continuously without sending Telegram messages. |
+| `python checker.py --once --dry-run` | Run one cycle without Telegram messages. |
+| `python quick_check.py` | Inspect the first configured URL and save metadata/API output under `temp/`. |
+
+Stop the continuous checker with **Ctrl+C**. Dry-run still contacts Doctolib. The diagnostic output from `quick_check.py` may contain practice and practitioner details; keep it local.
+
+## Booking URLs
+
+1. Open Doctolib and choose a practitioner or practice.
+2. Select the appointment type and continue to the availability view.
+3. Copy the complete URL from the browser, including its query parameters.
+4. Add it to a web job or the CLI's `urls` array.
+
+Supported hosts are `doctolib.de`, `www.doctolib.de`, `doctolib.fr`, and `www.doctolib.fr`, over HTTPS. The URL must contain `/booking/availabilities`, a practice ID (`placeId`, `pid`, or `practice_id`), and an appointment motive ID (`motiveIds[]`, `motiveIds`, or `visit_motive_ids`). Preserve other parameters copied from the booking flow, such as `specialityId` and `practitionerId`.
+
+Example shape, using placeholders rather than a real practice:
+
+```text
+https://www.doctolib.de/EXAMPLE-PATH/booking/availabilities?placeId=practice-XXXXX&motiveIds%5B%5D=XXXXXXX
+```
+
+Replace the entire example with a URL from your own booking flow. A profile page or search-results URL is not an availability URL.
+
+## Configuration
+
+### Backend environment
+
+The API and worker read process environment variables. `.env.example` documents the container settings; the application does **not** automatically load a `.env` file. Its container-oriented `API_HOST=0.0.0.0` and `DATABASE_PATH=/data/checker.sqlite3` differ from the local defaults below.
+
+| Variable | Local default | Purpose |
+| --- | --- | --- |
+| `DATABASE_PATH` | `./data/checker.sqlite3` | Shared SQLite file; use the same path for API and worker. |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Empty | Set both to enable Telegram delivery. |
+| `DEFAULT_TIMEZONE` | `Europe/Berlin` | Default timezone for new jobs. |
+| `MINIMUM_POLL_INTERVAL_SECONDS` | `300` | Polling floor; values below 300 are clamped. |
+| `REQUEST_SPACING_SECONDS` | `3` | Minimum spacing between requests; values below 3 are clamped. |
+| `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | API listening address and port. |
+| `DOCTOLIB_PROFILE` | `safari2601` | Supported availability transport profile; no browser runs. |
+| `DOCTOLIB_PAGE_DAYS` | `15` | Days per availability page, from 1 to 15. |
+| `USER_AGENT` | `DoctolibChecker/2.0` | Metadata request header; does not override the availability profile. |
+| `LOG_LEVEL` | `INFO` | Logging level. |
+| `WORKER_TICK_SECONDS` | `2` | Worker scheduler tick, with a minimum of 0.5 seconds. |
+
+### CLI configuration
+
+`config.json.example` is the starting point for the CLI. `config.json`, runtime data, logs, and `.env` files are ignored by Git.
+
+| Setting | Purpose |
+| --- | --- |
+| `urls` | Booking availability URLs to monitor. |
+| `telegram.bot_token`, `telegram.chat_id` | Notification credentials. |
+| `telegram.silent` | Send notifications without sound/vibration. |
+| `polling.check_interval_seconds` | Time between cycles; at least 300 seconds. |
+| `polling.delay_between_urls_seconds` | Request spacing; at least 3 seconds. |
+| `polling.upcoming_days` | Calendar dates to search, including today. |
+| `polling.insurance_sector` | `public` or `private`. |
+| `polling.telehealth` | Include telehealth appointments. |
+| `polling.page_days` | Days per availability page, from 1 to 15; older `slot_limit` is a fallback. |
+| `doctolib_profile` | Availability transport profile; currently `safari2601`. |
+| `user_agent` | Metadata request header. |
+| `dry_run` | Skip Telegram API calls; also available as `--dry-run`. |
+| `ui.terminal_table`, `ui.show_full_names` | Terminal presentation options. |
+
+<details>
+<summary>CLI message templates and heartbeat settings</summary>
+
+Templates live under `messages`. Each message supports `silent`; slot messages can also specify `effect.enabled` and `effect.id`. The example includes a disabled Telegram effect. See the [Telegram effect ID list](https://gist.github.com/wiz0u/2a6d40c8f635687be363d72251a264da) for alternatives.
+
+| Message | Template placeholders |
+| --- | --- |
+| `startup` | `{start_time}`, `{doctor_count}`, `{practice_count}`, `{practitioner_list}`, `{interval_mins}`, `{days}`, `{insurance_sector}` |
+| `shutdown` | Static shutdown text. |
+| `slot_found`, `far_slot_found` | `{total}`, `{practitioner}`, `{practice}`, `{first_date}`, `{booking_url}` |
+| `summary` | `{uptime}`, `{total_cycles}`, `{total_hits}`, `{total_errors}`, `{next_check_in}`, `{last_slot_line}` |
+
+Set `messages.summary.enabled` to enable heartbeat messages. `interval_seconds` sends by elapsed time; `every_x_cycles` sends by cycle count. Set either to `0` to disable that trigger. Summary messages are silent by default.
+
+`ui.colorblind_friendly` is reserved for future use.
+
+</details>
+
+## Deployment
+
+Keep the process or host awake and connected to the internet. For the backend, run the API and worker with the same environment and a persistent, writable SQLite location. The Dockerfile runs as UID/GID `10001:10001`; a mounted data directory must be writable by that user.
+
+**The application does not implement authentication.** For remote access, protect the complete origin with an authenticated reverse proxy: UI, assets, and API must share the same gate. Keep API container ports unpublished and use `/healthz` internally. Set `API_HOST=0.0.0.0` inside a container when the proxy needs to reach it.
+
+Only `app/web/` is served as static content. Repository files, configuration, tests, and databases are outside the served directory. UI and API share an origin, with no separate frontend server or CDN. Static assets revalidate after updates; API reads are uncached.
+
+## Troubleshooting and limitations
+
+| Symptom | What to check |
+| --- | --- |
+| Jobs do not run | Start the worker; verify its heartbeat and that both processes use the same database. |
+| No Telegram alerts | Set both credentials for both processes, enable Telegram on the job, and check alert history. CLI dry-run suppresses sends. |
+| URL rejected | Copy the final availability URL, preserving practice and motive parameters. |
+| Database permission error | Use a writable directory; for Docker bind mounts, account for UID/GID `10001:10001`. |
+| Blocked requests or transient failures | Keep conservative polling/request spacing and inspect reported errors. Doctolib can change its API or anti-bot behavior. |
+
+The API does not book appointments or deliver email/webhooks. Availability can change between a check and opening the booking page. The web interface currently exposes Jobs and Settings; check and alert history are also available through the API.
+
+This is an unofficial personal utility, provided as-is. It is not endorsed by Doctolib, and use may violate its terms of service or lead to access restrictions. Maintenance and compatibility are not guaranteed.
+
+## Development
+
+Install development dependencies and run the offline tests:
+
+```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-## Limitations & Considerations
+| Path | Responsibility |
+| --- | --- |
+| `checker.py`, `app/runner.py`, `app/loop.py` | CLI entrypoint and polling loop. |
+| `app/doctolib.py`, `app/models.py` | URL validation, metadata, and availability checks. |
+| `app/notifications.py` | Telegram delivery and formatting. |
+| `app/api/`, `app/services/` | API routes, validation, and job operations. |
+| `app/storage/`, `app/worker/` | SQLite persistence and scheduled checks. |
+| `app/web/` | Native HTML/CSS/JavaScript interface. |
+| `tests/` | Offline checker, backend, and UI verification. |
 
-- **Rate Limiting:** Doctolib may use anti-bot anti-ddos measures. Do not set your polling intervals too aggressively. Keep the interval to at least 5 minutes to minimize the risk of a temporary IP block.
-- **URL Accuracy:** The URLs in your `config.json` must be exact and contain the correct query parameters (`specialityId`, `motiveIds`, `practitionerId`, etc.) for the script to locate availabilities. Copy them directly from the final booking step in your browser.
-- **Always-On Requirement:** Because this runs locally, your computer must remain powered on, awake, and connected to the internet for the script to work.
+<details>
+<summary>Offline browser verification</summary>
 
-## Project Status & Development
+Create a fresh temporary directory, then start the fixture harness:
 
-This tool is a personal utility and is provided entirely **"as-is"**. There is no planned roadmap, and active maintenance, feature requests, or bug fixes are not guaranteed. Feel free to fork the repository to modify it for your own needs.
+```bash
+PYTHONPATH=. python tests/ui_harness.py --directory <temporary-directory> --port 9376
+```
 
-The codebase has been refactored from a monolithic script into a modular Python package (`app/`) to improve maintainability and separation of concerns. The CLI interface and configuration schema remain unchanged, so existing setups continue to work without modification.
+Open `http://127.0.0.1:9376/` for the connected journey, `/__test/contracts` for JavaScript contracts, or `/__test/responsive` for fixed-width layout checks. Only this harness substitutes fixture transports; its database and test routes are separate from production.
 
-*Note: This project was developed with the assistance of AI tools. The modular architecture follows conventional Python packaging patterns for better long-term maintainability.*
+The directory's `control.json` accepts boolean fault switches: `reads_fail`, `writes_fail`, `auth`, and `lose_create_response`. Use `{}` to recover. Stop the harness and remove its temporary directory after testing.
+
+</details>
+
+## Acknowledgements
+
+Inspired by [seh-len/doctolib](https://github.com/seh-len/doctolib) and [timoles/Doctolib-Userfriendly-Appointment-Tracker](https://github.com/timoles/Doctolib-Userfriendly-Appointment-Tracker). Developed with assistance from AI tools.
