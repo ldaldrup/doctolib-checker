@@ -1,0 +1,30 @@
+# 06 — Named Telegram channels and job routing
+
+**Outcome:** Settings manages multiple named Telegram destinations, and each job selects any combination. One availability event creates independent deliveries, so a failed Telegram1 does not repeat Telegram2. This is a complete UI/API/dispatcher release. **Effort: large.** Depends on 05 and on 01–03 migration, revision and delivery guarantees.
+
+Read the [shared execution contract](README.md) before implementation. Backend `b5cee59` and UI `6f3f589` are historical planning evidence only. Inspect the latest integrated source and implement on the existing `feat/improvements` branch under the shared branch policy. Inspect `app/storage/db.py`, `repositories.py`, `app/notifications.py`, `app/settings.py`, API routes/schemas, and UI Settings/job forms. If earlier plans changed these entrypoints, follow their handoffs and current contracts; avoid recreating their claims, versions or mutation system.
+
+## Scope and boundaries
+
+Ship named Telegram CRUD, encrypted credentials, explicit legacy onboarding, saved-config test sends, synthetic previews, job selection and per-destination status. Preserve existing earliest-slot/reappearance policy. Other adapters, quiet hours, arbitrary templates and a new authentication system are outside this chunk.
+
+## Implementation order
+
+1. Define stable channel IDs, type, display name, enabled/usable state, destination version and credential version. Names never identify recipients or dedupe work. Store credentials encrypted using a vetted authenticated-encryption dependency and an external `NOTIFICATION_SECRET_KEY`. Never invent encryption. Document key format, startup validation and key-loss recovery; refuse secret writes when the key is unavailable. Mask all reads; support explicit keep/replace/clear operations.
+2. Split logical availability events from per-config deliveries, or extend the existing schema with equivalent enforceable identities. Retain target/slot/episode identity and revision evidence. Observation consumes an episode's event identity even with notifications off or zero selected channels; persist its observed/routed boundary and originally authorized routing snapshot. Enforce uniqueness for `(event_id, channel_config_id, destination_version)` and reuse plan 03 claims, eligibility, retry and uncertain-outcome semantics. Routing changes apply prospectively: repeated confirmation of an already-observed episode cannot add deliveries to newly attached recipients. Cancelled rows stay cancelled unless the explicit same-destination eligible recovery path authorizes them. A manual paused-run capability from plan 04 authorizes only that event's selected deliveries and never resumes the job.
+3. Rehearse migration on disposable data. Preserve sent/cancelled history and attempts; migrate pending/failed work with freshness revalidation and explicit cancellation reasons. Carry active delivery ownership fields across rather than resetting claims. Use a quiesced migration procedure if mixed binaries are unsupported. Historical rows must remain browsable even when their config is later removed.
+4. Provide explicit idempotent onboarding that imports environment Telegram settings once as **Telegram1**, mapping only existing opted-in jobs. Never import on every startup or overwrite a saved config. Settings becomes authoritative after onboarding; expose the remaining operator configuration boundary clearly. Before migration, document the external key's backup/recovery companion to plan 01.
+5. Build Settings CRUD and job multiselect end to end. Renames preserve selections; disable cancels unsent work and prevents tests; deletion shows affected jobs and requires an explicit confirmed mutation. Credential repair for the same destination offers recovery of fresh failed work; recipient identity changes cancel old pending work instead of redirecting it. Refetch saved state rather than trusting cached process settings.
+6. Add saved-config asynchronous test operations using plan 05 idempotency. A test is separate from availability episodes, carries destination identity/version, and returns an operation ID for bounded status polling. Label the external side effect. Reject disabled/incomplete configs and never resend an unknown outcome automatically. Render a synthetic escaped Telegram preview using the current formatter.
+
+## Direct acceptance checks
+
+- Import twice: exactly one Telegram1, unchanged saved credentials and opt-in mapping; no historical replay.
+- One event routes to two fake Telegram destinations; one fails, and retry leaves the other's successful delivery untouched.
+- Observe a matching episode with channels off/empty → attach/enable a channel → confirm same slot: no delivery; genuine disappearance/reappearance creates a new eligible event.
+- Exercise Settings keep/replace/clear, reload, rename and deletion; no token appears in API reads, errors, logs or browser storage.
+- Change/disable a destination during queued and claimed work: unsent work cancels; a network attempt already in flight is recorded honestly.
+- Lose a test response and repeat its idempotency key: one operation and at most one dispatched attempt; unknown remains visible.
+- Migrate sent, failed, fresh pending, stale pending and claimed fixtures while preserving attempts and history.
+
+**Done/handoff:** Demonstrate Settings → selection → stub event → independent delivery status on `feat/improvements`; record migration version, config ownership, secret-key restore instructions and adapter interface for 07. Main risks are migration replay, secret exposure and recipient rotation races. Deployment/live Telegram testing requires a separately authorized controlled destination.

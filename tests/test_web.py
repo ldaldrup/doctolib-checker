@@ -97,3 +97,33 @@ def test_same_origin_hosting_does_not_enable_cross_origin_api(client):
         "Origin": "https://other.example", "Access-Control-Request-Method": "POST",
     })
     assert "access-control-allow-origin" not in preflight.headers
+
+
+def test_check_history_exposes_saved_revision_without_claim_credentials(client):
+    repository = client.app.state.repository
+    job = repository.create_job({
+        "name": "Revision API", "interval_seconds": 300,
+        "date_mode": "first_available", "horizon_days": 15,
+        "time_zone": "Europe/Berlin", "insurance_sector": "public",
+        "telehealth": False, "telegram_enabled": False,
+    }, [{
+        "booking_url": "https://www.doctolib.de/example/booking/availabilities?placeId=1&motiveIds[]=2",
+        "country": "de", "profile_slug": "example", "practice_id": "1",
+        "motive_id": "2", "agenda_ids_str": "3", "practice_name": "Example practice",
+        "practitioner_name": "Example practitioner",
+    }])
+    run_id, claim = repository.claim_due_jobs()[0]
+    response = client.get(f"/api/v1/jobs/{job['id']}/checks")
+    assert response.status_code == 200
+    saved = response.json()[0]
+    assert saved["id"] == run_id
+    assert saved["search_revision"] == job["search_revision"] == 1
+    assert saved["snapshot_known"] == 1
+    assert saved["search_snapshot"] == claim["search_snapshot"]
+    assert saved["search_snapshot"]["targets"][0]["id"] == job["targets"][0]["id"]
+    assert claim["owner_token"] not in response.text
+    assert "owner_token" not in saved
+    for path in ("/api/v1/jobs", f"/api/v1/jobs/{job['id']}"):
+        public = client.get(path)
+        assert claim["owner_token"] not in public.text
+        assert "lock_owner_token" not in public.text

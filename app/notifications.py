@@ -124,7 +124,7 @@ def format_slot_alert(alert):
     )
 
 
-def send_telegram_alert(settings, alert, session=None):
+def send_telegram_alert(settings, alert, session=None, before_send=None):
     """Send one structured slot alert without logging its URL or credentials."""
     if not settings.telegram_enabled or not settings.telegram_bot_token or not settings.telegram_chat_id:
         return False, "telegram_not_configured"
@@ -139,6 +139,9 @@ def send_telegram_alert(settings, alert, session=None):
     }
     last_error = "telegram_delivery_failed"
     for attempt in range(1, 4):
+        # Recheck eligibility after retry backoff; edits can invalidate evidence.
+        if before_send is not None and not before_send():
+            return False, "alert_no_longer_eligible"
         try:
             response = request_session.post(
                 endpoint,

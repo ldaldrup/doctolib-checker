@@ -238,3 +238,39 @@ The directory's `control.json` accepts boolean fault switches: `reads_fail`, `wr
 ## Acknowledgements
 
 Inspired by [seh-len/doctolib](https://github.com/seh-len/doctolib) and [timoles/Doctolib-Userfriendly-Appointment-Tracker](https://github.com/timoles/Doctolib-Userfriendly-Appointment-Tracker). Developed with assistance from AI tools.
+
+## SQLite backup and restore verification
+
+Create a backup of an **existing backend SQLite database** with the online backup command. The API/worker may keep writing during backup; SQLite supplies a consistent snapshot including committed WAL data. The destination parent must already exist in a trusted, writable location. The command never replaces an existing destination, including a symlink or hard link, and fails safely if the source is missing or invalid.
+
+```bash
+python -m app.admin backup \
+  --source ./data/checker.sqlite3 \
+  --destination /protected-backups/checker-before-upgrade.zip
+```
+
+The single ZIP bundle contains `checker.sqlite3` and `manifest.json`. It is published atomically with permissions `0600`; temporary files are private and removed on failure. The manifest records UTC creation time, the snapshot's schema version, a SHA-256 checksum and the backup tool's checkout revision when available and application files are clean (`null` otherwise). That revision does **not** establish the version of the running database writer. The checksum detects accidental corruption; it is not a signature. Backups contain private appointment/job/history data and are not encrypted: protect their directory and copies. Environment Telegram credentials, service configuration and the legacy CLI's separate JSON state are not included.
+
+Backup has a 30-second online-copy deadline; use `--timeout 120` for a deliberately longer deadline. Validation/archive creation takes additional time. A constantly busy database may need a longer deadline or a maintenance window. This command requires a filesystem supporting local hard links for no-overwrite publication; it does not fall back to an overwriting rename or upload to remote storage.
+
+Verify and rehearse restore in a **new disposable directory**, leaving the archive untouched:
+
+```bash
+python -m app.admin verify \
+  --archive /protected-backups/checker-before-upgrade.zip \
+  --work-directory /private/tmp/checker-restore-rehearsal
+```
+
+The parent directory must exist; the work directory must not. Verification checks the checksum, SQLite integrity, foreign keys, manifest/schema agreement and required checker tables/columns for supported versions **before** initialization can create tables. It retains an extracted original snapshot as `checker.sqlite3`, copies it to `restored.sqlite3`, migrates only that second copy with the current application, and exercises representative job/target/history/alert/status repository reads plus the real `/healthz` ASGI endpoint without opening a server/socket or starting a worker. Explicit offline settings disable Telegram and upstream access; ambient `DATABASE_PATH`/Telegram environment values are not used. Success prints safe aggregate JSON with backup/restored schema versions and health status. Failure removes only the disposable directory newly created by this invocation; it never removes an existing directory. Keep the successful rehearsal directory private or remove it deliberately after inspection.
+
+Current code can rehearse schema versions 1, 2, 3 and 4. A newer unsupported schema is refused before attempting migration. `verify --integrity-only` checks an archive without migration or API health, allowing archival integrity checks independently of application compatibility. Re-run rehearsal with the intended application revision before each upgrade; passing health proves DB access, not upstream availability or delivery.
+
+For an **actual offline restore**, stop every API/worker writer first. Preserve the current database using a separate backup, choose an application version compatible with the archive, and rehearse verification into a new private location. With writers stopped, promote the verified `restored.sqlite3` to a **new database path**, update all process configurations to that same path, and start the compatible application. Never overwrite a live database or combine restored data with old `-wal`/`-shm` files; do not start the worker during rehearsal. Check jobs/settings/targets/history and internal health before intentionally enabling real checks/notifications. Restored in-flight work and pending alerts require review because provider acceptance may have occurred after the snapshot; replay can duplicate an external notification. Record the cutover and keep the prior path available until rollback is no longer needed.
+
+Rollback restores the matching earlier database **and** application version after stopping writers. It cannot retain changes made after that backup and must not downgrade a newer schema in place. These instructions do not create a production backup schedule or authorize a live restore/deployment. Future stored notification secrets will also require their external encryption key; current backend credentials remain separate environment configuration.
+
+## Improvement work and branch policy
+
+Completed improvements are consolidated into `master`. Continue the numbered [implementation plans](docs/implementation-plans/README.md) sequentially on the single shared `feat/improvements` branch, starting from the latest `master`. Reuse that branch for every remaining part; do not create per-part, agent, review or auxiliary branches. Merge completed, reviewed work into `master`, then bring `feat/improvements` forward before continuing.
+
+Parts 01 and 02 are complete; the [part 02 handoff](docs/implementation-plans/02-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.

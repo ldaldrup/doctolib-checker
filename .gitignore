@@ -39,7 +39,11 @@ env/
 AGENTS.md
 **/AGENTS.md
 .agents/
-docs/
+docs/*
+!docs/improvement-overview.md
+!docs/implementation-plans/
+docs/implementation-plans/*
+!docs/implementation-plans/*.md
 plans/
 **/plans/
 *.plan.md

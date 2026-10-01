@@ -1,0 +1,29 @@
+# 10 — Job quiet hours with fresh, coalesced release
+
+**Outcome:** A job can defer notifications during a configured local quiet period, then send only a still-valid, recently confirmed appointment event. Availability monitoring continues under its existing schedule. **Effort: medium–large.** Depends directly on 09 and on 02–04/06 revisions, run capabilities, durable requests and independent delivery claims.
+
+Read the [shared execution contract](README.md). Revalidate backend `b5cee59`, UI `6f3f589` and inspect preceding-plan handoffs. Entry points include event/policy schemas, delivery eligibility and dispatcher, durable check-intent repository methods, worker scheduler, API job routes and job Settings/controls. Use current revision, run-trigger and paused-manual contracts instead of creating a second scheduler or auto-resuming jobs.
+
+## Scope and boundaries
+
+Ship one **per-job** quiet-hours interval inheriting the displayed job IANA time zone, including intervals crossing midnight. No separate quiet-zone field. It applies to all selected appointment channels. No per-channel schedules, digest messages, calendar exceptions or urgency bypass. Define disabled versus enabled explicitly; reject ambiguous equal start/end values rather than inventing an undocumented all-day schedule. Quiet hours delay delivery, not the availability checks already scheduled for active jobs.
+
+## Implementation order
+
+1. Store validated enabled/start/end under policy edit version and inherit job time_zone. Compute eligibility from zoned wall boundaries, not a fixed UTC offset. Persist planned next eligibility time for queue efficiency, then recompute eligibility on claim after job-zone/policy edits. Boundary rule: start inclusive/end exclusive; a nonexistent boundary moves to the first valid instant after the gap, and an ambiguous fold uses the earliest start/latest end so the repeated quiet interval remains quiet. Test this contract explicitly.
+2. Coalesce held work per job/target and selected destination to the newest eligible earliest-slot episode; cancel superseded held deliveries with reasons rather than retaining an unbounded digest queue. Retain event/history identity and successful delivery evidence. Do not re-send to a channel that already succeeded before a policy change. Pause cancels ordinary scheduled work; preserve only the explicit paused-manual capability described below. Delete, removed targets, destination changes and superseded search revisions invalidate unsent work.
+3. At release, require a successful result for the **current search revision**, matching target/metadata and still-matching future earliest slot. Freshness window is the **current job interval**; an interval edit changes the release calculation without changing search evidence. The current confirmation cannot be an error/partial target result masquerading as no availability. Reevaluate freshness and slot eligibility immediately before the bounded send attempt, preserving existing unavoidable in-flight races honestly.
+4. When an active job lacks fresh confirmation, create/coalesce a normal check request and wait. Quiet-hour refresh does not receive plan 04's edit/manual floor bypass; respect ordinary request spacing, provider backoff and job ownership. Avoid one request per destination or dispatcher poll. A confirming result creates/updates the eligible event, and stale disappeared/changed slots cancel held work rather than release old evidence.
+5. Preserve paused manual-run capability precisely. A manual check can notify while the job stays paused if that event's explicit capability was recorded by 04. It may be held and released while its confirmation remains fresh. If it becomes stale, show **a new manual check is needed**; do not initiate automatic recurring refreshes, silently resume the job or confer permission on unrelated events. A later manual check supersedes/revalidates held work through the normal revision/episode rules.
+6. Expose held-until, waiting-for-fresh-check, needs-manual-check, cancelled and delivered states through existing job/notification UI; expose additive API data consumed by 11's later Activity view. Settings preview shows inherited time zone and next release example without sending. Disabling/changing quiet hours reevaluates eligible work against the same freshness rules; it never dumps an old backlog immediately. Tests remain clearly labeled user-triggered operations rather than automatically deferred appointment events.
+
+## Direct acceptance checks
+
+- Fake-clock fixtures cover daytime, midnight-crossing, exact boundaries and DST gap/fold transitions in an IANA zone.
+- Several episodes during quiet hours coalesce independently per selected destination; previously successful destinations never repeat.
+- At release, fresh current-revision confirmation sends; stale, expired, disappeared, metadata-changed or superseded results do not.
+- Stale active work creates one normal refresh intent across polls/restart and respects ordinary floor/spacing.
+- Paused manual work releases only with its capability and fresh confirmation; stale work requests another manual action while status stays paused.
+- Editing/disabling policy recomputes eligibility without replaying history or exposing tokens in activity status.
+
+**Done/handoff:** Demonstrate hold → confirmation → release and paused manual hold → needs-manual-check in the UI with a fake clock. Record DST boundary rule, freshness calculation, coalescing identity and capability propagation for later diagnostics/retention. Main risks are stale release, DST boundary mistakes and turning a paused manual exception into automatic monitoring.

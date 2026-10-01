@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Database:
@@ -16,7 +16,11 @@ class Database:
         parent = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(parent, exist_ok=True)
         with self.connection() as conn:
-            conn.executescript(
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
+                versions = conn.execute("SELECT version FROM schema_version").fetchall()
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4):
+                    raise RuntimeError("Unsupported database schema version")
+            conn.executescript("BEGIN IMMEDIATE;" +
                 """
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER NOT NULL
@@ -47,7 +51,10 @@ class Database:
                     last_finished_at TEXT,
                     last_outcome TEXT,
                     lock_until TEXT,
-                    lock_run_id TEXT
+                    lock_run_id TEXT,
+                    lock_owner_token TEXT,
+                    search_revision INTEGER NOT NULL DEFAULT 1,
+                    edit_version INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, next_check_at);
                 CREATE TABLE IF NOT EXISTS targets (
@@ -78,7 +85,11 @@ class Database:
                     outcome TEXT NOT NULL CHECK (outcome IN ('running', 'completed', 'partial_error', 'error', 'interrupted')),
                     successful_targets INTEGER NOT NULL DEFAULT 0,
                     failed_targets INTEGER NOT NULL DEFAULT 0,
-                    triggered_by TEXT NOT NULL DEFAULT 'schedule'
+                    triggered_by TEXT NOT NULL DEFAULT 'schedule',
+                    search_revision INTEGER,
+                    search_snapshot TEXT,
+                    snapshot_known INTEGER NOT NULL DEFAULT 0,
+                    owner_token TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_job_time ON check_runs(job_id, started_at DESC);
                 CREATE TABLE IF NOT EXISTS check_results (
@@ -95,7 +106,10 @@ class Database:
                     earliest_slot TEXT,
                     count_complete INTEGER NOT NULL DEFAULT 1,
                     error_code TEXT,
-                    error_message TEXT
+                    error_message TEXT,
+                    search_revision INTEGER,
+                    snapshot_known INTEGER NOT NULL DEFAULT 0,
+                    published INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_results_target_time ON check_results(target_id, checked_at DESC);
                 CREATE TABLE IF NOT EXISTS target_alert_state (
@@ -117,7 +131,8 @@ class Database:
                     created_at TEXT NOT NULL,
                     sent_at TEXT,
                     error_summary TEXT,
-                    next_attempt_at TEXT
+                    next_attempt_at TEXT,
+                    search_revision INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
                 CREATE TABLE IF NOT EXISTS worker_heartbeat (
@@ -133,7 +148,6 @@ class Database:
                 );
                 """
             )
-            conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -178,9 +192,31 @@ class Database:
                             WHERE previous.target_id=t.id AND previous.status IN ('available','no_availability')
                             ORDER BY previous.rowid DESC LIMIT 1
                         )""")
+                    current_version = 3
+                if current_version == 3:
+                    additions = {
+                        "jobs": ["lock_owner_token TEXT", "search_revision INTEGER NOT NULL DEFAULT 1",
+                                 "edit_version INTEGER NOT NULL DEFAULT 1"],
+                        "check_runs": ["search_revision INTEGER", "search_snapshot TEXT",
+                                       "snapshot_known INTEGER NOT NULL DEFAULT 0", "owner_token TEXT"],
+                        "check_results": ["search_revision INTEGER", "snapshot_known INTEGER NOT NULL DEFAULT 0",
+                                          "published INTEGER NOT NULL DEFAULT 0"],
+                        "alerts": ["search_revision INTEGER"],
+                    }
+                    for table, columns in additions.items():
+                        for column in columns:
+                            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+                    # Legacy in-flight work has no provable snapshot/owner. Keep
+                    # its evidence, but never let an older worker publish it.
+                    conn.execute("""UPDATE check_runs SET outcome='interrupted',
+                        successful_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status!='error'),
+                        failed_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status='error')
+                        WHERE outcome='running'""")
+                    conn.execute("UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL")
                     conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
                 elif current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_results_known_run_target ON check_results(run_id,target_id) WHERE snapshot_known=1")
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
 
