@@ -42,7 +42,8 @@ app/
 ├── api/               # FastAPI app, routes, and request models
 ├── services/          # Job operations and check execution
 ├── storage/           # SQLite schema and repository operations
-└── worker/            # Separate polling worker process
+├── worker/            # Separate polling worker process
+└── web/               # Native HTML/CSS/JavaScript Jobs and Settings interface
 ```
 
 ### Architecture Overview
@@ -183,6 +184,20 @@ DATABASE_PATH=./data/checker.sqlite3 python -m app.worker.main
 ```
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of both processes to enable alerts. Keep those values out of job records and source control. The example container environment is in `.env.example`.
+
+### Jobs and Settings interface
+
+Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/) after starting the API. The API process serves the interface and its local assets, and the browser calls relative `/api/v1/` URLs on the same origin. No Node.js, frontend build, CDN, or separate static server is required. The worker must also run to check jobs; its heartbeat is shown in the interface.
+
+Jobs and settings load exclusively from the configured database through the API. A new database starts empty. Create/edit/pause/resume/delete actions persist on the server, and API failures display errors rather than substitute records. Settings can save the default job interval and request spacing; the polling floor, default time zone, and Telegram configuration remain server configuration. Activity/Alerts pages and new notification channels are not part of this interface.
+
+The served directory is only `app/web/`; repository files, configuration, tests, and database files are not public assets. Stable HTML, JavaScript, CSS, and font filenames are served with `Cache-Control: no-cache` and validators so browsers revalidate them after application updates. API reads use uncached requests. Unknown paths return 404, and hash navigation handles Jobs and Settings without a catch-all file rewrite.
+
+For remote use, put the complete origin behind the authenticated reverse proxy: UI, assets, and API must share the same access gate. The application does not implement authentication itself. Keep API container ports unpublished, and use `/healthz` internally for health checks. The `deployment-repository` configuration prepares this routing; Komodo synchronization, builds, and deployments are deliberate user-owned operations.
+
+Card detections are historical check results, not guaranteed live appointments. Partial failures remain visible alongside successful detections. The API has no search revision or creation idempotency key: results around external edits are marked uncertain, and an ambiguous creation response is reconciled before a deliberate retry is offered. Visible Jobs refresh every 30 seconds with bounded backoff; hidden pages stop polling.
+
+For offline browser verification, install `requirements-dev.txt`, create a fresh temporary directory, and run `PYTHONPATH=. python tests/ui_harness.py --directory <temporary-directory> --port 9376`. Open `/` for the connected journey, `/__test/contracts` for native JavaScript contracts, or `/__test/responsive` for fixed-width layout checks. Only this harness substitutes fixture transports; its database is separate and its routes/files are absent from the production application/image. Stop the harness and remove only its temporary directory after testing. Fault switches in that directory's `control.json` are `reads_fail`, `writes_fail`, `auth`, and `lose_create_response` (boolean values); use `{}` to recover.
 
 The versioned API is under `/api/v1`. It provides health and worker status, job and target management, URL validation, check history, alert history, and supported global settings. Poll intervals have a server-enforced minimum of at least 300 seconds, configurable through `MINIMUM_POLL_INTERVAL_SECONDS`. This minimum also applies to job edits, resume, and check-now requests; a check-now request may be queued for later. Outbound Doctolib requests share the configured spacing gate. A 15-day backend horizon includes today and the next 14 calendar dates. The API does not provide appointment booking, email, or webhook delivery.
 

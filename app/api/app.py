@@ -1,12 +1,24 @@
 """FastAPI application factory."""
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import create_router
 from app.doctolib import DoctolibClient
 from app.settings import Settings
 from app.storage.db import Database
 from app.storage.repositories import Repository
+
+
+class WebFiles(StaticFiles):
+    """Serve stable asset names with revalidation after application updates."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(settings=None, repository=None, doctolib=None):
@@ -33,5 +45,17 @@ def create_app(settings=None, repository=None, doctolib=None):
     app.state.settings = settings
     app.state.repository = repository
     app.state.doctolib = doctolib
+
+    @app.middleware("http")
+    async def uncached_api(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/") or request.url.path == "/healthz":
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     app.include_router(create_router())
+    # Register last so API/health routes retain their normal responses. Hash
+    # navigation only needs index.html; unknown paths must remain real 404s.
+    web_directory = Path(__file__).resolve().parents[1] / "web"
+    app.mount("/", WebFiles(directory=web_directory, html=True), name="web")
     return app
