@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>DoctolibChecker</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="assets/css/tokens.css">
+  <link rel="stylesheet" href="assets/css/base.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/pages.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner container">
+      <a class="brand" href="#jobs" aria-label="DoctolibChecker, Jobs">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">DoctolibChecker</span>
+      </a>
+      <nav class="desktop-nav" aria-label="Primary navigation">
+        <a href="#jobs" data-nav="jobs">Jobs</a>
+        <a href="#settings" data-nav="settings">Settings</a>
+      </nav>
+      <div class="header-actions">
+        <span class="worker-pill worker-unknown" id="worker-status" role="status">Worker status unknown</span>
+        <button class="button button-secondary button-small" id="sign-in" type="button" data-action="sign-in" hidden>Sign in</button>
+        <span class="header-divider" aria-hidden="true"></span>
+        <button class="button button-primary button-small header-new" type="button" data-action="new-job">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg> New Job
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="app" class="container main-content" tabindex="-1"></main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span><strong>DoctolibChecker</strong></span>
+      <div class="footer-links">
+        <a href="https://github.com/ldaldrup/doctolib-checker" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <nav class="mobile-nav" aria-label="Mobile navigation">
+    <a href="#jobs" data-nav="jobs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span>Jobs</span></a>
+    <button type="button" class="mobile-new" data-action="new-job" aria-label="New job"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>New</span></button>
+    <a href="#settings" data-nav="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M9 4v6M15 14v6"/></svg><span>Settings</span></a>
+  </nav>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-copy">
+    <form method="dialog">
+      <h2 id="confirm-title">Delete job?</h2>
+      <p id="confirm-copy">The job stops monitoring and its history is retained. An in-flight check may still record a result. Deletion persists after reload.</p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" value="cancel">Cancel</button>
+        <button class="button button-danger" value="confirm">Delete job</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script type="module" src="assets/js/main.js"></script>
+</body>
+</html>
