@@ -42,7 +42,47 @@ export function renderJobCounts(state) {
     .map(([key, label, total]) => `<button type="button" data-action="filter" data-filter="${key}" aria-pressed="${state.filter === key}" class="${key === "slot" ? "filter-slot" : ""}">${key === "slot" ? '<span class="filter-slot-dot" aria-hidden="true"></span>' : ""}${label} (${total})</button>`).join("");
 }
 
-export function jobStatus(job, state) {
+export function compactDuration(seconds) {
+  const total = Math.max(0, Math.ceil(seconds));
+  const units = [[86400, "d"], [3600, "h"], [60, "m"], [1, "s"]];
+  const index = units.findIndex(([size]) => total >= size);
+  if (index < 0) return "0s";
+  return units.slice(index, index + 2).map(([size, suffix], offset) => {
+    const amount = Math.floor((offset ? total % units[index][0] : total) / size);
+    return amount ? `${amount}${suffix}` : "";
+  }).join("");
+}
+
+export function nextCheck(job, state, now = Date.now()) {
+  if (job.status === "paused") return "paused";
+  if (state.load?.status?.phase !== "loaded") return "unknown";
+  if (!state.status?.worker_alive) return "blocked";
+  if (viewFor(state, job)?.running) return "checking";
+  const due = Date.parse(job.next_check_at || "");
+  return !Number.isFinite(due) ? "unknown" : due <= now ? "due" : compactDuration((due - now) / 1000);
+}
+
+export function nextCheckTitle(job) {
+  const due = Date.parse(job.next_check_at || "");
+  if (job.status === "paused") return "No check scheduled while paused.";
+  if (!Number.isFinite(due)) return "Next check time unavailable.";
+  const zone = job.time_zone || "Europe/Berlin";
+  try {
+    const formatted = new Intl.DateTimeFormat("de-DE", {timeZone: zone, day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false}).format(new Date(due));
+    return `Scheduled next check: ${formatted} (${zone})`;
+  } catch { return `Scheduled next check: ${new Date(due).toISOString()} (UTC)`; }
+}
+
+export function checkedAgo(value, now = Date.now()) {
+  const checked = Date.parse(value || "");
+  if (!Number.isFinite(checked)) return null;
+  const seconds = Math.max(0, Math.floor((now - checked) / 1000));
+  const units = [[31536000, "y"], [86400, "d"], [3600, "h"], [60, "m"], [1, "s"]];
+  const [size, suffix] = units.find(([size]) => seconds >= size) || units[units.length - 1];
+  return `Checked ${Math.floor(seconds / size)}${suffix} ago`;
+}
+
+export function jobStatus(job, state, now = Date.now()) {
   const view = viewFor(state, job);
   if (job.status === "paused") return {label: "Paused", tone: "paused", detail: "Checks are paused"};
   if (state.load?.status?.phase !== "loaded") return {label: "Status unknown", tone: "warning", detail: state.load?.status?.error ? "Worker status unavailable" : "Checking worker status…"};
@@ -50,8 +90,8 @@ export function jobStatus(job, state) {
   if (view?.error) return {label: "Status unknown", tone: "warning", detail: "Check history unavailable"};
   if (view?.state === "error") return {label: "Check failed", tone: "warning", detail: "Targets could not be checked"};
   if (view?.state === "partial") return {label: "Check incomplete", tone: "warning", detail: "Some target results are missing or failed"};
-  const labels = {unknown: "Loading check history…", never: "Awaiting first check", awaiting: "Awaiting a fresh check", running: "Check in progress", no_availability: "No availability reported", available: "Historical slot detection"};
-  return {label: "Monitoring", tone: "running", detail: labels[view?.state || "unknown"]};
+  const labels = {unknown: "Loading check history…", never: "Awaiting first check", awaiting: "Awaiting a fresh check", running: "Check in progress", no_availability: "Awaiting a check", available: "Historical slot detection"};
+  return {label: "Monitoring", tone: "running", detail: checkedAgo(view?.checkedAt, now) || labels[view?.state || "unknown"]};
 }
 
 function card(job, state) {
@@ -66,10 +106,10 @@ function card(job, state) {
     <div class="job-body"><div class="job-top"><div class="job-summary"><div class="job-title"><h2>${h(job.name)}</h2><span class="job-count">${list.length} target${list.length === 1 ? "" : "s"}</span></div>
       <div class="target-chips">${list.map(target => `<span class="target-chip ${target.id === view?.slot?.target_id ? "target-chip-found" : ""}"><span><strong>${h(target.practice_name || "Practice unavailable")}</strong><span>${h([target.practitioner_name, target.motive_name].filter(Boolean).join(" · ") || "Target identity unavailable")}</span></span></span>`).join("")}</div></div>
       <div class="job-state">${badge(status.label, status.tone)}<small>${h(status.detail)}</small></div></div>
-      ${detected ? `<p class="job-evidence">${h(view.slot.practitioner_name || view.slot.practice_name || "Detected target")}${view.slot.checked_at ? ` · Checked ${h(formatSlot(view.slot.checked_at, job.time_zone))}` : ""}. Availability may have changed; opening the link does not reserve a slot.</p>` : view?.checkedAt ? `<p class="job-evidence">Checked ${h(formatSlot(view.checkedAt, job.time_zone))}</p>` : ""}
+      ${detected ? `<p class="job-evidence">${h(view.slot.practitioner_name || view.slot.practice_name || "Detected target")}. Availability may have changed; opening the link does not reserve a slot.</p>` : ""}
       ${job.status === "paused" && detected ? '<p class="job-evidence">Monitoring is paused; this detection is from a previous check.</p>' : ""}
       ${view?.warning ? `<p class="notice notice-warning">${icon("warning")}<span>${h(view.warning)}</span></p>` : ""}
-      <div class="job-meta"><span>Range: <strong>${range}</strong></span><span class="meta-dot">•</span><span>Interval: <strong>${h(pollInterval(job.interval_seconds))}</strong></span><span class="meta-dot">•</span><span>Alert: <strong>${job.telegram_enabled ? "Telegram" : "Off"}</strong></span></div>
+      <div class="job-meta"><span>Range: <strong>${range}</strong></span><span class="meta-dot">•</span><span>Interval: <strong>${h(compactDuration(job.interval_seconds))}</strong> <span title="${h(nextCheckTitle(job))}">(next: ${h(nextCheck(job, state))})</span></span><span class="meta-dot">•</span><span>Alert: <strong>${job.telegram_enabled ? "Telegram" : "Off"}</strong></span></div>
       <div class="job-actions">${[[job.status === "paused" ? "resume" : "pause", job.status === "paused" ? "play" : "pause", job.status === "paused" ? "Resume" : "Pause"], ["edit", "edit", "Edit"], ["delete", "trash", "Delete"]].map(([action, symbol, label]) => `<button class="button button-quiet" type="button" data-action="${action}" aria-label="${label} ${h(job.name)}" ${pending ? "disabled" : ""}>${icon(symbol)}<span class="action-label">${label}</span></button>`).join("")}</div>
     </div></article>`;
 }
