@@ -304,6 +304,16 @@ class DoctolibClient:
             latest = today + timedelta(days=horizon - 1)
         else:
             raise ValueError("date_mode must be first_available or custom")
+        if "effective_earliest_date" in search or "effective_latest_date" in search:
+            # Claims freeze calendar dates, while check() still filters slots
+            # against the current clock rather than a historical claim time.
+            try:
+                earliest = date.fromisoformat(search["effective_earliest_date"])
+                latest = date.fromisoformat(search["effective_latest_date"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Frozen search requires both effective calendar dates") from exc
+            if earliest > latest or (latest - earliest).days + 1 > 366:
+                raise ValueError("Frozen search has an invalid date range")
         return zone, earliest, latest
 
     @staticmethod

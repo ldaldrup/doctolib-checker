@@ -10,9 +10,9 @@ const equal = (actual, expected) => assert(JSON.stringify(actual) === JSON.strin
 const t = number => `2026-10-01T10:00:${String(number).padStart(2, '0')}Z`;
 const url = id => `https://www.doctolib.de/test-${id}/booking/availabilities?placeId=practice-${id}&motiveIds[]=1`;
 const target = id => ({id, active: 1, booking_url: url(id), last_validated_at: t(0)});
-const job = {id: 'j', targets: [target('a'), target('b')], updated_at: t(0), time_zone: 'Europe/Berlin', date_mode: 'first_available', horizon_days: 15, interval_seconds: 300, insurance_sector: 'public', telehealth: false, telegram_enabled: false, name: 'Contract'};
-const result = (id, status, extras = {}) => ({target_id: id, status, checked_at: t(12), count_complete: true, booking_url: url(id), ...(status === 'available' ? {earliest_slot: '2026-10-03T09:00:00Z'} : {}), ...extras});
-const run = (outcome, results, extras = {}) => ({id: 'r', job_id: 'j', started_at: t(10), outcome, results, ...extras});
+const job = {id: 'j', search_revision: 1, edit_version: 1, targets: [target('a'), target('b')], updated_at: t(0), time_zone: 'Europe/Berlin', date_mode: 'first_available', horizon_days: 15, interval_seconds: 300, insurance_sector: 'public', telehealth: false, telegram_enabled: false, name: 'Contract'};
+const result = (id, status, extras = {}) => ({target_id: id, search_revision: 1, snapshot_known: 1, published: 1, status, checked_at: t(12), count_complete: true, booking_url: url(id), ...(status === 'available' ? {earliest_slot: '2026-10-03T09:00:00Z'} : {}), ...extras});
+const run = (outcome, results, extras = {}) => ({id: 'r', job_id: 'j', search_revision: 1, snapshot_known: 1, search_snapshot: {targets: job.targets}, started_at: t(10), outcome, results, ...extras});
 const settings = {minimum_poll_interval_seconds: 300, time_zone: 'Europe/Berlin', telegram_configured: true};
 const draft = {...job, target_urls: job.targets.map(item => item.booking_url)};
 async function test(name, fn) {
@@ -97,22 +97,42 @@ await test('empty running/interrupted checks retain preceding historical detecti
   equal(deriveJobView(job, [run('running', [])]).state, 'running');
   assert(deriveJobView(job, [run('interrupted', [])]).state !== 'no_availability');
 });
-await test('operational edit preserves detection with uncertainty, never proves a negative', () => {
-  const edited = {...job, updated_at: t(15), status: 'paused', name: 'Renamed', interval_seconds: 600};
-  const view = deriveJobView(edited, [run('completed', [result('a', 'available'), result('b', 'no_availability')])]);
-  assert(view.detected && view.historical && view.warning.includes('earlier options'));
-  assert(deriveJobView(edited, [run('completed', [result('a', 'no_availability'), result('b', 'no_availability')])]).state !== 'no_availability');
+await test('empty running or interrupted checks do not revive contradicted older detections', () => {
+  for (const outcome of ['running', 'interrupted']) {
+    const view = deriveJobView(job, [
+      run(outcome, [], {id: 'new', started_at: t(30)}),
+      run('completed', [result('a', 'no_availability'), result('b', 'no_availability')], {id: 'negative', started_at: t(20)}),
+      run('completed', [result('a', 'available'), result('b', 'no_availability')]),
+    ]);
+    assert(!view.detected && !view.slot && !view.coverageComplete);
+    assert(view.state !== 'no_availability');
+  }
 });
-await test('search invalidation and validation timestamps require a fresh check; equality warns', () => {
-  const runs = [run('completed', [result('a', 'available'), result('b', 'no_availability')])];
-  equal(deriveJobView(job, runs, {invalidatedAt: t(15)}).state, 'awaiting');
-  equal(deriveJobView({...job, targets: [{...target('a'), last_validated_at: t(15)}, target('b')]}, runs).state, 'awaiting');
-  const equalTime = deriveJobView(job, runs, {invalidatedAt: t(10)}); assert(equalTime.historical && equalTime.warning && !equalTime.coverageComplete);
-  assert(deriveJobView({...job, updated_at: t(10)}, [run('completed', [result('a', 'no_availability'), result('b', 'no_availability')])]).state !== 'no_availability');
+await test('cosmetic edits retain proven revision evidence', () => {
+  const edited = {...job, updated_at: t(15), edit_version: 2, status: 'paused', name: 'Renamed', interval_seconds: 600};
+  const view = deriveJobView(edited, [run('completed', [result('a', 'available'), result('b', 'no_availability')])]);
+  assert(view.detected && !view.historical && !view.warning && view.coverageComplete);
+  equal(deriveJobView(edited, [run('completed', [result('a', 'no_availability'), result('b', 'no_availability')])]).state, 'no_availability');
+});
+await test('obsolete revisions retain historical positives and cannot prove current negatives', () => {
+  const edited = {...job, search_revision: 2};
+  const view = deriveJobView(edited, [run('completed', [result('a', 'available'), result('b', 'no_availability')])]);
+  assert(view.detected && view.historical && view.warning.includes('earlier search revision') && !view.coverageComplete);
+  equal(deriveJobView(edited, [run('completed', [result('a', 'no_availability'), result('b', 'no_availability')])]).state, 'awaiting');
+  // Explicit matching revisions supersede local and validation timestamps.
+  equal(deriveJobView(job, [run('completed', [result('a', 'no_availability'), result('b', 'no_availability')])], {invalidatedAt: t(15)}).state, 'no_availability');
+});
+await test('migrated unknown snapshots never assert current negative evidence', () => {
+  const legacy = extras => run('completed', [result('a', 'no_availability'), result('b', 'no_availability')], {snapshot_known: 0, search_revision: null, search_snapshot: null, ...extras});
+  equal(deriveJobView(job, [legacy()]).state, 'awaiting');
+  const view = deriveJobView(job, [legacy({results: [result('a', 'available')]})]);
+  assert(view.detected && view.historical && view.warning.includes('unknown') && !view.coverageComplete);
+  const unpublished = deriveJobView(job, [run('completed', [result('a', 'no_availability', {published: 0}), result('b', 'no_availability')])]);
+  assert(!unpublished.coverageComplete && unpublished.state !== 'no_availability');
 });
 await test('history signatures include search/target/run evidence but ignore list last_result', () => {
   equal(historyKey(job), historyKey({...job, last_result: result('a', 'available')}));
-  for (const changed of [{...job, horizon_days: 30}, {...job, targets: [target('b')]}, {...job, last_started_at: t(20)}, {...job, targets: [{...target('a'), last_validated_at: t(3)}, target('b')]}]) assert(historyKey(job) !== historyKey(changed));
+  for (const changed of [{...job, search_revision: 2}, {...job, horizon_days: 30}, {...job, targets: [target('b')]}, {...job, last_started_at: t(20)}, {...job, targets: [{...target('a'), last_validated_at: t(3)}, target('b')]}]) assert(historyKey(job) !== historyKey(changed));
 });
 await test('payload dates, URL safety, bounds, allowlisting, and Telegram preservation', async () => {
   const first = createJobPayload({...draft, earliest_date: '', latest_date: '', unsupported: true}, settings); assert(!Object.hasOwn(first, 'earliest_date') && !Object.hasOwn(first, 'unsupported'));

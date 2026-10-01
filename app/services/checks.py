@@ -1,10 +1,15 @@
 """Run one job and persist its per-target results and alert outcomes."""
 
 import logging
+from copy import deepcopy
 
 from app.models import BookingMeta
 from app.notifications import send_telegram_alert
-from app.storage.repositories import iso
+from app.storage.repositories import LeaseLostError
+
+
+class _RunStopped(Exception):
+    """A pause or deletion stops remaining requests without recording an error."""
 
 
 def _safe_error(exc):
@@ -42,7 +47,17 @@ class CheckService:
             if not current:
                 continue
             try:
-                sent, error = self.notifier(self.settings, current[0])
+                if self.notifier is send_telegram_alert:
+                    sent, error = self.notifier(
+                        self.settings, current[0],
+                        before_send=lambda: any(
+                            ready["result_id"] == current[0]["result_id"]
+                            and ready["search_revision"] == current[0]["search_revision"]
+                            for ready in self.repository.get_pending_alerts(limit=1, alert_id=alert["id"])
+                        ),
+                    )
+                else:
+                    sent, error = self.notifier(self.settings, current[0])
             except Exception:
                 # Do not persist exception text; request URLs may contain
                 # credentials supplied by an upstream notification service.
@@ -53,31 +68,36 @@ class CheckService:
         successful = 0
         failed = 0
         last_error = None
+        owner_token = job["owner_token"]
+        snapshot = job["search_snapshot"]
+        had_hook = hasattr(self.doctolib, "before_request")
+        original_hook = getattr(self.doctolib, "before_request", None)
+
+        def guard_request():
+            current = self.repository.get_job(job["id"])
+            if current is None or current["status"] != "active":
+                raise _RunStopped()
+            if not self.repository.renew_job_lock(job["id"], run_id, owner_token=owner_token):
+                raise LeaseLostError("The check claim is no longer owned")
+
+        def before_request():
+            guard_request()
+            if original_hook is not None:
+                original_hook()
+            # A reserved request turn may wait beyond the lease or a pause.
+            guard_request()
+
         try:
-            targets = self.repository.get_targets(job["id"])
-            for target_ref in targets:
-                current_job = self.repository.get_job(job["id"])
-                if current_job is None or current_job["status"] != "active":
-                    break
-                if not self.repository.renew_job_lock(job["id"], run_id):
-                    break
-                target = self.repository.get_target(job["id"], target_ref["id"])
-                if target is None:
-                    continue
-                # Edits made while a previous request was in flight apply to
-                # this target request. Never change options during one request.
-                search = {
-                    "date_mode": current_job["date_mode"],
-                    "horizon_days": current_job["horizon_days"],
-                    "earliest_date": current_job["earliest_date"],
-                    "latest_date": current_job["latest_date"],
-                    "time_zone": current_job["time_zone"],
-                    "insurance_sector": current_job["insurance_sector"],
-                    "telehealth": bool(current_job["telehealth"]),
-                }
+            self.doctolib.before_request = before_request
+            for saved_target in snapshot["targets"]:
+                guard_request()
+                target = deepcopy(saved_target)
+                search = deepcopy(snapshot["search"])
                 try:
                     result = self.doctolib.check(target["booking_url"], search, meta=self._meta(target))
-                    result_id = self.repository.insert_result(run_id, current_job, target, result)
+                    result_id = self.repository.insert_result(
+                        run_id, job, target, result, owner_token=owner_token
+                    )
                     if result.status == "error":
                         failed += 1
                         last_error = result.error_code or "doctolib_incomplete_result"
@@ -89,25 +109,42 @@ class CheckService:
                         current_job = self.repository.get_job(job["id"])
                         if (current_job and current_job["status"] == "active"
                                 and current_job["telegram_enabled"]):
-                            self.repository.create_alert(current_job, target, result_id, result.earliest_slot)
+                            self.repository.create_alert(
+                                current_job, target, result_id, result.earliest_slot, owner_token=owner_token
+                            )
                             self.dispatch_pending()
+                except (_RunStopped, LeaseLostError):
+                    break
                 except Exception as exc:
                     failed += 1
                     code, message = _safe_error(exc)
                     last_error = code
-                    self.repository.insert_error_result(run_id, current_job, target, code, message)
+                    try:
+                        self.repository.insert_error_result(
+                            run_id, job, target, code, message, owner_token=owner_token
+                        )
+                    except LeaseLostError:
+                        break
                     logging.warning("Availability check failed for target %s (%s)", target["id"], code)
+        except (_RunStopped, LeaseLostError):
+            pass
         except Exception as exc:
             failed += 1
             last_error, _message = _safe_error(exc)
             logging.error("Unable to load or process targets for job %s (%s)", job["id"], last_error)
         finally:
+            if had_hook:
+                self.doctolib.before_request = original_hook
+            else:
+                del self.doctolib.before_request
             self.repository.finish_run(
-                run_id, job["id"], successful, failed, int(job["interval_seconds"]), last_error
+                run_id, job["id"], successful, failed, int(job["interval_seconds"]), last_error,
+                owner_token=owner_token,
             )
         return {"successful_targets": successful, "failed_targets": failed}
 
     def run_due(self, limit=10):
+        self.repository.interrupt_stale_runs()
         self.dispatch_pending()
         outcomes = []
         for _ in range(limit):

@@ -2,7 +2,10 @@
 
 import time
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
+
+from app.doctolib import DoctolibClient
 
 
 def utc_now():
@@ -41,6 +44,30 @@ class ConflictError(ValueError):
     pass
 
 
+class LeaseLostError(RuntimeError):
+    pass
+
+
+SEARCH_FIELDS = ("date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth")
+TARGET_FIELDS = ("booking_url", "country", "profile_slug", "practice_id", "motive_id", "practitioner_id",
+                 "agenda_ids", "practice_name", "practitioner_name", "motive_name")
+
+
+def search_signature(job, targets):
+    search = {key: job[key] for key in SEARCH_FIELDS}
+    search["telehealth"] = bool(search["telehealth"])
+    if search["date_mode"] == "custom":
+        search["horizon_days"] = None
+    else:
+        search["earliest_date"] = search["latest_date"] = None
+    metadata = []
+    for target in targets:
+        values = {key: target.get(key) for key in TARGET_FIELDS}
+        values["agenda_ids"] = sorted(set(str(values["agenda_ids"]).split("-")))
+        metadata.append(values)
+    return json.dumps([search, sorted(metadata, key=lambda item: item["booking_url"])], sort_keys=True)
+
+
 class Repository:
     def __init__(self, database, minimum_poll_interval_seconds=300):
         self.database = database
@@ -65,7 +92,7 @@ class Repository:
             for row in rows:
                 due = max(parse_time(row["next_check_at"]), self._minimum_due(row, now))
                 conn.execute(
-                    """UPDATE jobs SET interval_seconds=?,next_check_at=?,updated_at=? WHERE id=?""",
+                    """UPDATE jobs SET interval_seconds=?,next_check_at=?,updated_at=?,edit_version=edit_version+1 WHERE id=?""",
                     (minimum_poll_interval_seconds, precise_iso(due), iso(now), row["id"]),
                 )
 
@@ -82,6 +109,7 @@ class Repository:
             return None
         item = dict(row)
         item.pop("lock_run_id", None)
+        item.pop("lock_owner_token", None)
         if conn is not None:
             item["targets"] = [dict(target) for target in conn.execute(
                 "SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (item["id"],)
@@ -144,8 +172,8 @@ class Repository:
             for row in rows:
                 job = self._job(row, conn)
                 latest = conn.execute(
-                    """SELECT status,slot_count,earliest_slot,checked_at FROM check_results
-                    WHERE job_id=? ORDER BY checked_at DESC LIMIT 1""", (job["id"],)
+                    """SELECT status,slot_count,earliest_slot,checked_at,search_revision,snapshot_known,published FROM check_results
+                    WHERE job_id=? ORDER BY checked_at DESC,rowid DESC LIMIT 1""", (job["id"],)
                 ).fetchone()
                 job["last_result"] = dict(latest) if latest else None
                 result.append(job)
@@ -159,6 +187,8 @@ class Repository:
             row = conn.execute("SELECT * FROM jobs WHERE id=? AND status != 'deleted'", (job_id,)).fetchone()
             if row is None:
                 raise NotFoundError("Job not found")
+            previous_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
+            previous_search = search_signature(dict(row), previous_targets)
             fields = ["name", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date",
                       "time_zone", "insurance_sector", "telehealth", "telegram_enabled"]
             update = {key: values[key] for key in fields if key in values}
@@ -166,8 +196,7 @@ class Repository:
                 assignments = ",".join(key + "=?" for key in update)
                 encoded = [int(value) if key in ("telehealth", "telegram_enabled") else value
                            for key, value in update.items()]
-                conn.execute("UPDATE jobs SET " + assignments + ",updated_at=? WHERE id=?",
-                             encoded + [iso(), job_id])
+                conn.execute("UPDATE jobs SET " + assignments + " WHERE id=?", encoded + [job_id])
             if targets is not None:
                 conn.execute("UPDATE targets SET active=0 WHERE job_id=?", (job_id,))
                 for target in targets:
@@ -201,10 +230,16 @@ class Repository:
                     (SELECT id FROM targets WHERE job_id=? AND active=0)""",
                     (job_id, job_id),
                 )
+            current = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+            current_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
+            search_changed = search_signature(current, current_targets) != previous_search
+            changed = search_changed or any(current[key] != row[key] for key in fields)
+            if changed:
+                conn.execute("UPDATE jobs SET search_revision=search_revision+?,edit_version=edit_version+1,updated_at=? WHERE id=?",
+                             (int(search_changed), iso(), job_id))
             due = self._minimum_due(row, utc_now())
-            # Keep an in-flight lease intact. The worker re-reads the changed
-            # settings before its next target, and finish_run schedules using
-            # the updated interval.
+            # Keep the claim intact: its immutable snapshot remains historical
+            # if edited. Durable follow-up intents are introduced in part 04.
             conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (precise_iso(due), job_id))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
@@ -228,8 +263,10 @@ class Repository:
                     WHERE job_id=? AND status IN ('pending','failed')""", (job_id,),
                 )
             lock_run_id = row["lock_run_id"] if status != "deleted" else None
-            conn.execute("UPDATE jobs SET status=?,next_check_at=?,lock_until=?,lock_run_id=?,updated_at=? WHERE id=?",
-                         (status, due, lock, lock_run_id, iso(), job_id))
+            conn.execute("""UPDATE jobs SET status=?,next_check_at=?,lock_until=?,lock_run_id=?,
+                         lock_owner_token=CASE WHEN ?='deleted' THEN NULL ELSE lock_owner_token END,
+                         edit_version=edit_version+?,updated_at=? WHERE id=?""",
+                         (status, due, lock, lock_run_id, status, int(status != row["status"]), iso(), job_id))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
     def set_job_due(self, job_id, due_at):
@@ -247,11 +284,11 @@ class Repository:
             return due
 
     def claim_due_jobs(self, limit=10):
-        now = utc_now()
-        now_text = precise_iso(now)
         claimed = []
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            now_text = precise_iso(now)
             rows = conn.execute(
                 """SELECT * FROM jobs WHERE status='active' AND next_check_at<=?
                 AND (lock_until IS NULL OR lock_until<=?) ORDER BY next_check_at LIMIT ?""",
@@ -259,18 +296,30 @@ class Repository:
             ).fetchall()
             for row in rows:
                 run_id = new_id()
+                owner_token = new_id()
+                targets = [dict(target) for target in conn.execute(
+                    "SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (row["id"],))]
+                search = {key: row[key] for key in SEARCH_FIELDS}
+                search["telehealth"] = bool(search["telehealth"])
+                _zone, earliest, latest = DoctolibClient._window(search, now)
+                search.update(effective_earliest_date=earliest.isoformat(), effective_latest_date=latest.isoformat())
+                snapshot = {"search": search, "targets": targets, "evaluated_at": precise_iso(now)}
                 changed = conn.execute(
-                    """UPDATE jobs SET lock_until=?,lock_run_id=?,last_started_at=? WHERE id=? AND status='active'
+                    """UPDATE jobs SET lock_until=?,lock_run_id=?,lock_owner_token=?,last_started_at=? WHERE id=? AND status='active'
                     AND (lock_until IS NULL OR lock_until<=?)""",
-                    (precise_iso(now + timedelta(minutes=10)), run_id, now_text, row["id"], now_text),
+                    (precise_iso(now + timedelta(minutes=10)), run_id, owner_token, now_text, row["id"], now_text),
                 ).rowcount
                 if not changed:
                     continue
                 conn.execute(
-                    "INSERT INTO check_runs(id,job_id,job_name,started_at,outcome) VALUES(?,?,?,?,?)",
-                    (run_id, row["id"], row["name"], now_text, "running"),
+                    """INSERT INTO check_runs(id,job_id,job_name,started_at,outcome,search_revision,
+                    search_snapshot,snapshot_known,owner_token) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (run_id, row["id"], row["name"], now_text, "running", row["search_revision"],
+                     json.dumps(snapshot, sort_keys=True), 1, owner_token),
                 )
-                claimed.append((run_id, dict(row)))
+                claimed_job = dict(row)
+                claimed_job.update(owner_token=owner_token, search_snapshot=snapshot)
+                claimed.append((run_id, claimed_job))
             conn.execute(
                 """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at)
                 VALUES(1,?,?) ON CONFLICT(singleton_id) DO UPDATE SET last_seen_at=excluded.last_seen_at""",
@@ -278,14 +327,33 @@ class Repository:
             )
         return claimed
 
-    def renew_job_lock(self, job_id, run_id, lease_minutes=10):
+    def renew_job_lock(self, job_id, run_id, owner_token=None, lease_minutes=10):
         """Extend this run's lease before another outbound request starts."""
         with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             changed = conn.execute(
-                """UPDATE jobs SET lock_until=? WHERE id=? AND status='active' AND lock_run_id=?""",
-                (precise_iso(utc_now() + timedelta(minutes=lease_minutes)), job_id, run_id),
+                """UPDATE jobs SET lock_until=? WHERE id=? AND status='active' AND lock_run_id=?
+                AND lock_owner_token=? AND lock_until>? AND EXISTS
+                (SELECT 1 FROM check_runs WHERE id=? AND owner_token=? AND outcome='running')""",
+                (precise_iso(now + timedelta(minutes=lease_minutes)), job_id, run_id, owner_token,
+                 precise_iso(now), run_id, owner_token),
             ).rowcount
             return changed == 1
+
+    def _owned(self, conn, job_id, run_id, owner_token):
+        if not owner_token:
+            return None
+        return conn.execute(
+            """SELECT r.* FROM check_runs r JOIN jobs j ON j.id=r.job_id WHERE r.id=? AND r.job_id=?
+            AND r.outcome='running' AND r.owner_token=? AND j.lock_owner_token=?
+            AND j.lock_run_id=r.id AND j.lock_until>?""",
+            (run_id, job_id, owner_token, owner_token, precise_iso()),
+        ).fetchone()
+
+    def owns_run(self, job_id, run_id, owner_token):
+        with self.database.connection() as conn:
+            return self._owned(conn, job_id, run_id, owner_token) is not None
 
     def get_targets(self, job_id):
         with self.database.connection() as conn:
@@ -301,24 +369,39 @@ class Repository:
             ).fetchone()
             return dict(row) if row else None
 
-    def insert_result(self, run_id, job, target, result):
+    def insert_result(self, run_id, job, target, result, *, owner_token=None):
         result_id = new_id()
         earliest_slot = iso(result.earliest_slot) if result.earliest_slot else None
         if result.status == "available" and earliest_slot is None:
             raise ValueError("An available result requires an earliest slot")
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            run = self._owned(conn, job["id"], run_id, owner_token)
+            if run is None:
+                raise LeaseLostError("Run no longer owns a live lease")
+            snapshot = json.loads(run["search_snapshot"])
+            saved_target = next((item for item in snapshot["targets"] if item["id"] == target["id"]), None)
+            if saved_target is None:
+                raise ValueError("Target is not in the run snapshot")
+            target = saved_target
+            previous = conn.execute("SELECT id FROM check_results WHERE run_id=? AND target_id=?", (run_id, target["id"])).fetchone()
+            if previous:
+                return previous["id"]
+            current = conn.execute("SELECT search_revision,status FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            active = conn.execute("SELECT active FROM targets WHERE id=? AND job_id=?", (target["id"], job["id"])).fetchone()
+            published = (current["status"] == "active" and current["search_revision"] == run["search_revision"]
+                         and active is not None and active["active"])
             conn.execute(
                 """INSERT INTO check_results
                 (id,run_id,job_id,target_id,practitioner_name,practice_name,booking_url,checked_at,status,
-                 slot_count,earliest_slot,count_complete,error_code,error_message)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 slot_count,earliest_slot,count_complete,error_code,error_message,search_revision,snapshot_known,published)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (result_id, run_id, job["id"], target["id"], target["practitioner_name"],
                  target["practice_name"], target["booking_url"], iso(), result.status, result.slot_count,
                  earliest_slot, int(result.count_complete),
-                 result.error_code, result.error_message),
+                 result.error_code, result.error_message, run["search_revision"], 1, int(published)),
             )
-            if result.status in ("available", "no_availability"):
+            if published and result.status in ("available", "no_availability"):
                 state = conn.execute(
                     "SELECT last_status,last_earliest_slot,episode FROM target_alert_state WHERE target_id=?",
                     (target["id"],),
@@ -349,13 +432,13 @@ class Repository:
                         (target["id"], current_key),
                     )
                     conn.execute(
-                        """UPDATE alerts SET result_id=? WHERE target_id=? AND dedupe_key=?
+                        """UPDATE alerts SET result_id=?,search_revision=? WHERE target_id=? AND dedupe_key=?
                         AND status IN ('pending','failed')""",
-                        (result_id, target["id"], current_key),
+                        (result_id, run["search_revision"], target["id"], current_key),
                     )
         return result_id
 
-    def insert_error_result(self, run_id, job, target, error_code, error_message):
+    def insert_error_result(self, run_id, job, target, error_code, error_message, *, owner_token=None):
         class ErrorResult:
             status = "error"
             slot_count = 0
@@ -365,7 +448,7 @@ class Repository:
         result = ErrorResult()
         result.error_code = error_code
         result.error_message = error_message
-        return self.insert_result(run_id, job, target, result)
+        return self.insert_result(run_id, job, target, result, owner_token=owner_token)
 
     def result_id(self, run_id, target_id):
         with self.database.connection() as conn:
@@ -375,29 +458,34 @@ class Repository:
             ).fetchone()
             return row["id"] if row else None
 
-    def create_alert(self, job, target, result_id, earliest_slot):
+    def create_alert(self, job, target, result_id, earliest_slot, *, owner_token=None):
         alert_id = new_id()
         slot_text = iso(earliest_slot)
         now = iso()
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            result = conn.execute("SELECT * FROM check_results WHERE id=? AND job_id=? AND target_id=?",
+                                  (result_id, job["id"], target["id"])).fetchone()
+            if (result is None or not result["published"] or result["earliest_slot"] != slot_text or
+                    self._owned(conn, job["id"], result["run_id"], owner_token) is None):
+                return None
             state = conn.execute(
                 """SELECT s.episode,s.last_status,s.last_earliest_slot,t.active,
-                j.status AS job_status,j.telegram_enabled
+                j.status AS job_status,j.telegram_enabled,j.search_revision
                 FROM target_alert_state s JOIN targets t ON t.id=s.target_id
                 JOIN jobs j ON j.id=t.job_id WHERE t.id=? AND j.id=?""",
                 (target["id"], job["id"]),
             ).fetchone()
             if (state is None or not state["active"] or state["job_status"] != "active" or
                     not state["telegram_enabled"] or state["last_status"] != "available" or
-                    state["last_earliest_slot"] != slot_text):
+                    state["last_earliest_slot"] != slot_text or state["search_revision"] != result["search_revision"]):
                 return None
             dedupe = alert_dedupe_key(target["id"], slot_text, state["episode"])
             inserted = conn.execute(
                 """INSERT OR IGNORE INTO alerts(id,job_id,target_id,result_id,channel,event_type,dedupe_key,
-                status,created_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                status,created_at,next_attempt_at,search_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (alert_id, job["id"], target["id"], result_id, "telegram", "slot_found", dedupe,
-                 "pending", now, now),
+                 "pending", now, now, result["search_revision"]),
             ).rowcount
             if inserted:
                 return alert_id
@@ -407,20 +495,24 @@ class Repository:
             if existing["status"] == "sent":
                 return None
             if existing["status"] == "cancelled":
-                conn.execute(
-                    """UPDATE alerts SET status='pending',result_id=?,next_attempt_at=?,
-                    error_summary=NULL WHERE id=?""", (result_id, now, existing["id"]),
-                )
+                reactivated = conn.execute(
+                    """UPDATE alerts SET status='pending',result_id=?,next_attempt_at=?,search_revision=?,
+                    error_summary=NULL WHERE id=? AND error_summary IN ('slot_expired','availability_disappeared','earliest_slot_changed')""",
+                    (result_id, now, result["search_revision"], existing["id"]),
+                ).rowcount
+                if not reactivated:
+                    return None
             return existing["id"]
 
     def get_pending_alerts(self, limit=20, alert_id=None):
-        now = utc_now()
         ready = []
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             rows = conn.execute(
                 """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
-                r.booking_url,r.checked_at,j.time_zone,j.status AS job_status,j.telegram_enabled,
+                r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
+                j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
                 j.interval_seconds,t.active AS target_active,s.last_status,s.last_earliest_slot
                 FROM alerts a JOIN check_results r ON r.id=a.result_id
                 JOIN jobs j ON j.id=a.job_id
@@ -436,6 +528,12 @@ class Repository:
                     reason = "job_deleted"
                 elif not alert["target_active"]:
                     reason = "target_removed"
+                elif (not alert["snapshot_known"] or not alert["published"] or
+                      alert["search_revision"] != alert["current_revision"] or
+                      alert["result_revision"] != alert["current_revision"]):
+                    # Unknown/obsolete work stays dormant until a fresh matching
+                    # result confirms it; it must not mutate current episodes.
+                    continue
                 elif not alert["earliest_slot"] or parse_time(alert["earliest_slot"]) <= now:
                     reason = "slot_expired"
                 elif (alert["last_status"] != "available" or
@@ -471,41 +569,33 @@ class Repository:
                  error_summary[:240] if error_summary else None, next_attempt, alert_id),
             )
 
-    def finish_run(self, run_id, job_id, successful, failed, interval_seconds, error=None):
-        now = utc_now()
-        outcome = "error" if failed and not successful else "partial_error" if failed else "completed"
+    def finish_run(self, run_id, job_id, successful, failed, interval_seconds, error=None, *, owner_token=None):
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            owner = conn.execute(
-                "SELECT lock_run_id FROM jobs WHERE id=?", (job_id,)
-            ).fetchone()
-            run = conn.execute(
-                "SELECT outcome FROM check_runs WHERE id=? AND job_id=?", (run_id, job_id)
-            ).fetchone()
-            if run is None or run["outcome"] != "running":
-                return
-            if owner is None or owner["lock_run_id"] != run_id:
-                conn.execute(
-                    "UPDATE check_runs SET outcome='interrupted',finished_at=? WHERE id=?",
-                    (iso(now), run_id),
-                )
-                return
-            job_row = conn.execute(
-                "SELECT interval_seconds FROM jobs WHERE id=?", (job_id,)
-            ).fetchone()
-            effective_interval = max(
-                self.minimum_poll_interval_seconds,
-                job_row["interval_seconds"] if job_row else interval_seconds,
-            )
+            now = utc_now()
+            run = self._owned(conn, job_id, run_id, owner_token)
+            if run is None:
+                return False
+            snapshot = json.loads(run["search_snapshot"])
+            target_ids = {target["id"] for target in snapshot["targets"]}
+            results = conn.execute("SELECT target_id,status FROM check_results WHERE run_id=?", (run_id,)).fetchall()
+            covered = {result["target_id"] for result in results}
+            successful = sum(result["status"] != "error" for result in results)
+            failed = sum(result["status"] == "error" for result in results)
+            outcome = ("interrupted" if covered != target_ids else
+                       "error" if failed and not successful else "partial_error" if failed else "completed")
+            job_row = conn.execute("SELECT interval_seconds FROM jobs WHERE id=?", (job_id,)).fetchone()
+            effective_interval = max(self.minimum_poll_interval_seconds, job_row["interval_seconds"])
             conn.execute(
                 "UPDATE check_runs SET finished_at=?,outcome=?,successful_targets=?,failed_targets=? WHERE id=?",
-                (iso(now), outcome, successful, failed, run_id),
+                (precise_iso(now), outcome, successful, failed, run_id),
             )
             conn.execute(
                 """UPDATE jobs SET next_check_at=CASE WHEN status='active' THEN ? ELSE next_check_at END,
-                last_finished_at=?,last_outcome=?,lock_until=NULL,lock_run_id=NULL
-                WHERE id=? AND lock_run_id=?""",
-                (precise_iso(now + timedelta(seconds=effective_interval)), precise_iso(now), outcome, job_id, run_id),
+                last_finished_at=?,last_outcome=?,lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL
+                WHERE id=? AND lock_run_id=? AND lock_owner_token=?""",
+                (precise_iso(now + timedelta(seconds=effective_interval)), precise_iso(now), outcome,
+                 job_id, run_id, owner_token),
             )
             conn.execute(
                 """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at,last_completed_run_at,last_error)
@@ -513,26 +603,32 @@ class Repository:
                 last_completed_run_at=excluded.last_completed_run_at,last_error=excluded.last_error""",
                 (iso(now), iso(now), iso(now), error[:240] if error else None),
             )
+            return True
 
     def interrupt_stale_runs(self):
-        now = iso()
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = precise_iso()
             stale = conn.execute(
-                """SELECT r.id,r.job_id FROM check_runs r LEFT JOIN jobs j ON j.id=r.job_id
+                """SELECT r.id,r.job_id,r.owner_token FROM check_runs r LEFT JOIN jobs j ON j.id=r.job_id
                 WHERE r.outcome='running' AND (j.id IS NULL OR j.lock_until IS NULL
-                OR j.lock_until<=? OR j.lock_run_id!=r.id)""", (now,)
+                OR j.lock_until<=? OR j.lock_run_id IS NOT r.id OR j.lock_owner_token IS NOT r.owner_token
+                OR r.owner_token IS NULL)""", (now,),
             ).fetchall()
             for run in stale:
                 conn.execute(
-                    "UPDATE check_runs SET outcome='interrupted',finished_at=? WHERE id=? AND outcome='running'",
+                    """UPDATE check_runs SET outcome='interrupted',finished_at=?,
+                    successful_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status!='error'),
+                    failed_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status='error')
+                    WHERE id=? AND outcome='running'""",
                     (now, run["id"]),
                 )
                 conn.execute(
-                    """UPDATE jobs SET lock_until=NULL,lock_run_id=NULL
-                    WHERE id=? AND lock_run_id=?""", (run["job_id"], run["id"]),
+                    """UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL
+                    WHERE id=? AND lock_run_id=? AND lock_owner_token IS ?""",
+                    (run["job_id"], run["id"], run["owner_token"]),
                 )
-            conn.execute("UPDATE jobs SET lock_until=NULL,lock_run_id=NULL WHERE lock_until<=?", (now,))
+            conn.execute("UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL WHERE lock_until<=?", (now,))
 
     def worker_status(self):
         with self.database.connection() as conn:
@@ -567,7 +663,7 @@ class Repository:
         with self.database.connection() as conn:
             runs = [dict(row) for row in conn.execute(
                 """SELECT id,job_id,job_name,started_at,finished_at,outcome,successful_targets,
-                failed_targets,triggered_by FROM check_runs WHERE job_id=?
+                failed_targets,triggered_by,search_revision,search_snapshot,snapshot_known FROM check_runs WHERE job_id=?
                 ORDER BY started_at DESC,rowid DESC LIMIT ? OFFSET ?""",
                 (job_id, limit, offset),
             ).fetchall()]
@@ -583,6 +679,7 @@ class Repository:
             for result in results:
                 by_run[result["run_id"]].append(dict(result))
             for run in runs:
+                run["search_snapshot"] = json.loads(run["search_snapshot"]) if run["search_snapshot"] else None
                 run["results"] = by_run[run["id"]]
             return runs
 

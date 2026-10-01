@@ -13,7 +13,7 @@ from app.models import AvailabilityResult
 from app.services.checks import CheckService
 from app.settings import Settings
 from app.storage.db import Database
-from app.storage.repositories import Repository, iso, parse_time, utc_now
+from app.storage.repositories import Repository, LeaseLostError, iso, parse_time, utc_now
 
 
 URL = (
@@ -167,14 +167,25 @@ def lock_owner(repository, job_id):
         return conn.execute("SELECT lock_run_id FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
 
 
+def claim_for_result(repository, job):
+    # Each simulated response belongs to a real immutable, live claim.
+    with repository.database.connection() as conn:
+        previous = conn.execute("SELECT lock_run_id,lock_owner_token FROM jobs WHERE id=?", (job["id"],)).fetchone()
+    if previous[0]:
+        repository.finish_run(previous[0], job["id"], 0, 0, job["interval_seconds"], owner_token=previous[1])
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (iso(utc_now()), job["id"]))
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    assert claimed["id"] == job["id"]
+    job["owner_token"] = claimed["owner_token"]
+    return run_id, claimed
+
+
 def record_result(repository, job, status, earliest_slot=None, slot_count=0):
-    target = repository.get_job(job["id"])["targets"][0]
-    run_id = repository.checks(job["id"])[0]["id"]
-    result = AvailabilityResult(
-        status=status, slot_count=slot_count, earliest_slot=earliest_slot,
-        count_complete=True,
-    )
-    result_id = repository.insert_result(run_id, job, target, result)
+    run_id, claimed = claim_for_result(repository, job)
+    target = claimed["search_snapshot"]["targets"][0]
+    result = AvailabilityResult(status=status, slot_count=slot_count, earliest_slot=earliest_slot, count_complete=True)
+    result_id = repository.insert_result(run_id, claimed, target, result, owner_token=claimed["owner_token"])
     return target, result_id
 
 
@@ -408,7 +419,7 @@ def test_pause_during_request_records_result_but_suppresses_alert(tmp_path):
     assert notifier.sent == []
 
 
-def test_edit_applies_to_next_target_request_in_same_run(tmp_path):
+def test_edit_preserves_original_options_across_targets_in_same_run(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     response = client.post("/api/v1/jobs", json={
         "name": "Two targets with changed settings",
@@ -425,8 +436,8 @@ def test_edit_applies_to_next_target_request_in_same_run(tmp_path):
 
     CheckService(repository, updating, settings, notifier=FakeNotifier()).run_due()
 
-    assert [search["insurance_sector"] for search in updating.searches] == ["public", "private"]
-    assert [search["telehealth"] for search in updating.searches] == [False, True]
+    assert [search["insurance_sector"] for search in updating.searches] == ["public", "public"]
+    assert [search["telehealth"] for search in updating.searches] == [False, False]
 
 
 def test_pause_resume_and_check_now_obey_minimum_interval_after_restart(tmp_path):
@@ -461,7 +472,7 @@ def test_edit_during_run_keeps_claim_and_uses_new_interval(tmp_path):
     assert repository.claim_due_jobs(limit=1) == []
     assert client.post("/api/v1/jobs/" + job["id"] + "/check-now").status_code == 409
 
-    repository.finish_run(run_id, job["id"], 0, 0, claimed_job["interval_seconds"])
+    repository.finish_run(run_id, job["id"], 0, 0, claimed_job["interval_seconds"], owner_token=claimed_job["owner_token"])
     current = repository.get_job(job["id"])
     assert current["interval_seconds"] == 600
     assert parse_time(current["next_check_at"]) >= utc_now() + timedelta(seconds=595)
@@ -500,10 +511,10 @@ def test_worker_claims_one_job_at_a_time_and_renews_owned_lease(tmp_path):
     run_id, _job = repository.claim_due_jobs(limit=1)[0]
     with repository.database.connection() as conn:
         conn.execute("UPDATE jobs SET lock_until=? WHERE id=?", (iso(utc_now() - timedelta(seconds=1)), first["id"]))
-    assert repository.renew_job_lock(first["id"], run_id)
-    assert not repository.renew_job_lock(first["id"], "another-run")
-    assert repository.get_job(first["id"])["lock_until"] > iso(utc_now())
-    repository.finish_run(run_id, first["id"], 0, 0, 300)
+    assert not repository.renew_job_lock(first["id"], run_id, _job["owner_token"])
+    assert not repository.renew_job_lock(first["id"], "another-run", _job["owner_token"])
+    assert repository.get_job(first["id"])["lock_until"] < iso(utc_now())
+    assert not repository.finish_run(run_id, first["id"], 0, 0, 300, owner_token=_job["owner_token"])
 
 
 def test_stale_run_is_interrupted_after_its_lease_expires(tmp_path):
@@ -521,43 +532,22 @@ def test_stale_run_is_interrupted_after_its_lease_expires(tmp_path):
     assert lock_owner(repository, job["id"]) is None
 
 
-def test_database_v1_upgrade_preserves_running_lease_owner(tmp_path):
-    path = str(tmp_path / "legacy-v1.sqlite3")
-    connection = sqlite3.connect(path)
-    connection.executescript("""
-        CREATE TABLE schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) VALUES (1);
-        CREATE TABLE jobs(
-            id TEXT PRIMARY KEY,name TEXT NOT NULL,status TEXT NOT NULL,interval_seconds INTEGER NOT NULL,
-            date_mode TEXT NOT NULL,horizon_days INTEGER,earliest_date TEXT,latest_date TEXT,
-            time_zone TEXT NOT NULL,insurance_sector TEXT NOT NULL,telehealth INTEGER NOT NULL,
-            telegram_enabled INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
-            next_check_at TEXT NOT NULL,last_started_at TEXT,last_finished_at TEXT,last_outcome TEXT,lock_until TEXT
-        );
-        CREATE TABLE check_runs(
-            id TEXT PRIMARY KEY,job_id TEXT REFERENCES jobs(id),job_name TEXT NOT NULL,
-            started_at TEXT NOT NULL,finished_at TEXT,outcome TEXT NOT NULL,
-            successful_targets INTEGER NOT NULL DEFAULT 0,failed_targets INTEGER NOT NULL DEFAULT 0,
-            triggered_by TEXT NOT NULL DEFAULT 'schedule'
-        );
-        INSERT INTO jobs VALUES(
-            'job-1','Legacy job','active',300,'first_available',15,NULL,NULL,'Europe/Berlin',
-            'public',0,0,'2026-10-01T00:00:00+00:00','2026-10-01T00:00:00+00:00',
-            '2026-10-01T00:00:00+00:00','2026-10-01T00:00:00+00:00',NULL,NULL,
-            '2026-10-01T00:10:00+00:00'
-        );
-        INSERT INTO check_runs(id,job_id,job_name,started_at,outcome)
-        VALUES('run-1','job-1','Legacy job','2026-10-01T00:00:00+00:00','running');
-    """)
-    connection.commit()
-    connection.close()
-
-    Database(path).initialize()
-
-    repository = Repository(Database(path))
-    assert lock_owner(repository, "job-1") == "run-1"
+def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    run_id, _claimed = repository.claim_due_jobs(limit=1)[0]
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        drop_revision_columns(conn)
+        conn.execute("DROP TABLE target_alert_state")
+        conn.execute("ALTER TABLE jobs DROP COLUMN lock_run_id")
+        conn.execute("UPDATE schema_version SET version=1")
+    repository.database.initialize()
+    assert lock_owner(repository, job["id"]) is None
+    run = repository.checks(job["id"])[0]
+    assert run["id"] == run_id and run["outcome"] == "interrupted"
+    assert not run["snapshot_known"] and run["search_snapshot"] is None
+    with repository.database.connection() as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -667,7 +657,7 @@ def test_failed_alert_waits_for_fresh_confirmation_then_retries(tmp_path):
     assert notifier.sent == []
     target, result_id = record_result(repository, job, "available", slot, 3)
     assert result_id != original["result_id"]
-    assert repository.create_alert(job, target, result_id, slot) == original["id"]
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"]) == original["id"]
     checker.dispatch_pending()
     assert len(notifier.sent) == 1
     assert client.get("/api/v1/alerts").json()[0]["status"] == "sent"
@@ -691,9 +681,9 @@ def test_pause_and_error_do_not_make_an_old_alert_send_without_confirmation(tmp_
         conn.execute("UPDATE check_results SET checked_at=? WHERE id=?",
                      (iso(utc_now() - timedelta(seconds=301)), alert["result_id"]))
     assert client.post("/api/v1/jobs/" + job["id"] + "/resume").status_code == 200
-    target = repository.get_job(job["id"])["targets"][0]
-    run_id = repository.checks(job["id"])[0]["id"]
-    repository.insert_error_result(run_id, job, target, "doctolib_request_error", "retry later")
+    run_id, claimed = claim_for_result(repository, job)
+    target = claimed["search_snapshot"]["targets"][0]
+    repository.insert_error_result(run_id, claimed, target, "doctolib_request_error", "retry later", owner_token=claimed["owner_token"])
     assert repository.alerts()[0]["status"] == "failed"
     checker.dispatch_pending()
     assert notifier.sent == []
@@ -748,12 +738,12 @@ def test_reappearance_alerts_again_but_count_change_does_not(tmp_path):
 
     record_result(repository, job, "no_availability")
     target, result_id = record_result(repository, job, "available", slot, 3)
-    second_id = repository.create_alert(job, target, result_id, slot)
+    second_id = repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"])
     assert second_id and second_id != first["id"]
     CheckService(repository, doctolib, settings, notifier=FakeNotifier()).dispatch_pending()
 
     target, result_id = record_result(repository, job, "available", slot, 4)
-    assert repository.create_alert(job, target, result_id, slot) is None
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"]) is None
     alerts = client.get("/api/v1/alerts").json()
     assert len(alerts) == 2
     assert all(alert["status"] == "sent" for alert in alerts)
@@ -772,7 +762,7 @@ def test_configured_minimum_applies_to_patch_and_manual_scheduling(tmp_path):
                       json={"default_interval_seconds": 300}).status_code == 422
 
     run_id, claimed = repository.claim_due_jobs(limit=1)[0]
-    repository.finish_run(run_id, job["id"], 1, 0, claimed["interval_seconds"])
+    repository.finish_run(run_id, job["id"], 1, 0, claimed["interval_seconds"], owner_token=claimed["owner_token"])
     last_finished = parse_time(repository.get_job(job["id"])["last_finished_at"])
     floor = last_finished + timedelta(seconds=600)
     assert parse_time(repository.get_job(job["id"])["next_check_at"]) >= floor
@@ -837,16 +827,17 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
             attempt_count INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,sent_at TEXT,
             error_summary TEXT,next_attempt_at TEXT
         )""")
-        conn.execute("INSERT INTO alerts_v2 SELECT * FROM alerts")
+        conn.execute("INSERT INTO alerts_v2 SELECT id,job_id,target_id,result_id,channel,event_type,dedupe_key,status,attempt_count,created_at,sent_at,error_summary,next_attempt_at FROM alerts")
         conn.execute("DROP TABLE alerts")
         conn.execute("ALTER TABLE alerts_v2 RENAME TO alerts")
         conn.execute("CREATE INDEX idx_alerts_created ON alerts(created_at DESC)")
         conn.execute("DROP TABLE target_alert_state")
+        drop_revision_columns(conn, alerts=False)
         conn.execute("UPDATE schema_version SET version=2")
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
@@ -857,7 +848,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
         old_alert = before[job["id"]]
         slot = datetime.fromisoformat(old_alert["earliest_slot"])
         target, result_id = record_result(repository, job, "available", slot, 3)
-        duplicate = repository.create_alert(job, target, result_id, slot)
+        duplicate = repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"])
         assert duplicate == (None if job == sent_job else old_alert["id"])
     assert len(repository.alerts()) == 2
 
@@ -908,3 +899,347 @@ def test_shared_request_gate_reservations_survive_repository_reopen(tmp_path, mo
         ).fetchone()[0])
     assert waits == [3.0]
     assert next_allowed == fixed_now + timedelta(seconds=6)
+
+
+def drop_revision_columns(conn, *, alerts=True):
+    conn.execute("DROP INDEX IF EXISTS idx_results_known_run_target")
+    for table, columns in {
+        "jobs": ("lock_owner_token", "search_revision", "edit_version"),
+        "check_runs": ("search_revision", "search_snapshot", "snapshot_known", "owner_token"),
+        "check_results": ("search_revision", "snapshot_known", "published"),
+        "alerts": ("search_revision",) if alerts else (),
+    }.items():
+        for column in columns:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+
+def test_effective_revision_equality_and_scheduler_versions(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    original = (job['search_revision'], job['edit_version'])
+    unchanged = client.patch('/api/v1/jobs/' + job['id'], json={'name': job['name'], 'target_urls': [URL], 'horizon_days': 40}).json()
+    assert unchanged['search_revision'] == original[0]  # Horizon is ineffective in custom mode.
+    renamed = client.patch('/api/v1/jobs/' + job['id'], json={'name': 'Renamed', 'interval_seconds': 600, 'telegram_enabled': False}).json()
+    assert renamed['search_revision'] == original[0]
+    assert renamed['edit_version'] == unchanged['edit_version'] + 1
+    revision = client.patch('/api/v1/jobs/' + job['id'], json={'insurance_sector': 'private'}).json()
+    assert revision['search_revision'] == original[0] + 1
+    version = revision['edit_version']
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    repository.renew_job_lock(job['id'], run_id, claimed['owner_token'])
+    repository.finish_run(run_id, job['id'], 0, 0, 600, owner_token=claimed['owner_token'])
+    assert repository.get_job(job['id'])['edit_version'] == version
+
+
+def test_claim_freezes_dates_and_target_metadata_and_hides_owner(tmp_path, monkeypatch):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    client.patch('/api/v1/jobs/' + job['id'], json={'date_mode': 'first_available', 'horizon_days': 15})
+    fixed = datetime(2026, 10, 1, 21, 59, tzinfo=timezone.utc)
+    monkeypatch.setattr('app.storage.repositories.utc_now', lambda: fixed)
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    snapshot = claimed['search_snapshot']
+    assert snapshot['search']['effective_earliest_date'] == '2026-10-01'
+    assert snapshot['search']['effective_latest_date'] == '2026-10-15'
+    assert claimed['owner_token'] != run_id
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE targets SET practitioner_name='Changed after claim' WHERE job_id=?", (job['id'],))
+    assert snapshot['targets'][0]['practitioner_name'] == 'Dr. Ada Beispiel'
+    payload = client.get('/api/v1/jobs/' + job['id'] + '/checks').json()
+    assert payload[0]['snapshot_known']
+    assert isinstance(payload[0]['search_snapshot'], dict)
+    assert claimed['owner_token'] not in json.dumps(payload)
+    assert claimed['owner_token'] not in client.get('/api/v1/jobs/' + job['id']).text
+
+
+def test_obsolete_response_is_history_only_and_does_not_cancel_pending(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    pending = repository.alerts()[0]
+    run_id, claimed = claim_for_result(repository, job)
+    target = claimed['search_snapshot']['targets'][0]
+    client.patch('/api/v1/jobs/' + job['id'], json={'insurance_sector': 'private'})
+    result = AvailabilityResult(status='no_availability', slot_count=0, earliest_slot=None, count_complete=True)
+    result_id = repository.insert_result(run_id, claimed, target, result, owner_token=claimed['owner_token'])
+    history = repository.checks(job['id'])[0]['results'][0]
+    assert history['id'] == result_id and not history['published']
+    assert history['search_revision'] == claimed['search_revision']
+    assert repository.alerts()[0]['status'] == pending['status']
+    assert repository.get_pending_alerts() == []
+    with repository.database.connection() as conn:
+        assert conn.execute('SELECT last_status FROM target_alert_state WHERE target_id=?', (target['id'],)).fetchone()[0] == 'available'
+
+
+def test_expired_owner_cannot_publish_renew_or_finalize_after_reclaim(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    old_run, old = repository.claim_due_jobs(limit=1)[0]
+    with repository.database.connection() as conn:
+        conn.execute('UPDATE jobs SET lock_until=? WHERE id=?', (iso(utc_now() - timedelta(seconds=1)), job['id']))
+    assert not repository.renew_job_lock(job['id'], old_run, old['owner_token'])
+    repository.interrupt_stale_runs()
+    new_run, new = repository.claim_due_jobs(limit=1)[0]
+    assert new['owner_token'] != old['owner_token']
+    result = AvailabilityResult(status='no_availability', slot_count=0, earliest_slot=None, count_complete=True)
+    with pytest.raises(LeaseLostError):
+        repository.insert_result(old_run, old, old['search_snapshot']['targets'][0], result, owner_token=old['owner_token'])
+    assert not repository.finish_run(old_run, job['id'], 1, 0, 300, owner_token=old['owner_token'])
+    assert lock_owner(repository, job['id']) == new_run
+    assert repository.checks(job['id'])[0]['outcome'] == 'running'
+
+
+def test_partial_snapshot_coverage_cannot_be_completed_by_claimed_counters(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    assert repository.finish_run(run_id, job['id'], 1, 0, 300, owner_token=claimed['owner_token'])
+    run = repository.checks(job['id'])[0]
+    assert run['outcome'] == 'interrupted'
+    assert run['successful_targets'] == 0
+
+
+def test_unknown_schema_fails_without_creating_checker_tables(tmp_path):
+    path = tmp_path / 'future.sqlite3'
+    with sqlite3.connect(path) as conn:
+        conn.executescript('CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(99); CREATE TABLE private_future(value TEXT);')
+    with pytest.raises(RuntimeError, match='Unsupported'):
+        Database(str(path)).initialize()
+    with sqlite3.connect(path) as conn:
+        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'schema_version', 'private_future'}
+        assert conn.execute('SELECT version FROM schema_version').fetchone()[0] == 99
+
+
+def test_blocked_inflight_response_after_narrowing_cannot_notify(tmp_path):
+    import threading
+    client, repository, settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    class BlockedDoctolib(DoctolibClient):
+        def check(self, booking_url, search, meta=None, now=None):
+            entered.set()
+            assert release.wait(5)
+            return AvailabilityResult(status='available', slot_count=1,
+                                      earliest_slot=datetime(2026, 10, 15, 7, 30, tzinfo=timezone.utc),
+                                      count_complete=True)
+
+    notifier = FakeNotifier()
+    checker = CheckService(repository, BlockedDoctolib(), settings, notifier=notifier)
+    def run():
+        try:
+            checker.run_due()
+        except BaseException as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        edited = client.patch('/api/v1/jobs/' + job['id'], json={'latest_date': '2026-10-12'})
+        assert edited.status_code == 200
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors
+    assert notifier.sent == [] and repository.alerts() == []
+    historical = repository.checks(job['id'])[0]['results'][0]
+    assert historical['status'] == 'available' and not historical['published']
+    assert historical['search_revision'] != repository.get_job(job['id'])['search_revision']
+    with repository.database.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM target_alert_state').fetchone()[0] == 0
+        conn.execute('UPDATE jobs SET next_check_at=? WHERE id=?', (iso(utc_now()), job['id']))
+    CheckService(repository, FixtureDoctolib(no_availability=True), settings, notifier=notifier).run_due()
+    fresh = repository.checks(job['id'])[0]['results'][0]
+    assert fresh['status'] == 'no_availability' and fresh['published']
+    assert fresh['search_revision'] == edited.json()['search_revision']
+
+
+def test_equivalent_target_order_is_noop_but_effective_metadata_changes_revision(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    second_url = URL + '&source=second'
+    job = client.patch('/api/v1/jobs/' + job['id'], json={'target_urls': [URL, second_url]}).json()
+    reordered = client.patch('/api/v1/jobs/' + job['id'], json={'target_urls': [second_url, URL]}).json()
+    assert (reordered['search_revision'], reordered['edit_version']) == (job['search_revision'], job['edit_version'])
+    targets = []
+    for target in reordered['targets']:
+        target = dict(target)
+        target['agenda_ids_str'] = target['agenda_ids']
+        target['practitioner_name'] = 'Updated effective label'
+        targets.append(target)
+    changed = repository.update_job(job['id'], {}, targets=targets)
+    assert changed['search_revision'] == job['search_revision'] + 1
+
+
+def test_legacy_pending_needs_reconfirmation_while_sent_dedupe_survives_revision(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    original = repository.alerts()[0]
+    with repository.database.connection() as conn:
+        conn.execute('UPDATE alerts SET search_revision=NULL,next_attempt_at=? WHERE id=?', (iso(utc_now()), original['id']))
+        conn.execute('UPDATE check_results SET search_revision=NULL,snapshot_known=0,published=0 WHERE id=?', (original['result_id'],))
+    notifier = FakeNotifier()
+    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    checker.dispatch_pending()
+    assert notifier.sent == []
+    slot = datetime.fromisoformat(original['earliest_slot'])
+    target, result_id = record_result(repository, job, 'available', slot, 3)
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) == original['id']
+    checker.dispatch_pending()
+    assert len(notifier.sent) == 1
+    client.patch('/api/v1/jobs/' + job['id'], json={'insurance_sector': 'private'})
+    target, result_id = record_result(repository, job, 'available', slot, 3)
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) is None
+    checker.dispatch_pending()
+    assert len(notifier.sent) == 1 and len(repository.alerts()) == 1
+
+
+def test_request_after_midnight_uses_claim_calendar_and_live_slot_clock(tmp_path, monkeypatch):
+    client, repository, _settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    client.patch('/api/v1/jobs/' + job['id'], json={'date_mode': 'first_available', 'horizon_days': 15})
+    before_midnight = datetime(2026, 10, 1, 21, 59, tzinfo=timezone.utc)
+    after_midnight = datetime(2026, 10, 1, 22, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr('app.storage.repositories.utc_now', lambda: before_midnight)
+    _run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    search = claimed['search_snapshot']['search']
+    meta = doctolib.resolve(URL)
+    doctolib.fixture_session.calls.clear()
+    result = doctolib.check(URL, search, meta=meta, now=after_midnight)
+    assert result.status == 'available'
+    assert doctolib.fixture_session.calls[0][1]['params']['start_date'] == '2026-10-01'
+    assert DoctolibClient._window(search, after_midnight)[2].isoformat() == '2026-10-15'
+
+
+@pytest.mark.parametrize('boundary', ['gate_wait', 'retry'])
+def test_lease_is_rechecked_after_gate_wait_and_before_retry(tmp_path, monkeypatch, boundary):
+    client, repository, settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    fixed = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+    clock = [fixed]
+    monkeypatch.setattr('app.storage.repositories.utc_now', lambda: clock[0])
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (iso(fixed), job["id"]))
+    calls = []
+    class ExpiringSession:
+        def get(self, url, **kwargs):
+            calls.append(url)
+            clock[0] += timedelta(minutes=11)
+            return FixtureResponse({}, status_code=503)
+    def waiting_hook():
+        clock[0] += timedelta(minutes=11)
+    doctor = DoctolibClient(session=ExpiringSession(), before_request=waiting_hook if boundary == 'gate_wait' else None)
+    monkeypatch.setattr('app.doctolib.time_module.sleep', lambda seconds: None)
+    checker = CheckService(repository, doctor, settings, notifier=FakeNotifier())
+    checker.run_due(limit=1)
+    assert len(calls) == (0 if boundary == 'gate_wait' else 1)
+    assert repository.checks(job['id'])[0]['results'] == []
+    repository.interrupt_stale_runs()
+    assert repository.checks(job['id'])[0]['outcome'] == 'interrupted'
+
+
+def test_default_telegram_retry_rechecks_revision_after_backoff(tmp_path, monkeypatch):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    alert = repository.alerts()[0]
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), alert["id"]))
+    attempts = []
+
+    class TimingOutTelegram:
+        def post(self, endpoint, **kwargs):
+            attempts.append(1)
+            raise requests.Timeout()
+
+    def edit_during_backoff(_seconds):
+        edited = client.patch("/api/v1/jobs/" + job["id"], json={"insurance_sector": "private"})
+        assert edited.status_code == 200
+
+    monkeypatch.setattr("app.notifications.requests.Session", TimingOutTelegram)
+    monkeypatch.setattr("app.notifications.time.sleep", edit_during_backoff)
+    # Exercise the real default sender, including CheckService's callback wiring.
+    CheckService(repository, doctolib, settings).dispatch_pending()
+    assert len(attempts) == 1
+    current = repository.alerts()[0]
+    assert current["status"] == "failed"
+    assert current["error_summary"] == "alert_no_longer_eligible"
+    assert repository.get_pending_alerts() == []
+
+
+def test_periodic_stale_reconciliation_preserves_actual_terminal_counts(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    response = client.patch("/api/v1/jobs/" + job["id"], json={
+        "target_urls": [URL, URL + "&source=second", URL + "&source=third"],
+        "telegram_enabled": False,
+    })
+    assert response.status_code == 200
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    targets = claimed["search_snapshot"]["targets"]
+    repository.insert_result(run_id, claimed, targets[0],
+                             AvailabilityResult(status="no_availability", slot_count=0,
+                                                earliest_slot=None, count_complete=True),
+                             owner_token=claimed["owner_token"])
+    repository.insert_error_result(run_id, claimed, targets[1], "doctolib_request_error", "retry later",
+                                   owner_token=claimed["owner_token"])
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE jobs SET lock_until=?,next_check_at=? WHERE id=?",
+                     (iso(utc_now() - timedelta(seconds=1)), iso(utc_now() + timedelta(hours=1)), job["id"]))
+    # A normal tick must reconcile without restart or another claim.
+    assert CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due() == []
+    run = repository.checks(job["id"])[0]
+    assert run["id"] == run_id and run["outcome"] == "interrupted"
+    assert (run["successful_targets"], run["failed_targets"]) == (1, 1)
+    assert len(run["results"]) == 2
+    assert lock_owner(repository, job["id"]) is None
+
+
+def test_worker_uses_snapshot_metadata_for_each_target_after_midrun_edit(tmp_path):
+    client, repository, settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    response = client.patch("/api/v1/jobs/" + job["id"], json={
+        "target_urls": [URL, URL + "&source=second"], "telegram_enabled": False,
+    })
+    assert response.status_code == 200
+    observed = []
+
+    class MetadataEditingDoctolib(DoctolibClient):
+        def check(self, booking_url, search, meta=None, now=None):
+            observed.append((meta.practitioner_name, meta.agenda_ids_str))
+            if len(observed) == 1:
+                targets = repository.get_job(job["id"])["targets"]
+                for target in targets:
+                    target["practitioner_name"] = "Edited practitioner"
+                    target["agenda_ids_str"] = "9999"
+                repository.update_job(job["id"], {}, targets=targets)
+            return AvailabilityResult(status="no_availability", slot_count=0,
+                                      earliest_slot=None, count_complete=True)
+
+    CheckService(repository, MetadataEditingDoctolib(), settings, notifier=FakeNotifier()).run_due()
+    assert observed == [("Dr. Ada Beispiel", "1234"), ("Dr. Ada Beispiel", "1234")]
+    run = repository.checks(job["id"])[0]
+    assert len(run["results"]) == 2
+    assert all(result["practitioner_name"] == "Dr. Ada Beispiel" and not result["published"]
+               for result in run["results"])
+
+
+def test_same_claim_cannot_overwrite_terminal_target_evidence(tmp_path):
+    client, repository, _settings, _doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    run_id, claimed = repository.claim_due_jobs(limit=1)[0]
+    target = claimed["search_snapshot"]["targets"][0]
+    first = repository.insert_result(run_id, claimed, target,
+                                    AvailabilityResult(status="no_availability", slot_count=0,
+                                                       earliest_slot=None, count_complete=True),
+                                    owner_token=claimed["owner_token"])
+    repeated = repository.insert_result(run_id, claimed, target,
+                                       AvailabilityResult(status="available", slot_count=1,
+                                                          earliest_slot=datetime(2026, 10, 15, tzinfo=timezone.utc),
+                                                          count_complete=True),
+                                       owner_token=claimed["owner_token"])
+    assert repeated == first
+    results = repository.checks(job["id"])[0]["results"]
+    assert len(results) == 1 and results[0]["status"] == "no_availability"
