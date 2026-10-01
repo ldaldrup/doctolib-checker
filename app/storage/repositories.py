@@ -3,6 +3,7 @@
 import time
 import uuid
 import json
+import math
 from datetime import datetime, timedelta, timezone
 
 from app.doctolib import DoctolibClient
@@ -433,7 +434,7 @@ class Repository:
                     )
                     conn.execute(
                         """UPDATE alerts SET result_id=?,search_revision=? WHERE target_id=? AND dedupe_key=?
-                        AND status IN ('pending','failed')""",
+                        AND status IN ('pending','failed') AND claim_owner_token IS NULL""",
                         (result_id, run["search_revision"], target["id"], current_key),
                     )
         return result_id
@@ -497,77 +498,260 @@ class Repository:
             if existing["status"] == "cancelled":
                 reactivated = conn.execute(
                     """UPDATE alerts SET status='pending',result_id=?,next_attempt_at=?,search_revision=?,
-                    error_summary=NULL WHERE id=? AND error_summary IN ('slot_expired','availability_disappeared','earliest_slot_changed')""",
+                    error_summary=NULL WHERE id=? AND claim_owner_token IS NULL AND delivery_state IN ('ready','retry') AND error_summary IN ('slot_expired','availability_disappeared','earliest_slot_changed')""",
                     (result_id, now, result["search_revision"], existing["id"]),
                 ).rowcount
                 if not reactivated:
                     return None
             return existing["id"]
 
-    def get_pending_alerts(self, limit=20, alert_id=None):
-        ready = []
-        with self.database.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            rows = conn.execute(
-                """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
-                r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
-                j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
-                j.interval_seconds,t.active AS target_active,s.last_status,s.last_earliest_slot
-                FROM alerts a JOIN check_results r ON r.id=a.result_id
-                JOIN jobs j ON j.id=a.job_id
-                LEFT JOIN targets t ON t.id=a.target_id
-                LEFT JOIN target_alert_state s ON s.target_id=a.target_id
-                WHERE a.status IN ('pending','failed') AND (? IS NULL OR a.id=?)
-                ORDER BY a.created_at""", (alert_id, alert_id),
-            ).fetchall()
-            for row in rows:
-                alert = dict(row)
-                reason = None
-                if alert["job_status"] == "deleted":
-                    reason = "job_deleted"
-                elif not alert["target_active"]:
-                    reason = "target_removed"
-                elif (not alert["snapshot_known"] or not alert["published"] or
-                      alert["search_revision"] != alert["current_revision"] or
-                      alert["result_revision"] != alert["current_revision"]):
-                    # Unknown/obsolete work stays dormant until a fresh matching
-                    # result confirms it; it must not mutate current episodes.
-                    continue
-                elif not alert["earliest_slot"] or parse_time(alert["earliest_slot"]) <= now:
-                    reason = "slot_expired"
-                elif (alert["last_status"] != "available" or
-                      alert["last_earliest_slot"] != alert["earliest_slot"]):
-                    reason = "availability_changed"
-                if reason:
-                    conn.execute(
-                        """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary=?
-                        WHERE id=? AND status IN ('pending','failed')""", (reason, alert["id"]),
-                    )
-                    continue
-                if (alert["job_status"] != "active" or not alert["telegram_enabled"] or
-                        now - parse_time(alert["checked_at"]) > timedelta(seconds=alert["interval_seconds"]) or
-                        (alert["next_attempt_at"] and parse_time(alert["next_attempt_at"]) > now)):
-                    continue
-                ready.append(alert)
-                if len(ready) >= limit:
-                    break
-        return ready
+    @staticmethod
+    def _delivery_rows(conn, alert_id=None):
+        return conn.execute(
+            """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
+            r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
+            j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
+            j.interval_seconds,t.active AS target_active,s.last_status,s.last_earliest_slot
+            FROM alerts a JOIN check_results r ON r.id=a.result_id
+            JOIN jobs j ON j.id=a.job_id LEFT JOIN targets t ON t.id=a.target_id
+            LEFT JOIN target_alert_state s ON s.target_id=a.target_id
+            WHERE (? IS NULL OR a.id=?) ORDER BY COALESCE(a.next_attempt_at,a.created_at),a.created_at,a.rowid""",
+            (alert_id, alert_id),
+        ).fetchall()
 
-    def finish_alert(self, alert_id, sent, error_summary=None):
+    @staticmethod
+    def _delivery_eligible(alert, now):
+        return (alert['status'] in ('pending', 'failed') and alert['job_status'] == 'active'
+                and alert['telegram_enabled'] and alert['target_active']
+                and alert['snapshot_known'] and alert['published']
+                and alert['search_revision'] == alert['current_revision'] == alert['result_revision']
+                and alert['earliest_slot'] and parse_time(alert['earliest_slot']) > now
+                and alert['last_status'] == 'available' and alert['last_earliest_slot'] == alert['earliest_slot']
+                and now - parse_time(alert['checked_at']) <= timedelta(seconds=alert['interval_seconds']))
+
+    @staticmethod
+    def _delivery_budget(alert, now):
+        return (alert['delivery_epoch_attempts'] < 5 and
+                now - parse_time(alert['delivery_epoch_at'] or alert['created_at']) < timedelta(hours=24))
+
+    @staticmethod
+    def _public_alert(alert):
+        alert = dict(alert)
+        for key in ('claim_owner_token', 'claim_result_id', 'claim_search_revision'):
+            alert.pop(key, None)
+        return alert
+
+    @staticmethod
+    def _cancel_invalid_deliveries(conn, rows, now):
+        for row in rows:
+            if row['status'] not in ('pending', 'failed') or row['attempt_started_at']:
+                continue
+            reason = None
+            if row['job_status'] == 'deleted':
+                reason = 'job_deleted'
+            elif not row['target_active']:
+                reason = 'target_removed'
+            elif (row['snapshot_known'] and row['published'] and
+                  row['search_revision'] == row['current_revision'] == row['result_revision']):
+                if not row['earliest_slot'] or parse_time(row['earliest_slot']) <= now:
+                    reason = 'slot_expired'
+                elif row['last_status'] != 'available' or row['last_earliest_slot'] != row['earliest_slot']:
+                    reason = 'availability_changed'
+            if reason:
+                conn.execute("UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary=? WHERE id=?",
+                             (reason, row['id']))
+
+    def get_pending_alerts(self, limit=20, alert_id=None):
+        """Eligible preview with invalid-event cleanup; never authorizes delivery."""
         with self.database.connection() as conn:
-            row = conn.execute("SELECT attempt_count FROM alerts WHERE id=?", (alert_id,)).fetchone()
-            if row is None:
-                return
-            attempt = row["attempt_count"] + 1
-            delay = min(300, 2 ** min(attempt, 8))
-            next_attempt = None if sent else iso(utc_now() + timedelta(seconds=delay))
-            conn.execute(
-                """UPDATE alerts SET status=?,attempt_count=?,sent_at=?,error_summary=?,next_attempt_at=?
-                WHERE id=? AND status IN ('pending','failed')""",
-                ("sent" if sent else "failed", attempt, iso() if sent else None,
-                 error_summary[:240] if error_summary else None, next_attempt, alert_id),
-            )
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            self._cancel_invalid_deliveries(conn, self._delivery_rows(conn, alert_id), now)
+            return [self._public_alert(row) for row in self._delivery_rows(conn, alert_id)
+                    if row['delivery_state'] in ('ready', 'retry') and not row['claim_owner_token']
+                    and self._delivery_eligible(row, now) and self._delivery_budget(row, now)
+                    and (not row['next_attempt_at'] or parse_time(row['next_attempt_at']) <= now)][:limit]
+
+    @staticmethod
+    def _release_delivery(conn, alert_id, state, outcome=None):
+        conn.execute("""UPDATE alerts SET delivery_state=?,claim_owner_token=NULL,claim_until=NULL,
+                     claim_result_id=NULL,claim_search_revision=NULL,attempt_started_at=NULL,
+                     last_attempt_outcome=COALESCE(?,last_attempt_outcome) WHERE id=?""",
+                     (state, outcome, alert_id))
+
+    def reconcile_alert_claims(self):
+        with self.database.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            rows = conn.execute("SELECT * FROM alerts WHERE claim_owner_token IS NOT NULL AND claim_until<=?",
+                                (precise_iso(now),)).fetchall()
+            for row in rows:
+                attempted = bool(row['attempt_started_at'])
+                self._release_delivery(conn, row['id'], 'uncertain' if attempted else
+                                       ('retry' if row['attempt_count'] else 'ready'),
+                                       'uncertain' if attempted else None)
+                if attempted:
+                    conn.execute("""UPDATE alerts SET status=CASE WHEN status IN ('sent','cancelled') THEN status ELSE 'failed' END,
+                                 next_attempt_at=NULL,error_summary='delivery_acknowledgement_unknown' WHERE id=?""", (row['id'],))
+            return len(rows)
+
+    def claim_alert(self, lease_seconds=120):
+        if not 30 <= lease_seconds <= 300:
+            raise ValueError('Delivery lease must be between 30 and 300 seconds')
+        with self.database.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            self._cancel_invalid_deliveries(conn, self._delivery_rows(conn), now)
+            for row in self._delivery_rows(conn):
+                if row['status'] not in ('pending', 'failed') or row['claim_owner_token']:
+                    continue
+                if row['delivery_state'] not in ('ready', 'retry'):
+                    continue
+                if not self._delivery_budget(row, now):
+                    conn.execute("UPDATE alerts SET delivery_state='exhausted',next_attempt_at=NULL WHERE id=?", (row['id'],))
+                    continue
+                if not self._delivery_eligible(row, now):
+                    # Invalid evidence is dormant: a current fresh result may
+                    # confirm the same episode without creating another event.
+                    continue
+                if row['next_attempt_at'] and parse_time(row['next_attempt_at']) > now:
+                    continue
+                token = new_id()
+                conn.execute("""UPDATE alerts SET claim_owner_token=?,claim_until=?,claim_result_id=result_id,
+                             claim_search_revision=search_revision,attempt_started_at=NULL WHERE id=?""",
+                             (token, precise_iso(now + timedelta(seconds=lease_seconds)), row['id']))
+                alert = self._public_alert(row)
+                alert['owner_token'] = token
+                alert['claim_until'] = precise_iso(now + timedelta(seconds=lease_seconds))
+                return alert
+        return None
+
+    def begin_alert_attempt(self, alert_id, owner_token, wait_seconds=10):
+        wait_seconds = float(wait_seconds)
+        if not math.isfinite(wait_seconds):
+            raise ValueError('Delivery guard wait must be finite')
+        wait_ms = int(min(10, max(0, wait_seconds)) * 1000)
+        with self.database.connection() as conn:
+            # Set the bounded guard wait before obtaining the writer lock.
+            # The transport passes its remaining total work budget here.
+            conn.execute(f'PRAGMA busy_timeout={wait_ms}')
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            rows = self._delivery_rows(conn, alert_id)
+            if not rows:
+                return None
+            row = rows[0]
+            if (not owner_token or row['claim_owner_token'] != owner_token or not row['claim_until']
+                    or parse_time(row['claim_until']) <= now or row['attempt_started_at']):
+                return None
+            if (row['claim_result_id'] != row['result_id'] or row['claim_search_revision'] != row['search_revision']
+                    or not self._delivery_eligible(row, now) or not self._delivery_budget(row, now)):
+                self._release_delivery(conn, alert_id, 'exhausted' if not self._delivery_budget(row, now)
+                                       else ('retry' if row['attempt_count'] else 'ready'))
+                return None
+            conn.execute("""UPDATE alerts SET attempt_count=attempt_count+1,delivery_epoch_attempts=delivery_epoch_attempts+1,attempt_started_at=?,last_attempt_at=?,
+                         last_attempt_outcome='started',delivery_epoch_at=COALESCE(delivery_epoch_at,created_at)
+                         WHERE id=?""", (precise_iso(now), precise_iso(now), alert_id))
+            alert = self._public_alert(row)
+            alert['attempt_count'] += 1
+            alert['delivery_epoch_attempts'] += 1
+            alert['owner_token'] = owner_token
+            return alert
+
+    def finish_unstarted_delivery(self, alert_id, owner_token, outcome, error_code=None, retry_after=None):
+        """Release a proven pre-network failure without counting an attempt."""
+        if outcome not in ('retry', 'action_required'):
+            raise ValueError('Unstarted delivery must be retryable or action-required')
+        if error_code and (len(error_code) > 80 or not all(c.isalnum() or c == '_' for c in error_code)):
+            raise ValueError('Delivery error must be a safe machine code')
+        with self.database.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            row = conn.execute('SELECT * FROM alerts WHERE id=?', (alert_id,)).fetchone()
+            if (row is None or not owner_token or row['claim_owner_token'] != owner_token
+                    or row['attempt_started_at'] or not row['claim_until']
+                    or parse_time(row['claim_until']) <= now):
+                return False
+            state = outcome
+            next_attempt = None
+            if outcome == 'retry':
+                state = 'retry' if self._delivery_budget(row, now) else 'exhausted'
+                delay = 5
+                if retry_after is not None:
+                    delay = min(900, max(5, float(retry_after)))
+                if state == 'retry':
+                    next_attempt = precise_iso(now + timedelta(seconds=delay))
+            self._release_delivery(conn, alert_id, state)
+            conn.execute("""UPDATE alerts SET status=CASE WHEN status='cancelled' THEN status ELSE 'failed' END,
+                         next_attempt_at=?,error_summary=? WHERE id=?""", (next_attempt, error_code, alert_id))
+            return True
+
+    def finish_delivery(self, alert_id, owner_token, outcome, error_code=None, retry_after=None):
+        if outcome not in ('sent', 'retry', 'action_required', 'uncertain'):
+            raise ValueError('Unknown delivery outcome')
+        # Store only a bounded machine code; provider response bodies and URLs
+        # are never delivery history.
+        if error_code and (len(error_code) > 80 or not all(c.isalnum() or c == '_' for c in error_code)):
+            raise ValueError('Delivery error must be a safe machine code')
+        with self.database.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            row = conn.execute('SELECT * FROM alerts WHERE id=?', (alert_id,)).fetchone()
+            if (row is None or not owner_token or row['claim_owner_token'] != owner_token
+                    or not row['attempt_started_at'] or parse_time(row['claim_until']) <= now):
+                return False
+            state = outcome
+            next_attempt = None
+            if outcome == 'retry':
+                state = 'retry' if self._delivery_budget(row, now) else 'exhausted'
+                delay = min(900, 5 * 2 ** max(0, row['delivery_epoch_attempts'] - 1))
+                if retry_after is not None:
+                    delay = max(delay, min(900, max(5, float(retry_after))))
+                if state == 'retry':
+                    next_attempt = precise_iso(now + timedelta(seconds=delay))
+            self._release_delivery(conn, alert_id, state, outcome)
+            conn.execute("""UPDATE alerts SET status=?,sent_at=?,next_attempt_at=?,error_summary=? WHERE id=?""",
+                         ('cancelled' if row['status'] == 'cancelled' else ('sent' if outcome == 'sent' else 'failed'),
+                          precise_iso(now) if outcome == 'sent' else None, next_attempt, error_code, alert_id))
+            return True
+
+    def recover_alert(self, alert_id, acknowledge_duplicate_risk=False):
+        with self.database.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = utc_now()
+            rows = self._delivery_rows(conn, alert_id)
+            if not rows:
+                raise NotFoundError('Alert not found')
+            row = rows[0]
+            if row['status'] == 'sent' or row['delivery_state'] not in ('action_required', 'exhausted', 'uncertain'):
+                raise ConflictError('Alert is not recoverable')
+            if row['delivery_state'] == 'uncertain' and not acknowledge_duplicate_risk:
+                raise ConflictError('Uncertain delivery requires duplicate-risk acknowledgement')
+            if row['claim_owner_token']:
+                raise ConflictError('Alert is still claimed')
+            if not self._delivery_eligible(row, now):
+                return False
+            self._release_delivery(conn, alert_id, 'ready')
+            conn.execute("""UPDATE alerts SET status='pending',delivery_epoch_attempts=0,delivery_epoch_at=?,next_attempt_at=?,
+                         error_summary=NULL WHERE id=?""", (precise_iso(now), precise_iso(now), alert_id))
+            return True
+
+    def touch_dispatcher(self, last_error=None):
+        if last_error and (len(last_error) > 80 or not all(c.isalnum() or c == '_' for c in last_error)):
+            raise ValueError('Dispatcher error must be a safe machine code')
+        now = iso()
+        with self.database.connection() as conn:
+            conn.execute("""INSERT INTO dispatcher_heartbeat(singleton_id,started_at,last_seen_at,last_error)
+                         VALUES(1,?,?,?) ON CONFLICT(singleton_id) DO UPDATE SET
+                         last_seen_at=excluded.last_seen_at,last_error=excluded.last_error""", (now, now, last_error))
+
+    def dispatcher_status(self):
+        with self.database.connection() as conn:
+            heartbeat = conn.execute('SELECT * FROM dispatcher_heartbeat WHERE singleton_id=1').fetchone()
+            rows = conn.execute("""SELECT CASE WHEN claim_owner_token IS NOT NULL THEN 'in_flight' ELSE delivery_state END AS delivery_state,COUNT(*) AS count FROM alerts
+                                WHERE status IN ('pending','failed') GROUP BY 1""").fetchall()
+            return {'heartbeat': dict(heartbeat) if heartbeat else None,
+                    'backlog': {**dict.fromkeys(('ready', 'retry', 'in_flight', 'action_required', 'exhausted', 'uncertain'), 0), **{row['delivery_state']: row['count'] for row in rows}}}
 
     def finish_run(self, run_id, job_id, successful, failed, interval_seconds, error=None, *, owner_token=None):
         with self.database.connection() as conn:
@@ -656,7 +840,7 @@ class Repository:
                 "SELECT MIN(next_check_at) FROM jobs WHERE status='active'"
             ).fetchone()[0]
             return {"active_jobs": counts["active_jobs"] or 0, "paused_jobs": counts["paused_jobs"] or 0,
-                    "worker": self.worker_status(), "last_completed_run": dict(last_run) if last_run else None,
+                    "worker": self.worker_status(), "dispatcher": self.dispatcher_status()["heartbeat"], "delivery_backlog": self.dispatcher_status()["backlog"], "last_completed_run": dict(last_run) if last_run else None,
                     "next_check_at": next_check}
 
     def checks(self, job_id, limit=50, offset=0):
@@ -695,7 +879,7 @@ class Repository:
 
     def alerts(self, limit=50, offset=0):
         with self.database.connection() as conn:
-            return [dict(row) for row in conn.execute(
+            return [self._public_alert(row) for row in conn.execute(
                 """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
                 r.booking_url,j.name AS job_name,j.time_zone
                 FROM alerts a

@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Database:
@@ -18,7 +18,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4):
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" +
                 """
@@ -132,7 +132,17 @@ class Database:
                     sent_at TEXT,
                     error_summary TEXT,
                     next_attempt_at TEXT,
-                    search_revision INTEGER
+                    search_revision INTEGER,
+                    delivery_state TEXT NOT NULL DEFAULT 'ready',
+                    claim_owner_token TEXT,
+                    claim_until TEXT,
+                    claim_result_id TEXT,
+                    claim_search_revision INTEGER,
+                    attempt_started_at TEXT,
+                    last_attempt_at TEXT,
+                    last_attempt_outcome TEXT,
+                    delivery_epoch_at TEXT,
+                    delivery_epoch_attempts INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
                 CREATE TABLE IF NOT EXISTS worker_heartbeat (
@@ -140,6 +150,12 @@ class Database:
                     started_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
                     last_completed_run_at TEXT,
+                    last_error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS dispatcher_heartbeat (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    started_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
                     last_error TEXT
                 );
                 CREATE TABLE IF NOT EXISTS request_gate (
@@ -213,6 +229,18 @@ class Database:
                         failed_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status='error')
                         WHERE outcome='running'""")
                     conn.execute("UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL")
+                    current_version = 4
+                if current_version == 4:
+                    for column in ("delivery_state TEXT NOT NULL DEFAULT 'ready'", "claim_owner_token TEXT",
+                                   "claim_until TEXT", "claim_result_id TEXT", "claim_search_revision INTEGER",
+                                   "attempt_started_at TEXT", "last_attempt_at TEXT", "last_attempt_outcome TEXT",
+                                   "delivery_epoch_at TEXT", "delivery_epoch_attempts INTEGER NOT NULL DEFAULT 0"):
+                        conn.execute(f"ALTER TABLE alerts ADD COLUMN {column}")
+                    # Any unsent inline alert may have reached Telegram before a
+                    # crash, even with zero durable attempts. Do not
+                    # silently replay an acknowledgement that was lost.
+                    conn.execute("UPDATE alerts SET delivery_state='uncertain',last_attempt_outcome='legacy_unknown' WHERE status IN ('pending','failed')")
+                    conn.execute("UPDATE alerts SET delivery_epoch_at=created_at,delivery_epoch_attempts=attempt_count")
                     conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
                 elif current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")

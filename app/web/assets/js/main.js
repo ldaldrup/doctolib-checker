@@ -1,3 +1,4 @@
+import { renderDeliveryNotice } from "./delivery-view.js";
 import { api, createJobPayload, updateJobPayload, settingsPayload } from "./api.js";
 import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
 import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata } from "./pages/jobs.js";
@@ -55,6 +56,8 @@ function render() {
   window.scrollTo({top: scroll, behavior: "instant"});
 }
 function workerStatus() {
+  const delivery = document.getElementById("delivery-status");
+  if (delivery) { const next = renderDeliveryNotice(state); if (delivery.innerHTML !== next) delivery.innerHTML = next; }
   const element = document.querySelector("#worker-status"); if (!element) return;
   const load = state.load.status;
   const auth = Object.values(state.load).some(value => value.error?.kind === "auth") || state.jobError?.kind === "auth" || state.settingsError?.kind === "auth";

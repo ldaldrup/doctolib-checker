@@ -106,7 +106,7 @@ document.querySelector('#page').onchange=e=>frame.src='/#'+e.target.value;</scri
 
     @app.post("/__test/checks", include_in_schema=False)
     def run_checks():
-        return CheckService(repository, doctolib, settings, notifier=lambda *args: (True, None)).run_due()
+        return CheckService(repository, doctolib, settings).run_due()
 
     app.router.routes.append(static_mount)
     return app
