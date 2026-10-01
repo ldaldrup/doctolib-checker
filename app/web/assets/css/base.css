@@ -1,0 +1,38 @@
+@font-face {
+  font-family: "Inter";
+  src: url("../fonts/InterVariable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; background: var(--color-ground); color: var(--color-body); font: 14px/1.5 var(--font-ui); }
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+a { color: inherit; text-decoration: none; }
+svg { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+h1, h2, h3, p { margin-top: 0; }
+h1, h2, h3 { color: var(--color-text); }
+h1 { font-size: 24px; line-height: 1.3; letter-spacing: -.02em; }
+h2 { font-size: 18px; line-height: 1.35; letter-spacing: -.01em; }
+h3 { font-size: 16px; line-height: 1.4; }
+:focus-visible { outline: 3px solid var(--color-primary-hover); outline-offset: 3px; }
+#app:focus { outline: none; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.hidden, [hidden] { display: none !important; }
+.container { width: min(100% - 48px, var(--content-width)); margin-inline: auto; }
+.main-content { flex: 1; padding-block: 34px 70px; }
+.muted { color: var(--color-muted); }
+.numeric { font-variant-numeric: tabular-nums; }
+@media (max-width: 767px) {
+  html { scroll-padding-top: 76px; }
+  .container { width: min(100% - 32px, var(--content-width)); }
+  .main-content { padding-block: 24px 104px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
