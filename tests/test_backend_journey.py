@@ -11,9 +11,11 @@ from app.api.app import create_app
 from app.doctolib import DoctolibClient
 from app.models import AvailabilityResult
 from app.services.checks import CheckService
+from app.services.delivery import DeliveryService
+from app.notifications import DeliveryOutcome
 from app.settings import Settings
 from app.storage.db import Database
-from app.storage.repositories import Repository, LeaseLostError, iso, parse_time, utc_now
+from app.storage.repositories import Repository, LeaseLostError, ConflictError, iso, parse_time, utc_now
 
 
 URL = (
@@ -72,7 +74,27 @@ class FakeNotifier:
 
     def __call__(self, settings, alert):
         self.sent.append(dict(alert))
-        return self.successful, None if self.successful else "telegram_timeout"
+        return DeliveryOutcome("sent" if self.successful else "retry", None if self.successful else "telegram_connect_error")
+
+
+class Journey:
+    """Test-only orchestration: availability and delivery are explicit services."""
+
+    def __init__(self, repository, doctolib, settings, notifier=None):
+        self.checker = CheckService(repository, doctolib, settings)
+        self.delivery = DeliveryService(repository, settings, sender=notifier) if notifier else DeliveryService(repository, settings)
+
+    def run_due(self, **kwargs):
+        outcomes = self.checker.run_due(**kwargs)
+        self.dispatch_pending()
+        return outcomes
+
+    def dispatch_pending(self):
+        # Each turn can send only one ready alert. The bounded loop exists only
+        # in legacy journey tests; the production worker never dispatches.
+        for _ in range(20):
+            if not self.delivery.run_once():
+                break
 
 
 class RaisingNotifier:
@@ -205,7 +227,7 @@ def test_primary_user_journey_validate_create_check_alert_and_read(tmp_path):
     assert job["next_check_at"]
 
     notifier = FakeNotifier()
-    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    checker = Journey(repository, doctolib, settings, notifier=notifier)
     outcomes = checker.run_due()
     assert outcomes == [{"successful_targets": 1, "failed_targets": 0}]
     assert len(notifier.sent) == 1
@@ -340,7 +362,7 @@ def test_no_match_stays_active_and_does_not_alert(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path, status="no_availability")
     job = create_job(client)
     notifier = FakeNotifier()
-    outcomes = CheckService(repository, doctolib, settings, notifier=notifier).run_due()
+    outcomes = Journey(repository, doctolib, settings, notifier=notifier).run_due()
     assert outcomes == [{"successful_targets": 1, "failed_targets": 0}]
     assert latest_result(client, job["id"])["status"] == "no_availability"
     assert client.get("/api/v1/jobs").json()[0]["status"] == "active"
@@ -351,7 +373,7 @@ def test_no_match_stays_active_and_does_not_alert(tmp_path):
 def test_structured_incomplete_availability_result_counts_as_failed_target(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    checker = CheckService(repository, StructuredErrorDoctolib(), settings, notifier=FakeNotifier())
+    checker = Journey(repository, StructuredErrorDoctolib(), settings, notifier=FakeNotifier())
 
     outcomes = checker.run_due()
 
@@ -373,7 +395,7 @@ def test_run_history_paginates_runs_and_keeps_all_target_results_together(tmp_pa
     })
     assert response.status_code == 201, response.text
     job = response.json()
-    checker = CheckService(repository, doctolib, settings, notifier=FakeNotifier())
+    checker = Journey(repository, doctolib, settings, notifier=FakeNotifier())
 
     assert len(checker.run_due()) == 1
     with repository.database.connection() as conn:
@@ -390,7 +412,7 @@ def test_run_history_paginates_runs_and_keeps_all_target_results_together(tmp_pa
 def test_run_with_no_results_is_visible_in_history(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path, status="no_availability")
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
     with repository.database.connection() as conn:
         conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (iso(utc_now()), job["id"]))
     run_id, _claimed_job = repository.claim_due_jobs(limit=1)[0]
@@ -410,7 +432,7 @@ def test_pause_during_request_records_result_but_suppresses_alert(tmp_path):
     pausing = PausingDoctolib(repository, doctolib.fixture_session, job["id"])
     notifier = FakeNotifier()
 
-    CheckService(repository, pausing, settings, notifier=notifier).run_due()
+    Journey(repository, pausing, settings, notifier=notifier).run_due()
 
     result = latest_result(client, job["id"])
     assert result["status"] == "available"
@@ -434,7 +456,7 @@ def test_edit_preserves_original_options_across_targets_in_same_run(tmp_path):
     job = response.json()
     updating = UpdatingDoctolib(client, doctolib.fixture_session, job["id"])
 
-    CheckService(repository, updating, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, updating, settings, notifier=FakeNotifier()).run_due()
 
     assert [search["insurance_sector"] for search in updating.searches] == ["public", "public"]
     assert [search["telehealth"] for search in updating.searches] == [False, False]
@@ -444,7 +466,7 @@ def test_pause_resume_and_check_now_obey_minimum_interval_after_restart(tmp_path
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
     notifier = FakeNotifier()
-    CheckService(repository, doctolib, settings, notifier=notifier).run_due()
+    Journey(repository, doctolib, settings, notifier=notifier).run_due()
 
     queued = client.post("/api/v1/jobs/" + job["id"] + "/check-now")
     assert queued.status_code == 200
@@ -501,7 +523,7 @@ def test_worker_claims_one_job_at_a_time_and_renews_owned_lease(tmp_path):
                 assert repository.get_job(second["id"])["lock_until"] is None
             return doctolib.check(booking_url, search, meta=meta, now=now)
 
-    checker = CheckService(repository, InspectingDoctolib(), settings, notifier=FakeNotifier())
+    checker = Journey(repository, InspectingDoctolib(), settings, notifier=FakeNotifier())
     assert len(checker.run_due(limit=2)) == 2
     assert lock_owner(repository, first["id"]) is None
     assert lock_owner(repository, second["id"]) is None
@@ -547,13 +569,13 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path, status="no_availability")
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
     deleted = client.delete("/api/v1/jobs/" + job["id"])
     assert deleted.status_code == 200
     assert client.get("/api/v1/jobs").json() == []
@@ -569,19 +591,19 @@ def test_failed_telegram_delivery_preserves_available_result_and_history(tmp_pat
     job = create_job(client)
     notifier = FakeNotifier(successful=False)
 
-    CheckService(repository, doctolib, settings, notifier=notifier).run_due()
+    Journey(repository, doctolib, settings, notifier=notifier).run_due()
 
     result = latest_result(client, job["id"])
     alert = client.get("/api/v1/alerts").json()[0]
     assert result["status"] == "available"
     assert alert["status"] == "failed"
     assert alert["attempt_count"] == 1
-    assert alert["error_summary"] == "telegram_timeout"
+    assert alert["error_summary"] == "telegram_connect_error"
 
     with repository.database.connection() as conn:
         conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), alert["id"]))
     retry_notifier = FakeNotifier(successful=True)
-    CheckService(repository, doctolib, settings, notifier=retry_notifier).dispatch_pending()
+    Journey(repository, doctolib, settings, notifier=retry_notifier).dispatch_pending()
     retried = client.get("/api/v1/alerts").json()[0]
     assert retried["status"] == "sent"
     assert retried["attempt_count"] == 2
@@ -591,13 +613,13 @@ def test_failed_telegram_delivery_preserves_available_result_and_history(tmp_pat
 def test_pending_telegram_alert_waits_until_job_active_and_telegram_enabled(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
     alert = client.get("/api/v1/alerts").json()[0]
     with repository.database.connection() as conn:
         conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), alert["id"]))
 
     retry_notifier = FakeNotifier()
-    checker = CheckService(repository, doctolib, settings, notifier=retry_notifier)
+    checker = Journey(repository, doctolib, settings, notifier=retry_notifier)
     assert client.post("/api/v1/jobs/" + job["id"] + "/pause").status_code == 200
     checker.dispatch_pending()
     assert retry_notifier.sent == []
@@ -612,14 +634,14 @@ def test_pending_telegram_alert_waits_until_job_active_and_telegram_enabled(tmp_
     assert len(retry_notifier.sent) == 1
 
 
-def test_notifier_exception_is_sanitized_and_saved_for_retry(tmp_path):
+def test_notifier_exception_is_sanitized_and_marked_uncertain(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
 
-    CheckService(repository, doctolib, settings, notifier=RaisingNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=RaisingNotifier()).run_due()
 
     alert = client.get("/api/v1/alerts").json()[0]
-    assert alert["status"] == "failed"
+    assert alert["delivery_state"] == "uncertain"
     assert alert["error_summary"] == "telegram_delivery_error"
     assert b"private-token" not in client.get("/api/v1/alerts").content
     assert latest_result(client, job["id"])["status"] == "available"
@@ -628,7 +650,7 @@ def test_notifier_exception_is_sanitized_and_saved_for_retry(tmp_path):
 def test_repeated_identical_slot_does_not_create_another_alert(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
 
     target = repository.get_job(job["id"])["targets"][0]
     check = repository.checks(job["id"])[0]["results"][0]
@@ -643,7 +665,7 @@ def test_repeated_identical_slot_does_not_create_another_alert(tmp_path):
 def test_failed_alert_waits_for_fresh_confirmation_then_retries(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
     original = client.get("/api/v1/alerts").json()[0]
     slot = datetime.fromisoformat(original["earliest_slot"])
     with repository.database.connection() as conn:
@@ -652,7 +674,7 @@ def test_failed_alert_waits_for_fresh_confirmation_then_retries(tmp_path):
         conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), original["id"]))
 
     notifier = FakeNotifier()
-    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    checker = Journey(repository, doctolib, settings, notifier=notifier)
     checker.dispatch_pending()
     assert notifier.sent == []
     target, result_id = record_result(repository, job, "available", slot, 3)
@@ -666,14 +688,14 @@ def test_failed_alert_waits_for_fresh_confirmation_then_retries(tmp_path):
 def test_pause_and_error_do_not_make_an_old_alert_send_without_confirmation(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
     alert = client.get("/api/v1/alerts").json()[0]
     slot = datetime.fromisoformat(alert["earliest_slot"])
     with repository.database.connection() as conn:
         conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), alert["id"]))
 
     notifier = FakeNotifier()
-    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    checker = Journey(repository, doctolib, settings, notifier=notifier)
     assert client.post("/api/v1/jobs/" + job["id"] + "/pause").status_code == 200
     checker.dispatch_pending()
     assert notifier.sent == []
@@ -700,11 +722,11 @@ def test_pause_and_error_do_not_make_an_old_alert_send_without_confirmation(tmp_
 def test_new_confirmed_result_cancels_contradicted_alert(tmp_path, new_status, new_slot):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
     record_result(repository, job, new_status, new_slot, int(new_slot is not None))
 
     notifier = FakeNotifier()
-    CheckService(repository, doctolib, settings, notifier=notifier).dispatch_pending()
+    Journey(repository, doctolib, settings, notifier=notifier).dispatch_pending()
     assert notifier.sent == []
     assert client.get("/api/v1/alerts").json()[0]["status"] == "cancelled"
 
@@ -712,7 +734,7 @@ def test_new_confirmed_result_cancels_contradicted_alert(tmp_path, new_status, n
 def test_expired_slot_and_removed_target_cancel_pending_alerts(tmp_path, monkeypatch):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
     slot = datetime.fromisoformat(client.get("/api/v1/alerts").json()[0]["earliest_slot"])
     monkeypatch.setattr("app.storage.repositories.utc_now", lambda: slot + timedelta(seconds=1))
     assert repository.get_pending_alerts() == []
@@ -721,7 +743,7 @@ def test_expired_slot_and_removed_target_cancel_pending_alerts(tmp_path, monkeyp
     monkeypatch.undo()
     second_client, second_repository, second_settings, second_doctolib = setup_backend(tmp_path / "second")
     second_job = create_job(second_client)
-    CheckService(second_repository, second_doctolib, second_settings,
+    Journey(second_repository, second_doctolib, second_settings,
                  notifier=FakeNotifier(successful=False)).run_due()
     replacement_url = URL + "&source=other"
     assert second_client.patch("/api/v1/jobs/" + second_job["id"],
@@ -732,7 +754,7 @@ def test_expired_slot_and_removed_target_cancel_pending_alerts(tmp_path, monkeyp
 def test_reappearance_alerts_again_but_count_change_does_not(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
     first = client.get("/api/v1/alerts").json()[0]
     slot = datetime.fromisoformat(first["earliest_slot"])
 
@@ -740,7 +762,7 @@ def test_reappearance_alerts_again_but_count_change_does_not(tmp_path):
     target, result_id = record_result(repository, job, "available", slot, 3)
     second_id = repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"])
     assert second_id and second_id != first["id"]
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).dispatch_pending()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).dispatch_pending()
 
     target, result_id = record_result(repository, job, "available", slot, 4)
     assert repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"]) is None
@@ -810,9 +832,9 @@ def test_request_spacing_keeps_fractional_seconds_across_repository_instances(tm
 def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     sent_job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
     failed_job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
     before = {alert["job_id"]: alert for alert in client.get("/api/v1/alerts").json()}
     assert before[sent_job["id"]]["status"] == "sent"
     assert before[failed_job["id"]]["status"] == "failed"
@@ -837,7 +859,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
@@ -850,6 +872,16 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
         target, result_id = record_result(repository, job, "available", slot, 3)
         duplicate = repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"])
         assert duplicate == (None if job == sent_job else old_alert["id"])
+    assert len(repository.alerts()) == 2
+    legacy_failed = next(alert for alert in repository.alerts() if alert["job_id"] == failed_job["id"])
+    assert legacy_failed["delivery_state"] == "uncertain"
+    sender = FakeNotifier()
+    dispatcher = DeliveryService(repository, settings, sender=sender)
+    assert not dispatcher.run_once() and sender.sent == []
+    with pytest.raises(ConflictError, match="acknowledgement"):
+        repository.recover_alert(legacy_failed["id"])
+    assert repository.recover_alert(legacy_failed["id"], acknowledge_duplicate_risk=True)
+    assert dispatcher.run_once() and len(sender.sent) == 1
     assert len(repository.alerts()) == 2
 
 
@@ -873,7 +905,7 @@ def test_one_target_failure_does_not_discard_another_target_result(tmp_path):
     assert response.status_code == 201, response.text
     job = response.json()
 
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
     history = client.get("/api/v1/jobs/" + job["id"] + "/checks")
 
     assert history.status_code == 200
@@ -901,7 +933,15 @@ def test_shared_request_gate_reservations_survive_repository_reopen(tmp_path, mo
     assert next_allowed == fixed_now + timedelta(seconds=6)
 
 
+def drop_delivery_columns(conn, *, alerts=True):
+    conn.execute("DROP TABLE IF EXISTS dispatcher_heartbeat")
+    if alerts:
+        for column in ("delivery_state", "claim_owner_token", "claim_until", "claim_result_id", "claim_search_revision", "attempt_started_at", "last_attempt_at", "last_attempt_outcome", "delivery_epoch_at", "delivery_epoch_attempts"):
+            conn.execute(f"ALTER TABLE alerts DROP COLUMN {column}")
+
+
 def drop_revision_columns(conn, *, alerts=True):
+    drop_delivery_columns(conn, alerts=alerts)
     conn.execute("DROP INDEX IF EXISTS idx_results_known_run_target")
     for table, columns in {
         "jobs": ("lock_owner_token", "search_revision", "edit_version"),
@@ -955,7 +995,7 @@ def test_claim_freezes_dates_and_target_metadata_and_hides_owner(tmp_path, monke
 def test_obsolete_response_is_history_only_and_does_not_cancel_pending(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
     pending = repository.alerts()[0]
     run_id, claimed = claim_for_result(repository, job)
     target = claimed['search_snapshot']['targets'][0]
@@ -1026,7 +1066,7 @@ def test_blocked_inflight_response_after_narrowing_cannot_notify(tmp_path):
                                       count_complete=True)
 
     notifier = FakeNotifier()
-    checker = CheckService(repository, BlockedDoctolib(), settings, notifier=notifier)
+    checker = Journey(repository, BlockedDoctolib(), settings, notifier=notifier)
     def run():
         try:
             checker.run_due()
@@ -1049,7 +1089,7 @@ def test_blocked_inflight_response_after_narrowing_cannot_notify(tmp_path):
     with repository.database.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM target_alert_state').fetchone()[0] == 0
         conn.execute('UPDATE jobs SET next_check_at=? WHERE id=?', (iso(utc_now()), job['id']))
-    CheckService(repository, FixtureDoctolib(no_availability=True), settings, notifier=notifier).run_due()
+    Journey(repository, FixtureDoctolib(no_availability=True), settings, notifier=notifier).run_due()
     fresh = repository.checks(job['id'])[0]['results'][0]
     assert fresh['status'] == 'no_availability' and fresh['published']
     assert fresh['search_revision'] == edited.json()['search_revision']
@@ -1075,13 +1115,13 @@ def test_equivalent_target_order_is_noop_but_effective_metadata_changes_revision
 def test_legacy_pending_needs_reconfirmation_while_sent_dedupe_survives_revision(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
     original = repository.alerts()[0]
     with repository.database.connection() as conn:
         conn.execute('UPDATE alerts SET search_revision=NULL,next_attempt_at=? WHERE id=?', (iso(utc_now()), original['id']))
         conn.execute('UPDATE check_results SET search_revision=NULL,snapshot_known=0,published=0 WHERE id=?', (original['result_id'],))
     notifier = FakeNotifier()
-    checker = CheckService(repository, doctolib, settings, notifier=notifier)
+    checker = Journey(repository, doctolib, settings, notifier=notifier)
     checker.dispatch_pending()
     assert notifier.sent == []
     slot = datetime.fromisoformat(original['earliest_slot'])
@@ -1132,7 +1172,7 @@ def test_lease_is_rechecked_after_gate_wait_and_before_retry(tmp_path, monkeypat
         clock[0] += timedelta(minutes=11)
     doctor = DoctolibClient(session=ExpiringSession(), before_request=waiting_hook if boundary == 'gate_wait' else None)
     monkeypatch.setattr('app.doctolib.time_module.sleep', lambda seconds: None)
-    checker = CheckService(repository, doctor, settings, notifier=FakeNotifier())
+    checker = Journey(repository, doctor, settings, notifier=FakeNotifier())
     checker.run_due(limit=1)
     assert len(calls) == (0 if boundary == 'gate_wait' else 1)
     assert repository.checks(job['id'])[0]['results'] == []
@@ -1140,33 +1180,23 @@ def test_lease_is_rechecked_after_gate_wait_and_before_retry(tmp_path, monkeypat
     assert repository.checks(job['id'])[0]['outcome'] == 'interrupted'
 
 
-def test_default_telegram_retry_rechecks_revision_after_backoff(tmp_path, monkeypatch):
+def test_scheduled_retry_rechecks_revision_before_another_attempt(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    CheckService(repository, doctolib, settings).run_due()
+    notifier = FakeNotifier(False)
+    dispatcher = DeliveryService(repository, settings, sender=notifier)
+    assert dispatcher.run_once()
+    assert len(notifier.sent) == 1
     alert = repository.alerts()[0]
+    assert alert["attempt_count"] == 1
+    assert parse_time(alert["next_attempt_at"]) >= utc_now() + timedelta(seconds=4)
+    assert client.patch("/api/v1/jobs/" + job["id"], json={"insurance_sector": "private"}).status_code == 200
     with repository.database.connection() as conn:
         conn.execute("UPDATE alerts SET next_attempt_at=? WHERE id=?", (iso(utc_now()), alert["id"]))
-    attempts = []
-
-    class TimingOutTelegram:
-        def post(self, endpoint, **kwargs):
-            attempts.append(1)
-            raise requests.Timeout()
-
-    def edit_during_backoff(_seconds):
-        edited = client.patch("/api/v1/jobs/" + job["id"], json={"insurance_sector": "private"})
-        assert edited.status_code == 200
-
-    monkeypatch.setattr("app.notifications.requests.Session", TimingOutTelegram)
-    monkeypatch.setattr("app.notifications.time.sleep", edit_during_backoff)
-    # Exercise the real default sender, including CheckService's callback wiring.
-    CheckService(repository, doctolib, settings).dispatch_pending()
-    assert len(attempts) == 1
-    current = repository.alerts()[0]
-    assert current["status"] == "failed"
-    assert current["error_summary"] == "alert_no_longer_eligible"
-    assert repository.get_pending_alerts() == []
+    assert not dispatcher.run_once()
+    assert len(notifier.sent) == 1
+    assert repository.alerts()[0]["attempt_count"] == 1
 
 
 def test_periodic_stale_reconciliation_preserves_actual_terminal_counts(tmp_path):
@@ -1189,7 +1219,7 @@ def test_periodic_stale_reconciliation_preserves_actual_terminal_counts(tmp_path
         conn.execute("UPDATE jobs SET lock_until=?,next_check_at=? WHERE id=?",
                      (iso(utc_now() - timedelta(seconds=1)), iso(utc_now() + timedelta(hours=1)), job["id"]))
     # A normal tick must reconcile without restart or another claim.
-    assert CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due() == []
+    assert Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due() == []
     run = repository.checks(job["id"])[0]
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert (run["successful_targets"], run["failed_targets"]) == (1, 1)
@@ -1218,7 +1248,7 @@ def test_worker_uses_snapshot_metadata_for_each_target_after_midrun_edit(tmp_pat
             return AvailabilityResult(status="no_availability", slot_count=0,
                                       earliest_slot=None, count_complete=True)
 
-    CheckService(repository, MetadataEditingDoctolib(), settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, MetadataEditingDoctolib(), settings, notifier=FakeNotifier()).run_due()
     assert observed == [("Dr. Ada Beispiel", "1234"), ("Dr. Ada Beispiel", "1234")]
     run = repository.checks(job["id"])[0]
     assert len(run["results"]) == 2

@@ -34,11 +34,15 @@ def create_router():
             last_seen = utc_now() - datetime.fromisoformat(
                 heartbeat["last_seen_at"].replace("Z", "+00:00")
             )
-            # Requests and Telegram retries can keep a sequential worker busy
-            # for longer than one scheduler tick; network attempts refresh this.
+            # Availability requests refresh the polling worker heartbeat.
             result["worker_alive"] = last_seen <= timedelta(seconds=90)
         else:
             result["worker_alive"] = False
+        dispatcher = result.get("dispatcher")
+        result["dispatcher_alive"] = bool(dispatcher and utc_now() - datetime.fromisoformat(
+            dispatcher["last_seen_at"].replace("Z", "+00:00")
+        ) <= timedelta(seconds=90))
+        result["telegram_configured"] = request.app.state.settings.telegram_enabled
         return result
 
     @router.get("/api/v1/jobs")

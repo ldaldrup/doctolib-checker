@@ -2,7 +2,7 @@
 
 Planning only, 1 October 2026. Start here, then execute one numbered plan at a time. These files are a specification for future implementation, not evidence of implemented or deployed behavior. Source overview: [improvement overview](../improvement-overview.md).
 
-Execution status: **parts 01 and 02 completed locally**; see the [part 01 handoff](01-completion-handoff.md) and [part 02 handoff](02-completion-handoff.md) for implementation, verification, adversarial fixes and next-step boundaries. Parts 03–14 remain plans. Completed work is consolidated into `master`; all further implementation uses only `feat/improvements`. Repository publication does not imply a production rollout.
+Execution status: **parts 01–03 completed locally**; see the [part 01 handoff](01-completion-handoff.md) and [part 02 handoff](02-completion-handoff.md) and [part 03 handoff](03-completion-handoff.md) for implementation, verification, adversarial fixes and next-step boundaries. Parts 04–14 remain plans. Parts 01/02 are consolidated into local `master`; part 03 is local, uncommitted work on `feat/improvements`. All further implementation uses only that branch. The current instruction prohibits remote pushes; repository changes do not imply a production rollout.
 
 ## Sequence and coverage
 

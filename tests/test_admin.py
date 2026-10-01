@@ -9,16 +9,16 @@ import pytest
 
 from app import admin
 from app.storage.db import Database
-from test_backend_journey import create_job, FakeNotifier, setup_backend, drop_revision_columns
+from test_backend_journey import create_job, FakeNotifier, setup_backend, drop_revision_columns, drop_delivery_columns, Journey
 from app.services.checks import CheckService
 
 
 def seeded(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due()
     create_job(client)
-    CheckService(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
+    Journey(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
     repository.update_settings({"default_interval_seconds": 600}, 300)
     return Path(settings.database_path), repository
 
@@ -38,11 +38,11 @@ def test_backup_restore_preserves_data_and_uses_offline_health(tmp_path, monkeyp
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "private-fixture-chat")
     monkeypatch.setattr("requests.sessions.Session.request", lambda *a, **k: pytest.fail("network used"))
     monkeypatch.setattr("app.notifications.send_telegram_alert", lambda *a, **k: pytest.fail("send used"))
-    assert admin.backup(source, archive)["schema_version"] == 4
+    assert admin.backup(source, archive)["schema_version"] == 5
     original = archive.read_bytes()
     work = tmp_path / "verify"
     assert admin.verify(archive, work) == {
-        "status": "verified", "backup_schema_version": 4, "restored_schema_version": 4,
+        "status": "verified", "backup_schema_version": 5, "restored_schema_version": 5,
         "integrity": "ok", "foreign_keys": "ok", "health": "ok",
     }
     assert rows(work / "restored.sqlite3") == expected
@@ -50,7 +50,7 @@ def test_backup_restore_preserves_data_and_uses_offline_health(tmp_path, monkeyp
     assert archive.read_bytes() == original
     with zipfile.ZipFile(archive) as bundle:
         manifest = json.loads(bundle.read("manifest.json"))
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert "private-fixture" not in json.dumps(manifest)
     assert manifest["created_at"].endswith("+00:00")
     for path in (archive, work / "checker.sqlite3", work / "restored.sqlite3"):
@@ -158,12 +158,15 @@ def test_failed_backup_cleans_temporary_output(tmp_path, monkeypatch, fault):
     assert not list(tmp_path.glob(".checker-backup-*"))
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_legacy_archive_stays_immutable_while_copy_migrates(tmp_path, version):
     source, _ = seeded(tmp_path)
     expected = rows(source)
     with sqlite3.connect(source) as conn:
-        drop_revision_columns(conn)
+        if version < 4:
+            drop_revision_columns(conn)
+        else:
+            drop_delivery_columns(conn)
         if version < 3:
             conn.execute("DROP TABLE target_alert_state")
         if version == 1:
@@ -175,7 +178,7 @@ def test_legacy_archive_stays_immutable_while_copy_migrates(tmp_path, version):
     work = tmp_path / "legacy-verify"
     report = admin.verify(archive, work)
     assert report["backup_schema_version"] == version
-    assert report["restored_schema_version"] == 4 and report["health"] == "ok"
+    assert report["restored_schema_version"] == 5 and report["health"] == "ok"
     assert archive.read_bytes() == before
     with sqlite3.connect(work / "checker.sqlite3") as conn:
         assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == version
@@ -183,9 +186,10 @@ def test_legacy_archive_stays_immutable_while_copy_migrates(tmp_path, version):
     for table in ("targets", "settings"):
         assert actual[table] == expected[table]
     with sqlite3.connect(work / "restored.sqlite3") as conn:
-        assert conn.execute("SELECT COUNT(*) FROM check_runs WHERE snapshot_known=1 OR search_revision IS NOT NULL OR search_snapshot IS NOT NULL").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM check_results WHERE snapshot_known=1 OR search_revision IS NOT NULL OR published=1").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM alerts WHERE search_revision IS NOT NULL").fetchone()[0] == 0
+        if version < 4:
+            assert conn.execute("SELECT COUNT(*) FROM check_runs WHERE snapshot_known=1 OR search_revision IS NOT NULL OR search_snapshot IS NOT NULL").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM check_results WHERE snapshot_known=1 OR search_revision IS NOT NULL OR published=1").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM alerts WHERE search_revision IS NOT NULL").fetchone()[0] == 0
     assert len(actual["target_alert_state"]) == len(expected["target_alert_state"])
 
 

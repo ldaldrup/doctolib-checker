@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import logging
+import json
+from dataclasses import dataclass
 import re
 import time
 from datetime import datetime
@@ -124,42 +128,201 @@ def format_slot_alert(alert):
     )
 
 
-def send_telegram_alert(settings, alert, session=None, before_send=None):
-    """Send one structured slot alert without logging its URL or credentials."""
-    if not settings.telegram_enabled or not settings.telegram_bot_token or not settings.telegram_chat_id:
-        return False, "telegram_not_configured"
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    category: str
+    error_code: str | None = None
+    retry_after: float | None = None
+    attempted: bool = True
 
-    request_session = session or requests.Session()
+
+SEND_BUDGET_SECONDS = 15.0
+CONNECT_TIMEOUT_SECONDS = 3.0
+READ_TIMEOUT_SECONDS = 7.0
+MAX_RESPONSE_BYTES = 65536
+
+
+def _retry_after(response, body):
+    value = body.get("parameters", {}).get("retry_after") if isinstance(body, dict) else None
+    if value is None:
+        value = response.headers.get("Retry-After")
+    try:
+        return min(900.0, max(5.0, float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _known_presend_failure(exc):
+    # A generic ConnectionError can mean the acknowledgement was lost after
+    # acceptance. Only connection establishment / DNS failure is retryable.
+    import urllib3.exceptions
+    pending, seen = [exc], set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, urllib3.exceptions.NewConnectionError):
+            return True
+        pending.extend(value for value in getattr(error, "args", ()) if isinstance(value, BaseException))
+        pending.extend(value for value in (getattr(error, "reason", None),
+                       getattr(error, "__cause__", None)) if isinstance(value, BaseException))
+    return False
+
+
+def _telegram_payload(settings, alert):
+    return {"chat_id": settings.telegram_chat_id, "text": format_slot_alert(alert),
+            "parse_mode": "HTML", "disable_web_page_preview": True}
+
+
+def _telegram_attempt(settings, alert, session, payload=None):
     endpoint = f"{TELEGRAM_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
-    payload = {
-        "chat_id": settings.telegram_chat_id,
-        "text": format_slot_alert(alert),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    last_error = "telegram_delivery_failed"
-    for attempt in range(1, 4):
-        # Recheck eligibility after retry backoff; edits can invalidate evidence.
-        if before_send is not None and not before_send():
-            return False, "alert_no_longer_eligible"
+    payload = payload if payload is not None else _telegram_payload(settings, alert)
+    response = None
+    try:
+        response = session.post(endpoint, json=payload,
+                                headers={"User-Agent": "DoctolibChecker/2.0"},
+                                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS), stream=True,
+                                allow_redirects=False)
+        # Bound provider data even for an endless chunked body. The parent
+        # process also bounds the full operation, including DNS/body trickling.
+        chunks, size = [], 0
+        for chunk in response.iter_content(chunk_size=4096):
+            size += len(chunk)
+            if size > MAX_RESPONSE_BYTES:
+                return DeliveryOutcome("uncertain", "telegram_response_too_large")
+            chunks.append(chunk)
         try:
-            response = request_session.post(
-                endpoint,
-                json=payload,
-                headers={"User-Agent": "DoctolibChecker/2.0"},
-                timeout=20,
-            )
-            if response.status_code == 200 and response.json().get("ok") is True:
-                return True, None
-            last_error = "telegram_http_" + str(response.status_code)
-        except requests.exceptions.Timeout:
-            last_error = "telegram_timeout"
-        except requests.exceptions.ConnectionError:
-            last_error = "telegram_connection_error"
+            body = json.loads(b"".join(chunks))
+        except (ValueError, UnicodeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        status = response.status_code
+        if status == 200 and body.get("ok") is True:
+            return DeliveryOutcome("sent")
+        provider_code = body.get("error_code") if body.get("ok") is False else status
+        if provider_code in (400, 401, 403):
+            return DeliveryOutcome("action_required", "telegram_rejected_" + str(provider_code))
+        if provider_code == 429:
+            return DeliveryOutcome("retry", "telegram_rate_limited", _retry_after(response, body))
+        if provider_code in (500, 502, 503, 504):
+            return DeliveryOutcome("retry", "telegram_temporary_rejection", _retry_after(response, body))
+        return DeliveryOutcome("uncertain", "telegram_unconfirmed_response")
+    except requests.exceptions.ConnectTimeout:
+        return DeliveryOutcome("retry", "telegram_connect_timeout")
+    except requests.exceptions.ConnectionError as exc:
+        if _known_presend_failure(exc):
+            return DeliveryOutcome("retry", "telegram_connect_failed")
+        return DeliveryOutcome("uncertain", "telegram_connection_lost")
+    except requests.exceptions.Timeout:
+        return DeliveryOutcome("uncertain", "telegram_acknowledgement_timeout")
+    except Exception:
+        return DeliveryOutcome("uncertain", "telegram_delivery_error")
+    finally:
+        if response is not None:
+            response.close()
+
+
+def _telegram_child(connection, settings, alert):
+    import os
+    import threading
+    # Independent watchdog remains effective if the dispatcher parent crashes.
+    # os._exit closes sockets even if a provider trickles response bytes forever.
+    watchdog = threading.Timer(SEND_BUDGET_SECONDS, lambda: os._exit(70))
+    watchdog.daemon = True
+    watchdog.start()
+    permitted = False
+    try:
+        try:
+            payload = _telegram_payload(settings, alert)
         except Exception:
-            # Never include requests' URL-bearing exception text: the URL contains the bot token.
-            last_error = "telegram_delivery_error"
-        if attempt < 3:
-            time.sleep(2 ** attempt)
-    logging.warning("Telegram delivery failed (%s)", last_error)
-    return False, last_error
+            connection.send(DeliveryOutcome("action_required", "telegram_invalid_payload", attempted=False))
+            return
+        with requests.Session() as session:
+            # All local preparation succeeds before SQLite records an attempt.
+            connection.send("ready")
+            permitted = connection.recv() is True
+            if permitted:
+                connection.send(_telegram_attempt(settings, alert, session, payload=payload))
+    except BaseException:
+        try:
+            connection.send(DeliveryOutcome("uncertain" if permitted else "retry",
+                                           "telegram_transport_failure", attempted=permitted))
+        except BaseException:
+            pass
+    finally:
+        watchdog.cancel()
+        connection.close()
+
+
+def send_telegram_alert(settings, alert, session=None, before_send=None):
+    """One send attempt, with no retries or backoff sleeps.
+
+    A prepared child waits for SQLite's persisted attempt permission before POST.
+    Production transport has independent child and parent wall-clock watchdogs.
+    Injected sessions are offline test transports.
+    """
+    if not settings.telegram_enabled or not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return DeliveryOutcome("action_required", "telegram_not_configured", attempted=False)
+    if session is not None:
+        try:
+            payload = _telegram_payload(settings, alert)
+        except Exception:
+            return DeliveryOutcome("action_required", "telegram_invalid_payload", attempted=False)
+        if before_send is not None and not before_send(remaining_seconds=SEND_BUDGET_SECONDS):
+            return DeliveryOutcome("retry", "alert_no_longer_eligible", attempted=False)
+        return _telegram_attempt(settings, alert, session, payload=payload)
+    import multiprocessing
+    import time as clock
+    permitted = False
+    process = None
+    parent = child = None
+    deadline = clock.monotonic() + SEND_BUDGET_SECONDS
+    try:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(target=_telegram_child, args=(child, settings, alert), daemon=True)
+        process.start()
+        child.close()
+        if parent.poll(max(0, deadline - clock.monotonic())):
+            message = parent.recv()
+            if isinstance(message, DeliveryOutcome):
+                return message
+            if message == "ready":
+                if clock.monotonic() >= deadline:
+                    return DeliveryOutcome("retry", "telegram_preparation_deadline", attempted=False)
+                if before_send is not None and not before_send(
+                        remaining_seconds=max(0, deadline - clock.monotonic())):
+                    return DeliveryOutcome("retry", "alert_no_longer_eligible", attempted=False)
+                # Persisted permission might already represent an attempted send
+                # if acknowledgement is lost after this boundary.
+                permitted = True
+                if clock.monotonic() >= deadline:
+                    return DeliveryOutcome("uncertain", "telegram_attempt_deadline", attempted=True)
+                parent.send(True)
+                if parent.poll(max(0, deadline - clock.monotonic())):
+                    outcome = parent.recv()
+                    if isinstance(outcome, DeliveryOutcome):
+                        return outcome
+        return DeliveryOutcome("uncertain" if permitted else "retry",
+                               "telegram_attempt_deadline" if permitted else "telegram_preparation_deadline",
+                               attempted=permitted)
+    except Exception:
+        return DeliveryOutcome("uncertain" if permitted else "retry",
+                               "telegram_transport_failure", attempted=permitted)
+    finally:
+        if child is not None:
+            child.close()
+        if parent is not None:
+            parent.close()
+        if process is not None and process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+                if process.is_alive():
+                    raise RuntimeError("telegram_transport_cleanup_failed")
+            process.close()

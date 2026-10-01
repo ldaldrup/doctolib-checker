@@ -40,30 +40,6 @@ class CheckService:
             motive_name=target.get("motive_name"),
         )
 
-    def dispatch_pending(self):
-        for alert in self.repository.get_pending_alerts():
-            # A job or target may have changed after the initial batch query.
-            current = self.repository.get_pending_alerts(limit=1, alert_id=alert["id"])
-            if not current:
-                continue
-            try:
-                if self.notifier is send_telegram_alert:
-                    sent, error = self.notifier(
-                        self.settings, current[0],
-                        before_send=lambda: any(
-                            ready["result_id"] == current[0]["result_id"]
-                            and ready["search_revision"] == current[0]["search_revision"]
-                            for ready in self.repository.get_pending_alerts(limit=1, alert_id=alert["id"])
-                        ),
-                    )
-                else:
-                    sent, error = self.notifier(self.settings, current[0])
-            except Exception:
-                # Do not persist exception text; request URLs may contain
-                # credentials supplied by an upstream notification service.
-                sent, error = False, "telegram_delivery_error"
-            self.repository.finish_alert(alert["id"], sent, error)
-
     def run_claim(self, run_id, job):
         successful = 0
         failed = 0
@@ -112,7 +88,6 @@ class CheckService:
                             self.repository.create_alert(
                                 current_job, target, result_id, result.earliest_slot, owner_token=owner_token
                             )
-                            self.dispatch_pending()
                 except (_RunStopped, LeaseLostError):
                     break
                 except Exception as exc:
@@ -145,7 +120,6 @@ class CheckService:
 
     def run_due(self, limit=10):
         self.repository.interrupt_stale_runs()
-        self.dispatch_pending()
         outcomes = []
         for _ in range(limit):
             claimed = self.repository.claim_due_jobs(limit=1)

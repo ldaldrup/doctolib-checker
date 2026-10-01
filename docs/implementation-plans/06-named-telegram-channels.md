@@ -28,3 +28,5 @@ Ship named Telegram CRUD, encrypted credentials, explicit legacy onboarding, sav
 - Migrate sent, failed, fresh pending, stale pending and claimed fixtures while preserving attempts and history.
 
 **Done/handoff:** Demonstrate Settings → selection → stub event → independent delivery status on `feat/improvements`; record migration version, config ownership, secret-key restore instructions and adapter interface for 07. Main risks are migration replay, secret exposure and recipient rotation races. Deployment/live Telegram testing requires a separately authorized controlled destination.
+
+**Part 03 compatibility:** preserve schema-5 delivery ownership and attempt semantics while migrating to named channels: `claim_owner_token`, `claim_until`, `claim_result_id`, `claim_search_revision`, `attempt_started_at`, `last_attempt_at`, `last_attempt_outcome`, `delivery_state`, lifetime `attempt_count`, and `delivery_epoch_at`/`delivery_epoch_attempts`. Retain the separate dispatcher heartbeat. A channel migration must not reset sent dedupe, uncertain acceptance, claim ownership or recovery budgets. See the [part 03 completion handoff](03-completion-handoff.md).

@@ -28,3 +28,9 @@ Use fake sessions/time plus SQLite transactions, not real Telegram. Focused deli
 **Ship gate:** existing single Telegram remains functional via the documented dispatcher command; no new channel screens needed. Handoff includes retry constants, state meanings, runtime transition and lease fields that 06 must preserve.
 
 **Major risks:** accidentally retaining inline dispatch; long send blocking other deliveries despite isolation; attempts counted twice; losing freshness or pause guards; starting both old and new send paths; claiming exactly-once delivery.
+
+## Implementation decisions
+
+Part 03 runs locally on the single `feat/improvements` branch under the shared branch policy. No remote push or live infrastructure change is authorized. The existing alert table gains schema-5 claim/attempt fields and a separate dispatcher heartbeat; no new channel/event schema is introduced. Network attempts use a short-lived child with a bounded deadline and independent watchdog so a trickling provider body cannot hold the dispatcher indefinitely. A preparation handshake precedes the persisted attempt boundary, so startup/preparation failures do not count as network attempts.
+
+Legacy pending **and** failed inline alerts migrate to uncertain: either may represent provider acceptance before an old worker stored its acknowledgement. Preserving the status/ID/count does not assert that acceptance is known. Fresh confirmation alone cannot clear this uncertainty; explicit duplicate-risk acknowledgement plus fresh eligibility is required. Lifetime attempt counts are preserved across recovery; a separate epoch counter and epoch start govern the renewed five-attempt/24-hour budget. The legacy CLI send loop remains separate from this API/worker dispatcher scope.

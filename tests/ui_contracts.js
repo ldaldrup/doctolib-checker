@@ -1,3 +1,4 @@
+import { deliveryNotice } from "/assets/js/delivery-view.js";
 import { api, ApiError, createJobPayload, updateJobPayload, settingsPayload } from '/assets/js/api.js';
 import { deriveJobView, historyKey, safeBookingUrl } from '/assets/js/job-view.js';
 
@@ -23,6 +24,16 @@ async function rejects(fn, kind) {
   try { await fn(); throw new Error('Expected rejection'); }
   catch (error) { assert(error instanceof ApiError && error.kind === kind, `Expected ${kind}, got ${error.message}`); return error; }
 }
+await test('delivery notices separate dispatcher failure and recovery from checking', () => {
+  const state = {load: {status: {phase: 'loaded'}}, status: {worker_alive: true, telegram_configured: true, dispatcher_alive: false,
+    delivery_backlog: {queued: 2, action_required: 1, exhausted: 1, uncertain: 3}}};
+  const notice = deliveryNotice(state);
+  assert(notice.includes('dispatcher unavailable') && notice.includes('Availability checking runs independently'));
+  assert(notice.includes('2 alert(s) queued') && notice.includes('credential or recipient repair'));
+  assert(notice.includes('retry limit') && notice.includes('3 alert(s) may already have been delivered'));
+  state.status.dispatcher_alive = true; assert(deliveryNotice(state).includes('dispatcher online'));
+  state.load.status.phase = 'stale'; assert(deliveryNotice(state).includes('unknown'));
+});
 await test('next-check tooltip shows scheduled datetime and job timezone', () => {
   const scheduled = {...job, next_check_at: '2026-10-01T10:05:01Z'};
   equal(nextCheckTitle(scheduled), 'Scheduled next check: 01.10.2026, 12:05:01 (Europe/Berlin)');

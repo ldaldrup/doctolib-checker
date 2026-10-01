@@ -28,7 +28,7 @@ Choose a workflow below. The web interface uses environment variables and SQLite
 
 ## Web interface
 
-Start the API and worker in **two separate terminals**, with the virtual environment activated in each:
+Start the API, availability worker and notification dispatcher in **three separate terminals**, with the virtual environment activated in each:
 
 ```bash
 # Terminal 1: API and web interface
@@ -36,11 +36,16 @@ python -m app.api.main
 ```
 
 ```bash
-# Terminal 2: background checks and notifications
+# Terminal 2: background availability checks
 python -m app.worker.main
 ```
 
-Run both from the repository directory so they use the same default database, `./data/checker.sqlite3`. For a custom location, set the same `DATABASE_PATH` in both terminals.
+```bash
+# Terminal 3: independent Telegram delivery
+python -m app.dispatcher
+```
+
+Run all three from the repository directory so they use the same default database, `./data/checker.sqlite3`. For a custom location, set the same `DATABASE_PATH` in all three terminals. Use compatible application versions for every writer.
 
 1. Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 2. Create a job with one or more [booking URLs](#booking-urls) and your search filters.
@@ -51,7 +56,7 @@ A new database starts empty. The worker must remain running to perform checks. R
 
 ### Enable Telegram alerts
 
-Create a bot with [BotFather](https://t.me/BotFather), start a conversation with it, and obtain the destination chat ID. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of **both processes**, then restart them. Enable Telegram for the jobs you want to notify.
+Create a bot with [BotFather](https://t.me/BotFather), start a conversation with it, and obtain the destination chat ID. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of **all three processes**, then restart them. The dispatcher performs sends; the API and worker use the configuration to expose and enqueue Telegram preferences. Enable Telegram for the jobs you want to notify.
 
 The timezone, polling minimum, and Telegram credentials are server configuration; they cannot be edited in the web interface. Keep credentials out of job records and source control.
 
@@ -68,9 +73,34 @@ An alert is sent once for an earliest slot while that slot remains the earliest 
 
 Failed Telegram sends can be retried while the target is active, the slot is in the future, and a confirming check is no older than one job interval. A newer no-availability result, changed earliest slot, removed target, or expired slot cancels a pending alert. Errors do not reset an episode. Pausing a job or disabling Telegram suspends delivery until a fresh-enough check permits it.
 
-Cancelled alerts remain visible in `/api/v1/alerts`. Telegram does not provide exactly-once delivery: if it accepts a message and the worker stops before recording success, a retry may send a duplicate.
+Availability checks queue alerts without sending. The independent serial dispatcher makes one bounded attempt per turn, with no in-request retry sleeps. It retries known connection-establishment failures, temporary rejections and rate limits with at least 5 seconds of exponential backoff, capped at 15 minutes. Retry-After is bounded by the same cap. Each recovery epoch allows at most 5 network attempts over 24 hours; confirmation freshness and slot expiry can stop delivery sooner. `attempt_count` is cumulative; `delivery_epoch_attempts` tracks the current recovery budget.
+
+`/api/v1/alerts` preserves pending/failed/sent/cancelled status and adds `delivery_state`: ready, retry, action_required, exhausted or uncertain (sent delivery has state sent). `/api/v1/status` and Jobs/Settings notices show dispatcher health and backlog separately from availability worker health. Credential/recipient rejection needs repair and explicit recovery. Lost acknowledgements, read timeouts, interrupted started sends and unknown responses become uncertain and cannot retry automatically. Cancelled alerts remain visible. Telegram acceptance followed by a crash cannot be made exactly-once.
 
 </details>
+
+### Dispatcher operation and recovery
+
+Run a single dispatch turn with `python -m app.dispatcher --once`. Inspect alert IDs and delivery states using `/api/v1/alerts`; the CLI prints safe recovery outcomes and never provider response bodies or credentials.
+
+After repairing credentials or the recipient, explicitly reevaluate an action-required/exhausted alert:
+
+```bash
+python -m app.dispatcher --recover ALERT_UUID
+```
+
+An uncertain send may already have reached Telegram. Only deliberately accepting possible duplicate delivery allows its recovery:
+
+```bash
+python -m app.dispatcher --recover ALERT_UUID --acknowledge-duplicate-risk
+```
+
+Recovery never replays sent work. It requires an active job/target, enabled Telegram, matching current revision, future slot and fresh successful confirmation. If evidence is stale, let the availability worker reconfirm it before recovery. Recovery preserves lifetime attempt counts and starts a new bounded epoch. It does not send directly.
+
+For an upgrade from inline delivery, stop every old API/worker writer, create and rehearse a protected backup, migrate with compatible schema-5 code, and start the API, availability worker and one dispatcher against the same DB. Do not run old inline senders alongside the dispatcher. Legacy pending and failed alerts become uncertain because an earlier send may have been accepted without a stored acknowledgement; fresh confirmation alone cannot resolve that ambiguity. Review them before acknowledged recovery. Migration preserves their status, IDs and history.
+
+The default sender uses connect/read timeouts of 3/7 seconds and a 15-second overall transport deadline. A short-lived network child enforces that deadline independently, with bounded cleanup; the dispatcher remains serial. Shut down every process for maintenance or restore. Rollback restores the pre-upgrade database and matching earlier code after stopping writers, never an in-place schema downgrade.
+
 
 ## Command line
 
@@ -125,11 +155,11 @@ Replace the entire example with a URL from your own booking flow. A profile page
 
 ### Backend environment
 
-The API and worker read process environment variables. `.env.example` documents the container settings; the application does **not** automatically load a `.env` file. Its container-oriented `API_HOST=0.0.0.0` and `DATABASE_PATH=/data/checker.sqlite3` differ from the local defaults below.
+The API, worker and dispatcher read process environment variables. `.env.example` documents the container settings; the application does **not** automatically load a `.env` file. Its container-oriented `API_HOST=0.0.0.0` and `DATABASE_PATH=/data/checker.sqlite3` differ from the local defaults below.
 
 | Variable | Local default | Purpose |
 | --- | --- | --- |
-| `DATABASE_PATH` | `./data/checker.sqlite3` | Shared SQLite file; use the same path for API and worker. |
+| `DATABASE_PATH` | `./data/checker.sqlite3` | Shared SQLite file; use the same path for API, worker and dispatcher. |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Empty | Set both to enable Telegram delivery. |
 | `DEFAULT_TIMEZONE` | `Europe/Berlin` | Default timezone for new jobs. |
 | `MINIMUM_POLL_INTERVAL_SECONDS` | `300` | Polling floor; values below 300 are clamped. |
@@ -181,7 +211,9 @@ Set `messages.summary.enabled` to enable heartbeat messages. `interval_seconds` 
 
 ## Deployment
 
-Keep the process or host awake and connected to the internet. For the backend, run the API and worker with the same environment and a persistent, writable SQLite location. The Dockerfile runs as UID/GID `10001:10001`; a mounted data directory must be writable by that user.
+Keep the process or host awake and connected to the internet. For the backend, run the API, availability worker and dispatcher with the same environment and a persistent, writable SQLite location. The Dockerfile runs as UID/GID `10001:10001`; a mounted data directory must be writable by that user.
+
+The same built image supports three commands: `python -m app.api.main`, `python -m app.worker.main`, and `python -m app.dispatcher`. Set those as separate service/container commands with the same writable `/data` mount and `DATABASE_PATH`; only the API needs proxy ingress. No dispatcher port is needed. The Dockerfile API default remains unchanged. Configure the supervisor to restart each process independently and stop all three before restore.
 
 **The application does not implement authentication.** For remote access, protect the complete origin with an authenticated reverse proxy: UI, assets, and API must share the same gate. Keep API container ports unpublished and use `/healthz` internally. Set `API_HOST=0.0.0.0` inside a container when the proxy needs to reach it.
 
@@ -191,8 +223,8 @@ Only `app/web/` is served as static content. Repository files, configuration, te
 
 | Symptom | What to check |
 | --- | --- |
-| Jobs do not run | Start the worker; verify its heartbeat and that both processes use the same database. |
-| No Telegram alerts | Set both credentials for both processes, enable Telegram on the job, and check alert history. CLI dry-run suppresses sends. |
+| Jobs do not run | Start the worker; verify its heartbeat and that all three processes use the same database. |
+| No Telegram alerts | Start the dispatcher, set both credentials for all three processes, enable Telegram on the job, and inspect delivery state in alert history. CLI dry-run suppresses sends. |
 | URL rejected | Copy the final availability URL, preserving practice and motive parameters. |
 | Database permission error | Use a writable directory; for Docker bind mounts, account for UID/GID `10001:10001`. |
 | Blocked requests or transient failures | Keep conservative polling/request spacing and inspect reported errors. Doctolib can change its API or anti-bot behavior. |
@@ -217,6 +249,7 @@ python -m pytest
 | `app/notifications.py` | Telegram delivery and formatting. |
 | `app/api/`, `app/services/` | API routes, validation, and job operations. |
 | `app/storage/`, `app/worker/` | SQLite persistence and scheduled checks. |
+| `app/dispatcher.py`, `app/services/delivery.py` | Independent durable notification dispatch and explicit recovery. |
 | `app/web/` | Native HTML/CSS/JavaScript interface. |
 | `tests/` | Offline checker, backend, and UI verification. |
 
@@ -241,7 +274,7 @@ Inspired by [seh-len/doctolib](https://github.com/seh-len/doctolib) and [timoles
 
 ## SQLite backup and restore verification
 
-Create a backup of an **existing backend SQLite database** with the online backup command. The API/worker may keep writing during backup; SQLite supplies a consistent snapshot including committed WAL data. The destination parent must already exist in a trusted, writable location. The command never replaces an existing destination, including a symlink or hard link, and fails safely if the source is missing or invalid.
+Create a backup of an **existing backend SQLite database** with the online backup command. The API/worker/dispatcher may keep writing during backup; SQLite supplies a consistent snapshot including committed WAL data. The destination parent must already exist in a trusted, writable location. The command never replaces an existing destination, including a symlink or hard link, and fails safely if the source is missing or invalid.
 
 ```bash
 python -m app.admin backup \
@@ -263,7 +296,7 @@ python -m app.admin verify \
 
 The parent directory must exist; the work directory must not. Verification checks the checksum, SQLite integrity, foreign keys, manifest/schema agreement and required checker tables/columns for supported versions **before** initialization can create tables. It retains an extracted original snapshot as `checker.sqlite3`, copies it to `restored.sqlite3`, migrates only that second copy with the current application, and exercises representative job/target/history/alert/status repository reads plus the real `/healthz` ASGI endpoint without opening a server/socket or starting a worker. Explicit offline settings disable Telegram and upstream access; ambient `DATABASE_PATH`/Telegram environment values are not used. Success prints safe aggregate JSON with backup/restored schema versions and health status. Failure removes only the disposable directory newly created by this invocation; it never removes an existing directory. Keep the successful rehearsal directory private or remove it deliberately after inspection.
 
-Current code can rehearse schema versions 1, 2, 3 and 4. A newer unsupported schema is refused before attempting migration. `verify --integrity-only` checks an archive without migration or API health, allowing archival integrity checks independently of application compatibility. Re-run rehearsal with the intended application revision before each upgrade; passing health proves DB access, not upstream availability or delivery.
+Current code can rehearse schema versions 1, 2, 3, 4 and 5. A newer unsupported schema is refused before attempting migration. `verify --integrity-only` checks an archive without migration or API health, allowing archival integrity checks independently of application compatibility. Re-run rehearsal with the intended application revision before each upgrade; passing health proves DB access, not upstream availability or delivery.
 
 For an **actual offline restore**, stop every API/worker writer first. Preserve the current database using a separate backup, choose an application version compatible with the archive, and rehearse verification into a new private location. With writers stopped, promote the verified `restored.sqlite3` to a **new database path**, update all process configurations to that same path, and start the compatible application. Never overwrite a live database or combine restored data with old `-wal`/`-shm` files; do not start the worker during rehearsal. Check jobs/settings/targets/history and internal health before intentionally enabling real checks/notifications. Restored in-flight work and pending alerts require review because provider acceptance may have occurred after the snapshot; replay can duplicate an external notification. Record the cutover and keep the prior path available until rollback is no longer needed.
 
@@ -273,4 +306,4 @@ Rollback restores the matching earlier database **and** application version afte
 
 Completed improvements are consolidated into `master`. Continue the numbered [implementation plans](docs/implementation-plans/README.md) sequentially on the single shared `feat/improvements` branch, starting from the latest `master`. Reuse that branch for every remaining part; do not create per-part, agent, review or auxiliary branches. Merge completed, reviewed work into `master`, then bring `feat/improvements` forward before continuing.
 
-Parts 01 and 02 are complete; the [part 02 handoff](docs/implementation-plans/02-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.
+Parts 01–03 are complete; the [part 03 handoff](docs/implementation-plans/03-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.
