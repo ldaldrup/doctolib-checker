@@ -2,7 +2,7 @@ import { api, ApiError, createJobPayload, updateJobPayload, settingsPayload } fr
 import { deriveJobView, historyKey, safeBookingUrl } from '/assets/js/job-view.js';
 
 import { settingWarning } from '/assets/js/pages/settings.js';
-import { jobStatus } from '/assets/js/pages/jobs.js';
+import { jobStatus, checkedAgo, renderJobList, compactDuration, nextCheck, nextCheckTitle } from '/assets/js/pages/jobs.js';
 
 const lines = [];
 const assert = (condition, message = 'Assertion failed') => { if (!condition) throw new Error(message); };
@@ -23,6 +23,37 @@ async function rejects(fn, kind) {
   try { await fn(); throw new Error('Expected rejection'); }
   catch (error) { assert(error instanceof ApiError && error.kind === kind, `Expected ${kind}, got ${error.message}`); return error; }
 }
+await test('next-check tooltip shows scheduled datetime and job timezone', () => {
+  const scheduled = {...job, next_check_at: '2026-10-01T10:05:01Z'};
+  equal(nextCheckTitle(scheduled), 'Scheduled next check: 01.10.2026, 12:05:01 (Europe/Berlin)');
+  equal(nextCheckTitle({...scheduled, time_zone: 'UTC'}), 'Scheduled next check: 01.10.2026, 10:05:01 (UTC)');
+  equal(nextCheckTitle({...scheduled, status: 'paused'}), 'No check scheduled while paused.');
+  equal(nextCheckTitle({...scheduled, next_check_at: 'invalid'}), 'Next check time unavailable.');
+  const state = {jobs: [scheduled], filter: 'all', intervalFilter: 'all', load: {jobs: {phase: 'loaded'}, status: {phase: 'loaded'}}, status: {worker_alive: true}, views: new Map()};
+  assert(renderJobList(state).includes(`<span title="${nextCheckTitle(scheduled)}">(next:`));
+});
+await test('compact next-check countdown uses two adjacent units and reports scheduler blockers', () => {
+  const now = Date.parse('2026-10-01T10:00:00Z');
+  for (const [seconds, text] of [[301, '5m1s'], [3723, '1h2m'], [10800, '3h'], [86461, '1d'], [86400 + 7200, '1d2h'], [59, '59s']]) equal(compactDuration(seconds), text);
+  const state = {load: {status: {phase: 'loaded'}}, status: {worker_alive: true}, views: new Map()};
+  const scheduled = {...job, next_check_at: new Date(now + 301000).toISOString()};
+  equal(nextCheck(scheduled, state, now), '5m1s'); equal(nextCheck(scheduled, state, now + 302000), 'due');
+  equal(nextCheck({...scheduled, status: 'paused'}, state, now), 'paused');
+  state.status.worker_alive = false; equal(nextCheck(scheduled, state, now), 'blocked');
+  state.status.worker_alive = true; state.views.set(job.id, {running: true}); equal(nextCheck(scheduled, state, now), 'checking');
+});
+await test('relative check times appear beneath monitoring, with failures retaining their explanation', () => {
+  const now = Date.parse('2026-10-01T10:00:00Z');
+  for (const [seconds, text] of [[0, '0s'], [1, '1s'], [59, '59s'], [60, '1m'], [3600, '1h'], [432000, '5d'], [31536000, '1y'], [63072000, '2y']]) {
+    equal(checkedAgo(new Date(now - seconds * 1000).toISOString(), now), `Checked ${text} ago`);
+  }
+  equal(checkedAgo('invalid', now), null); equal(checkedAgo(new Date(now + 1000).toISOString(), now), 'Checked 0s ago');
+  const state = {jobs: [job], load: {status: {phase: 'loaded'}, jobs: {phase: 'loaded'}}, status: {worker_alive: true}, views: new Map([[job.id, {state: 'no_availability', checkedAt: new Date(now - 1000).toISOString()}]]), filter: 'all', intervalFilter: 'all'};
+  equal(jobStatus(job, state, now).detail, 'Checked 1s ago');
+  const html = renderJobList(state); assert(html.includes('<small>Checked ') && !html.includes('No availability reported') && !html.includes('class="job-evidence"'));
+  state.status.worker_alive = false; equal(jobStatus(job, state, now).detail, 'Worker unavailable');
+  state.status.worker_alive = true; state.views.get(job.id).state = 'error'; equal(jobStatus(job, state, now).detail, 'Targets could not be checked');
+});
 await test('setting warnings apply only to unsaved fields and clear after persistence', () => {
   const saved = {default_interval_seconds: 300, request_spacing_seconds: 3};
   const state = {settings: saved, settingsDraft: {...saved, request_spacing_seconds: 4}};
