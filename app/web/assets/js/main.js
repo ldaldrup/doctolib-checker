@@ -1,7 +1,7 @@
 import { api, createJobPayload, updateJobPayload, settingsPayload } from "./api.js";
-import { deriveJobView, historyKey } from "./job-view.js";
+import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
 import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata } from "./pages/jobs.js";
-import { renderSettings } from "./pages/settings.js";
+import { renderSettings, settingWarning } from "./pages/settings.js";
 
 const app = document.querySelector("#app"), toast = document.querySelector("#toast"), dialog = document.querySelector("#confirm-dialog");
 const state = {
@@ -68,15 +68,28 @@ function workerStatus() {
 function patchJobs() {
   workerStatus(); if (route() !== "jobs") return;
   const focus = controlFocus();
-  const list = document.querySelector("#job-list"); if (list) list.innerHTML = renderJobList(state);
+  const list = document.querySelector("#job-list");
+  if (list) {
+    const content = document.createElement("template"); content.innerHTML = renderJobList(state);
+    const existing = new Map([...list.children].filter(node => node.dataset.jobId).map(node => [node.dataset.jobId, node]));
+    let position = list.firstElementChild;
+    for (const candidate of [...content.content.children]) {
+      const previous = existing.get(candidate.dataset.jobId);
+      const node = previous?.outerHTML === candidate.outerHTML ? previous : candidate;
+      if (node !== position) list.insertBefore(node, position);
+      position = node.nextElementSibling;
+      existing.delete(candidate.dataset.jobId);
+    }
+    while (position) { const next = position.nextElementSibling; position.remove(); position = next; }
+  }
   const template = document.createElement("template"); template.innerHTML = renderJobs(state);
   for (const id of ["job-counts", "jobs-load-state"]) {
     const old = document.getElementById(id), next = template.content.querySelector(`#${id}`);
-    if (old && next) old.innerHTML = next.innerHTML;
+    if (old && next && old.innerHTML !== next.innerHTML) old.innerHTML = next.innerHTML;
   }
   const interval = document.getElementById("interval-filter"), nextInterval = template.content.querySelector("#interval-filter");
   if (interval && nextInterval) {
-    interval.innerHTML = nextInterval.innerHTML;
+    if (interval.innerHTML !== nextInterval.innerHTML) interval.innerHTML = nextInterval.innerHTML;
     // A saved filter remains selectable even if its last job was removed.
     if (state.intervalFilter !== "all" && ![...interval.options].some(option => option.value === state.intervalFilter)) {
       const option = document.createElement("option"); option.value = state.intervalFilter;
@@ -102,7 +115,7 @@ function updateViews() {
 function queueHistory(job) {
   const key = historyKey(job), entry = state.histories.get(job.id);
   if (historyQueued.has(job.id)) return;
-  if (entry?.key === key && (entry.epoch === historyEpoch || entry.phase === "loading" || (entry.phase === "loaded" && Date.now() - entry.loadedAt < 30000)
+  if (entry?.key === key && (entry.epoch === historyEpoch || entry.phase === "loading" || (entry.phase === "loaded" && Date.now() - entry.loadedAt < 15000)
     || (["error", "stale"].includes(entry.phase) && !entry.retryEligible))) return;
   historyQueued.add(job.id); historyQueue.push({id: job.id, key}); pumpHistory();
 }
@@ -113,7 +126,7 @@ function pumpHistory() {
     const previous = state.histories.get(item.id);
     const priorRuns = previous?.key === item.key ? previous.runs : [];
     const epoch = historyEpoch;
-    historyActive++; state.histories.set(item.id, {key: item.key, phase: priorRuns?.length ? "stale" : "loading", runs: priorRuns || [], retryEligible: false, epoch});
+    historyActive++; state.histories.set(item.id, {key: item.key, phase: previous?.phase === "loaded" && previous.key === item.key ? "loaded" : priorRuns?.length ? "stale" : "loading", runs: priorRuns || [], retryEligible: false, epoch});
     api.getChecks(item.id, {limit: 10}).then(runs => {
       if (historyKey(state.jobs?.find(value => value.id === item.id) || {}) !== item.key) return;
       state.histories.set(item.id, {key: item.key, phase: "loaded", runs, error: null, loadedAt: Date.now(), epoch});
@@ -141,7 +154,7 @@ function observeCards() {
 async function loadJobs() {
   historyEpoch++;
   for (const entry of state.histories.values()) if (["error", "stale"].includes(entry.phase)) entry.retryEligible = true;
-  state.load.jobs = {phase: state.jobs ? "refreshing" : "loading", error: null}; patchJobs();
+  if (state.jobs === null) { state.load.jobs = {phase: "loading", error: null}; patchJobs(); }
   const collected = new Map();
   try {
     for (let offset = 0; ; offset += 100) {
@@ -157,9 +170,10 @@ async function loadJobs() {
 async function loadStatus() {
   try { state.status = await api.getStatus(); state.load.status = {phase: "loaded", error: null}; }
   catch (error) { state.load.status = {phase: state.status ? "stale" : "error", error}; }
-  workerStatus();
+  patchJobs();
 }
 async function loadSettings() {
+  if (state.settingsSubmitting) return;
   const generation = ++settingsGeneration;
   try {
     const settings = await api.getSettings();
@@ -172,24 +186,28 @@ async function loadSettings() {
 }
 function showSettingsRead() {
   if (route() === "jobs" && document.getElementById("job-form")) { patchJobs(); return; }
-  if (route() !== "settings" || !state.settingsDirty || !document.getElementById("settings-form")) { render(); return; }
+  if (route() !== "settings" || !document.getElementById("settings-form")) { render(); return; }
   // Keep the actual controls mounted while the user is editing a settings draft.
   const template = document.createElement("template"); template.innerHTML = renderSettings(state);
   for (const id of ["settings-load-state", "settings-remote-notice"]) {
     const current = document.getElementById(id), next = template.content.querySelector(`#${id}`);
-    if (current && next) { current.innerHTML = next.innerHTML; current.hidden = next.hidden; }
+    if (current && next) { if (current.innerHTML !== next.innerHTML) current.innerHTML = next.innerHTML; current.hidden = next.hidden; }
   }
-  workerStatus();
+  if (!state.settingsDirty) {
+    const current = document.querySelector(".settings-sections"), next = template.content.querySelector(".settings-sections");
+    if (current && next && settingsDiffer(readSettings(document.getElementById("settings-form")), state.settings)) { const focus = controlFocus(); current.innerHTML = next.innerHTML; restoreControl(focus); }
+  }
+  settingsFeedback(); workerStatus();
 }
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  if (document.hidden || route() !== "jobs") return;
-  refreshTimer = setTimeout(() => refresh(), Math.min(120000, 30000 * 2 ** failures));
+  if (document.hidden) return;
+  refreshTimer = setTimeout(() => refresh(), Math.min(120000, 15000 * 2 ** failures));
 }
 function refresh(includeSettings = false) {
   if (refreshPromise) { refreshAgain = true; refreshSettingsAgain ||= includeSettings; return refreshPromise; }
   refreshPromise = (async () => {
-    let settings = includeSettings;
+    let settings = includeSettings || route() === "settings";
     try {
       do {
         refreshAgain = false;
@@ -271,18 +289,49 @@ async function submitJob(form) {
     if (state.jobError) showErrors(state.jobError, "job-form", "job-form-error");
   }
 }
-async function submitSettings(form) {
-  if (state.settingsSubmitting || !state.settings) return;
-  state.settingsDraft = readSettings(form); state.settingsDirty = true; state.settingsError = null;
-  let payload; try { payload = settingsPayload(state.settingsDraft, state.settings); }
-  catch (error) { state.settingsError = error; showErrors(error, "settings-form", "settings-error"); return; }
-  ++settingsGeneration; state.settingsSubmitting = true; render();
-  try {
-    state.settings = await api.updateSettings(payload); state.settingsDraft = settingsValues(state.settings);
-    state.settingsDirty = false; state.remoteSettingsChanged = false; announce("Settings saved."); await loadSettings();
-  } catch (error) { state.settingsError = error; if (error.ambiguous) await loadSettings(); }
-  finally { state.settingsSubmitting = false; render(); if (state.settingsError) showErrors(state.settingsError, "settings-form", "settings-error"); }
+let settingsSaveTimer, settingsEditRevision = 0;
+function settingsDiffer(draft, saved) {
+  return Object.keys(settingsValues(saved)).some(key => draft[key] === "" || Number(draft[key]) !== Number(saved[key]));
 }
+function settingsFeedback() {
+  document.getElementById("settings-form")?.setAttribute("aria-busy", String(state.settingsSubmitting));
+  document.querySelectorAll('[data-setting-warning]').forEach(button => {
+    const warning = settingWarning(state, button.dataset.settingWarning);
+    button.hidden = !warning;
+    button.setAttribute("aria-label", `${button.closest(".settings-row").querySelector("h3").textContent}: ${warning?.message || ""}`);
+    button.querySelector(".settings-warning-message").textContent = warning?.message || "";
+    button.classList.toggle("settings-warning-failed", Boolean(warning?.failed));
+  });
+}
+function settingsEdited(immediate = false) {
+  state.settingsDraft = readSettings(document.getElementById("settings-form"));
+  state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
+  state.settingsError = null; settingsEditRevision++;
+  clearTimeout(settingsSaveTimer); settingsFeedback();
+  if (state.settingsDirty) settingsSaveTimer = setTimeout(() => submitSettings(), immediate ? 0 : 600);
+}
+async function submitSettings(form) {
+  clearTimeout(settingsSaveTimer);
+  if (form) state.settingsDraft = readSettings(form);
+  if (state.settingsSubmitting || !state.settings || !state.settingsDraft) return;
+  state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
+  if (!state.settingsDirty) { settingsFeedback(); return; }
+  let payload; try { payload = settingsPayload(state.settingsDraft, state.settings); }
+  catch (error) { state.settingsError = error; settingsFeedback(); return; }
+  const revision = settingsEditRevision;
+  ++settingsGeneration; state.settingsSubmitting = true; state.settingsError = null; settingsFeedback();
+  try {
+    state.settings = await api.updateSettings(payload);
+    state.load.settings = {phase: "loaded", error: null};
+    state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
+    state.remoteSettingsChanged = false;
+  } catch (error) { state.settingsError = error; }
+  finally {
+    state.settingsSubmitting = false; settingsFeedback();
+    if (settingsEditRevision !== revision && state.settingsDirty) settingsSaveTimer = setTimeout(() => submitSettings(), 600);
+  }
+}
+
 async function mutateJob(job, action) {
   if (state.pendingJobs.has(job.id)) return;
   state.pendingJobs.add(job.id); patchJobs();
@@ -298,24 +347,40 @@ async function mutateJob(job, action) {
   } catch (error) { announce(message(error)); if (error.ambiguous || error.status === 404) await refresh(); }
   finally { state.pendingJobs.delete(job.id); patchJobs(); }
 }
-async function validateTarget(index) {
-  const input = document.getElementById(`target-${index}`); if (!input) return;
-  const url = input.value.trim(); if (!url) return;
-  const cached = state.targetMetadata.get(url);
-  if (cached?.phase === "loading" || (cached?.phase === "loaded" && !cached.seeded)) return;
-  const update = () => {
-    document.querySelectorAll('[name="target_urls"]').forEach(current => {
-      if (current.value.trim() !== url) return;
-      const row = current.closest(".target-entry"), output = row?.querySelector(".target-meta");
-      if (output) output.innerHTML = renderTargetMetadata(url, state);
-      const button = row?.querySelector('[data-action="validate-target"]');
-      if (button) button.disabled = state.targetMetadata.get(url)?.phase === "loading";
-    });
-  };
-  state.targetMetadata.set(url, {phase: "loading", data: null, error: null}); update();
-  try { const data = await api.validateTarget(url); state.targetMetadata.set(url, {phase: "loaded", data, error: null}); }
-  catch (error) { state.targetMetadata.set(url, {phase: "error", data: null, error}); }
-  update();
+let searchRefreshTimer;
+let targetValidationTimer, targetValidationActive = false, targetValidationNext = 0;
+function updateTargetMetadata() {
+  document.querySelectorAll('[name="target_urls"]').forEach(input => {
+    const output = input.closest(".target-entry")?.querySelector(".target-meta");
+    if (output) output.innerHTML = renderTargetMetadata(input.value.trim(), state);
+  });
+}
+function scheduleTargetValidation() {
+  clearTimeout(targetValidationTimer);
+  targetValidationTimer = setTimeout(validateTargets, Math.max(600, targetValidationNext - Date.now()));
+}
+async function validateTargets() {
+  if (targetValidationActive || route() !== "jobs") return;
+  const urls = [...new Set([...document.querySelectorAll('[name="target_urls"]')].map(input => input.value.trim()).filter(Boolean))];
+  const url = urls.find(value => {
+    const cached = state.targetMetadata.get(value);
+    return safeBookingUrl(value) && !cached;
+  });
+  if (!url) return;
+  targetValidationActive = true;
+  state.targetMetadata.set(url, {phase: "loading", data: null, error: null});
+  updateTargetMetadata();
+  try {
+    const data = await api.validateTarget(url);
+    state.targetMetadata.set(url, {phase: "loaded", data, error: null});
+  } catch (error) {
+    state.targetMetadata.set(url, {phase: "error", data: null, error, at: Date.now()});
+  } finally {
+    targetValidationActive = false;
+    targetValidationNext = Date.now() + Math.max(3000, (state.settings?.request_spacing_seconds || 3) * 1000);
+    updateTargetMetadata();
+    scheduleTargetValidation();
+  }
 }
 
 document.addEventListener("click", event => {
@@ -323,9 +388,8 @@ document.addEventListener("click", event => {
   const action = control.dataset.action, job = state.jobs?.find(value => value.id === control.closest("[data-job-id]")?.dataset.jobId);
   if (["retry", "refresh"].includes(action)) { refresh(true); return; }
   if (action === "sign-in") { location.assign(location.href); return; }
-  if (action === "filter") { state.filter = control.dataset.filter; patchJobs(); return; }
-  if (action === "validate-target") { validateTarget(Number(control.dataset.index)); return; }
-  if (["new-job", "cancel-edit"].includes(action)) { if (!state.jobSubmitting) { resetEditor(); openEditor(); } return; }
+  if (action === "filter") { state.filter = control.dataset.filter; patchJobs(); refresh(); return; }
+  if (["new-job", "cancel-edit"].includes(action)) { if (!state.jobSubmitting) { resetEditor(); openEditor(); refresh(); } return; }
   if (["add-target", "remove-target"].includes(action)) {
     if (state.jobSubmitting || !state.formDraft) return;
     state.formDraft = readDraft(document.getElementById("job-form"));
@@ -333,9 +397,7 @@ document.addEventListener("click", event => {
     if (action === "remove-target" && state.formDraft.target_urls.length > 1) state.formDraft.target_urls.splice(Number(control.dataset.index), 1);
     render(); document.getElementById(`target-${action === "add-target" ? state.formDraft.target_urls.length - 1 : Math.max(0, Number(control.dataset.index) - 1)}`)?.focus(); return;
   }
-  if (action === "discard-settings") {
-    state.settingsDraft = settingsValues(state.settings); state.settingsDirty = false; state.remoteSettingsChanged = false; state.settingsError = null; render(); return;
-  }
+  if (action === "retry-settings") { submitSettings(); return; }
   if (action === "retry-create" && state.uncertainCreate) {
     deleteFocus = controlFocus(control); dialog.dataset.operation = "retry-create"; dialog.returnValue = "";
     dialog.querySelector('[value="confirm"]').textContent = "Allow retry";
@@ -351,7 +413,7 @@ document.addEventListener("click", event => {
     for (const target of job.targets) {
       if (state.targetMetadata.get(target.booking_url)?.phase !== "loading") state.targetMetadata.set(target.booking_url, {phase: "loaded", data: target, error: null, seeded: true});
     }
-    state.jobError = null; openEditor(); return;
+    state.jobError = null; openEditor(); refresh(); return;
   }
   if (action === "delete") {
     deleteFocus = controlFocus(control); dialog.dataset.operation = "delete"; dialog.dataset.jobId = job.id; dialog.returnValue = "";
@@ -362,25 +424,25 @@ document.addEventListener("click", event => {
   }
 });
 document.addEventListener("input", event => {
-  if (event.target.id === "job-search") { state.query = event.target.value; patchJobs(); return; }
+  if (event.target.id === "job-search") { state.query = event.target.value; patchJobs(); clearTimeout(searchRefreshTimer); searchRefreshTimer = setTimeout(() => refresh(), 300); return; }
   if (event.target.closest("#job-form")) {
     state.formDraft = readDraft(document.getElementById("job-form"));
-    const count = document.querySelector(".target-heading > span:last-child"); if (count) count.textContent = `${state.formDraft.target_urls.filter(value => value.trim()).length} links added`;
     event.target.removeAttribute("aria-invalid");
     if (event.target.name === "target_urls") {
       const index = [...document.querySelectorAll('[name="target_urls"]')].indexOf(event.target);
       const url = event.target.value.trim();
       const output = document.getElementById(`target-meta-${index}`); if (output) output.innerHTML = renderTargetMetadata(url, state);
-      const validate = event.target.closest(".target-entry")?.querySelector('[data-action="validate-target"]');
-      if (validate) validate.disabled = !url || state.targetMetadata.get(url)?.phase === "loading";
+      const cached = state.targetMetadata.get(url);
+      if (cached?.phase === "error" && Date.now() - cached.at >= 30000) state.targetMetadata.delete(url);
+      scheduleTargetValidation();
     }
   }
-  if (event.target.closest("#settings-form")) { state.settingsDraft = readSettings(document.getElementById("settings-form")); state.settingsDirty = true; }
+  if (event.target.closest("#settings-form")) settingsEdited(event.target.type === "radio");
 });
 document.addEventListener("change", event => {
-  if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); return; }
+  if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); refresh(); return; }
   if (event.target.closest("#job-form")) state.formDraft = readDraft(document.getElementById("job-form"));
-  if (event.target.closest("#settings-form")) { state.settingsDraft = readSettings(document.getElementById("settings-form")); state.settingsDirty = true; }
+  if (event.target.closest("#settings-form")) settingsEdited(event.target.type === "radio");
   const toggle = (wrapperId, custom, inputId) => {
     const wrapper = document.getElementById(wrapperId), input = document.getElementById(inputId);
     if (wrapper) wrapper.hidden = !custom;
@@ -411,12 +473,12 @@ dialog.addEventListener("close", () => {
 });
 window.addEventListener("hashchange", async () => {
   clearTimeout(refreshTimer); render(); app.focus({preventScroll: true});
-  if (route() === "settings") { await loadSettings(); if (route() === "settings") showSettingsRead(); }
+  if (route() === "settings") { await refresh(true); }
   else { pumpHistory(); refresh(); }
 });
 document.addEventListener("visibilitychange", () => {
   clearTimeout(refreshTimer);
-  if (!document.hidden) { if (route() === "jobs") { pumpHistory(); refresh(); } else loadSettings().then(() => { if (route() === "settings") showSettingsRead(); }); }
+  if (!document.hidden) { if (route() === "jobs") { pumpHistory(); refresh(); } else refresh(true); }
 });
 render();
 refresh(true);
