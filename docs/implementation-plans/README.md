@@ -2,7 +2,7 @@
 
 Planning only, 1 October 2026. Start here, then execute one numbered plan at a time. These files are a specification for future implementation, not evidence of implemented or deployed behavior. Source overview: [improvement overview](../improvement-overview.md).
 
-Execution status: **parts 01–03 completed locally**; see the [part 01 handoff](01-completion-handoff.md) and [part 02 handoff](02-completion-handoff.md) and [part 03 handoff](03-completion-handoff.md) for implementation, verification, adversarial fixes and next-step boundaries. Parts 04–14 remain plans. Parts 01/02 are consolidated into local `master`; part 03 is local, uncommitted work on `feat/improvements`. All further implementation uses only that branch. The current instruction prohibits remote pushes; repository changes do not imply a production rollout.
+Execution status: **parts 01–03 completed locally**; see the [part 01 handoff](01-completion-handoff.md) and [part 02 handoff](02-completion-handoff.md) and [part 03 handoff](03-completion-handoff.md) for implementation, verification, adversarial fixes and next-step boundaries. Parts 01–03 are committed and consolidated into local `master`. Part 04 has an interrupted, unverified implementation on `feat/improvements`; parts 05–14 remain plans. All further implementation and adversarial reviews reuse only `feat/improvements`; no additional branches are permitted. The current instruction prohibits remote pushes; repository changes do not imply a production rollout.
 
 ## Sequence and coverage
 
@@ -51,7 +51,7 @@ These choices can be changed deliberately before the relevant implementation sta
 
 ## Starting point and drift control
 
-Initial inspection used backend `master` at `b5cee59` and UI `feat/ui-foundation` at `6f3f589`. The UI subsequently merged into remote `master` (`af83189` before parts 01/02 consolidation). Completed parts 01/02, the UI and these planning Markdown files are consolidated into `master`.
+Initial inspection used backend `master` at `b5cee59` and UI `feat/ui-foundation` at `6f3f589`. The UI subsequently merged into remote `master` (`af83189` before parts 01/02 consolidation). Completed parts 01–03, the UI and these planning Markdown files are consolidated into local `master`.
 
 **Branch policy (explicit user instruction, 1 October 2026):** all future parts use the single shared `feat/improvements` branch, based on the latest `master`. Reuse it across parts and agent reviews; never create per-part, agent, review, worktree or auxiliary branches. After each authorized merge into `master`, update the same `feat/improvements` branch before continuing. Retire older feature branches only after verifying their commits are preserved in `master`. Inspect status and ancestry before changes and preserve user work. This policy applies to every numbered plan and supersedes the historical separate-UI-branch guidance.
 
@@ -74,3 +74,9 @@ Rollback means restore the pre-migration database **and** compatible application
 All fourteen overview areas map above. Optional digests/reminders, arbitrary executable templates, multi-transport email, automatic destructive retention, multiworker scaling and page-level resumable checking remain separate future choices. They are not silently required by these plans. Manual repair is implemented in 13; automatic expiry/error-triggered metadata refresh can be added later once the repair path is proven.
 
 The requested adversarial review is recorded in [review findings](adversarial-review.md), with corrections applied to the actual plan files. Acceptance checks specify future implementation verification; creating these documents does not mean those features passed tests.
+
+## Consolidation checkpoint — 2 October 2026
+
+The user renewed explicit permission to commit, merge and retire old branches before continuing. Local `master` was fast-forwarded to `ba6a04a`, preserving completed parts 01–03. Only `master` and the shared `feat/improvements` branch remain locally; the remote has only `master` and no open pull requests. No branch deletion was needed. Documentation updates are committed on `master`, then the same `feat/improvements` branch is advanced to that commit. Remote publication remains prohibited by the existing instruction.
+
+Interrupted part 04 edits are preserved on `feat/improvements` and are not a completed release: schema-6 recovery compatibility, behavioral verification, adversarial fixes and the completion handoff remain required. Resume that work on the same branch after consolidation. The earlier README integration stash remains preserved.

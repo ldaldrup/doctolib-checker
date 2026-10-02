@@ -306,4 +306,6 @@ Rollback restores the matching earlier database **and** application version afte
 
 Completed improvements are consolidated into `master`. Continue the numbered [implementation plans](docs/implementation-plans/README.md) sequentially on the single shared `feat/improvements` branch, starting from the latest `master`. Reuse that branch for every remaining part; do not create per-part, agent, review or auxiliary branches. Merge completed, reviewed work into `master`, then bring `feat/improvements` forward before continuing.
 
-Parts 01–03 are complete; the [part 03 handoff](docs/implementation-plans/03-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.
+Parts 01–03 are committed and consolidated into local `master`; the [part 03 handoff](docs/implementation-plans/03-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.
+
+Consolidation checkpoint (2 October 2026): only local `master` and `feat/improvements` remain; the remote has only `master` and no open pull requests. Part 04 is interrupted work on `feat/improvements`, pending verification and review. Keep all remaining implementation and adversarial reviews on that one feature branch. Remote publication remains prohibited by the current instruction.
