@@ -2,7 +2,7 @@
 
 Planning only, 1 October 2026. Start here, then execute one numbered plan at a time. These files are a specification for future implementation, not evidence of implemented or deployed behavior. Source overview: [improvement overview](../improvement-overview.md).
 
-Execution status: **parts 01–03 completed locally**; see the [part 01 handoff](01-completion-handoff.md) and [part 02 handoff](02-completion-handoff.md) and [part 03 handoff](03-completion-handoff.md) for implementation, verification, adversarial fixes and next-step boundaries. Parts 01–03 are committed and consolidated into local `master`. Part 04 has an interrupted, unverified implementation on `feat/improvements`; parts 05–14 remain plans. All further implementation and adversarial reviews reuse only `feat/improvements`; no additional branches are permitted. The current instruction prohibits remote pushes; repository changes do not imply a production rollout.
+Execution status: **parts 01–04 completed locally**; see the [part 01 handoff](01-completion-handoff.md) and [part 02 handoff](02-completion-handoff.md) and [part 03 handoff](03-completion-handoff.md) for implementation, verification, adversarial fixes and next-step boundaries. Parts 01–04 are committed and consolidated into local `master`. Part 04 was implemented and verified on the same `feat/improvements` branch; see the [part 04 handoff](04-completion-handoff.md). Parts 05–14 remain plans. All further implementation and adversarial reviews reuse only `feat/improvements`; no additional branches are permitted. The current instruction prohibits remote pushes; repository changes do not imply a production rollout.
 
 ## Sequence and coverage
 
@@ -80,3 +80,5 @@ The requested adversarial review is recorded in [review findings](adversarial-re
 The user renewed explicit permission to commit, merge and retire old branches before continuing. Local `master` was fast-forwarded to `ba6a04a`, preserving completed parts 01–03. Only `master` and the shared `feat/improvements` branch remain locally; the remote has only `master` and no open pull requests. No branch deletion was needed. Documentation updates are committed on `master`, then the same `feat/improvements` branch is advanced to that commit. Remote publication remains prohibited by the existing instruction.
 
 Interrupted part 04 edits are preserved on `feat/improvements` and are not a completed release: schema-6 recovery compatibility, behavioral verification, adversarial fixes and the completion handoff remain required. Resume that work on the same branch after consolidation. The earlier README integration stash remains preserved.
+
+Part 04 continuation completed locally after the consolidation checkpoint. Its [completion handoff](04-completion-handoff.md) supersedes the interrupted-work status above; all changes remain on the same `feat/improvements` branch.

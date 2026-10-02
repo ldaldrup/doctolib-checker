@@ -112,12 +112,60 @@ class Repository:
         item.pop("lock_run_id", None)
         item.pop("lock_owner_token", None)
         if conn is not None:
+            item["check_intent"] = self._intent_evidence(conn, item["id"])
+            item["current_run"] = self._current_run(conn, item["id"])
+        if conn is not None:
             item["targets"] = [dict(target) for target in conn.execute(
                 "SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (item["id"],)
             ).fetchall()]
         for key in ("telehealth", "telegram_enabled"):
             item[key] = bool(item[key])
         return item
+
+    @staticmethod
+    def _current_run(conn, job_id):
+        row = conn.execute("""SELECT r.id,r.outcome,r.search_revision,r.triggered_by,r.intent_id,r.paused_manual
+            FROM check_runs r JOIN jobs j ON j.lock_run_id=r.id WHERE j.id=? AND r.outcome='running'
+            AND j.lock_until>?""", (job_id, precise_iso())).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _intent_evidence(conn, job_id, intent_id=None):
+        row = conn.execute("""SELECT i.*,r.outcome FROM check_intents i LEFT JOIN check_runs r ON r.id=i.run_id
+            WHERE i.job_id=? AND (? IS NULL OR i.id=?)
+            ORDER BY CASE WHEN i.status='queued' THEN 0 ELSE 1 END,
+            i.rowid DESC LIMIT 1""", (job_id, intent_id, intent_id)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result.update(requested_revision=row['search_revision'],run_outcome=row['outcome'],
+                      reason=row['triggered_by'],cancellation_reason=row['cancel_reason'])
+        return result
+
+    @staticmethod
+    def _queue_intent(conn, job, trigger, now):
+        queued = conn.execute("SELECT * FROM check_intents WHERE job_id=? AND status='queued'", (job['id'],)).fetchone()
+        eligible = max(now, parse_time(job['last_extra_started_at']) + timedelta(seconds=60)) if job['last_extra_started_at'] else now
+        intent_id = queued['id'] if queued else new_id()
+        if queued:
+            conn.execute("""UPDATE check_intents SET search_revision=?,triggered_by=?,requested_at=?,eligible_at=?,
+                paused_manual=?,status_version=? WHERE id=?""",
+                (job['search_revision'],trigger,precise_iso(now),precise_iso(eligible),int(job['status']=='paused'),job['status_version'],intent_id))
+        else:
+            conn.execute("""INSERT INTO check_intents(id,job_id,search_revision,triggered_by,requested_at,eligible_at,
+                status,paused_manual,status_version) VALUES(?,?,?,?,?,?,'queued',?,?)""",
+                (intent_id,job['id'],job['search_revision'],trigger,precise_iso(now),precise_iso(eligible),int(job['status']=='paused'),job['status_version']))
+        evidence = Repository._intent_evidence(conn, job['id'], intent_id)
+        evidence['coalesced'] = queued is not None
+        return evidence
+
+    def request_check(self, job_id):
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute("SELECT * FROM jobs WHERE id=? AND status!='deleted'", (job_id,)).fetchone()
+            if job is None:
+                raise NotFoundError("Job not found")
+            return self._queue_intent(conn, job, 'manual', utc_now())
 
     def create_job(self, values, targets):
         if values["interval_seconds"] < self.minimum_poll_interval_seconds:
@@ -238,10 +286,14 @@ class Repository:
             if changed:
                 conn.execute("UPDATE jobs SET search_revision=search_revision+?,edit_version=edit_version+1,updated_at=? WHERE id=?",
                              (int(search_changed), iso(), job_id))
-            due = self._minimum_due(row, utc_now())
-            # Keep the claim intact: its immutable snapshot remains historical
-            # if edited. Durable follow-up intents are introduced in part 04.
-            conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (precise_iso(due), job_id))
+            if search_changed:
+                current = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if current['status'] == 'active':
+                    self._queue_intent(conn, current, 'search_edit', utc_now())
+                else:
+                    conn.execute("UPDATE check_intents SET status='cancelled',cancel_reason='search_edited' WHERE job_id=? AND status='queued'", (job_id,))
+                conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='search_edited'
+                    WHERE job_id=? AND status IN ('pending','failed') AND search_revision IS NOT ?""", (job_id,current['search_revision']))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
     def set_status(self, job_id, status):
@@ -252,6 +304,11 @@ class Repository:
             row = conn.execute("SELECT * FROM jobs WHERE id=? AND status != 'deleted'", (job_id,)).fetchone()
             if row is None:
                 raise NotFoundError("Job not found")
+            if status != row['status'] or status == 'paused':
+                conn.execute("UPDATE jobs SET status_version=status_version+1 WHERE id=?", (job_id,))
+                conn.execute("UPDATE check_intents SET status='cancelled',cancel_reason='status_changed' WHERE job_id=? AND status='queued'", (job_id,))
+                if status != 'active':
+                    conn.execute("UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='job_paused' WHERE job_id=? AND status IN ('pending','failed')", (job_id,))
             due = row["next_check_at"]
             lock = row["lock_until"]
             if status == "active":
@@ -290,57 +347,71 @@ class Repository:
             conn.execute("BEGIN IMMEDIATE")
             now = utc_now()
             now_text = precise_iso(now)
-            rows = conn.execute(
-                """SELECT * FROM jobs WHERE status='active' AND next_check_at<=?
-                AND (lock_until IS NULL OR lock_until<=?) ORDER BY next_check_at LIMIT ?""",
-                (now_text, now_text, limit),
-            ).fetchall()
+            rows = conn.execute("""SELECT j.* FROM jobs j LEFT JOIN check_intents i ON i.job_id=j.id AND i.status='queued'
+                WHERE j.status!='deleted' AND (j.lock_until IS NULL OR j.lock_until<=?)
+                AND ((i.id IS NOT NULL AND i.eligible_at<=? AND i.search_revision=j.search_revision
+                  AND i.status_version=j.status_version AND (j.status='active' OR i.paused_manual=1)
+                  AND (j.last_extra_started_at IS NULL OR j.last_extra_started_at<=?))
+                  OR (j.status='active' AND j.next_check_at<=?))
+                ORDER BY CASE WHEN i.id IS NOT NULL AND i.eligible_at<=? THEN i.eligible_at ELSE j.next_check_at END LIMIT ?""",
+                (now_text,now_text,precise_iso(now-timedelta(seconds=60)),now_text,now_text,limit)).fetchall()
             for row in rows:
-                run_id = new_id()
-                owner_token = new_id()
-                targets = [dict(target) for target in conn.execute(
-                    "SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (row["id"],))]
+                intent = conn.execute("SELECT * FROM check_intents WHERE job_id=? AND status='queued'", (row['id'],)).fetchone()
+                extra_ready = (intent is not None and parse_time(intent['eligible_at'])<=now
+                    and intent['search_revision']==row['search_revision'] and intent['status_version']==row['status_version']
+                    and (row['status']=='active' or intent['paused_manual'])
+                    and (not row['last_extra_started_at'] or parse_time(row['last_extra_started_at'])<=now-timedelta(seconds=60)))
+                if not extra_ready:
+                    intent = None
+                run_id, owner_token = new_id(), new_id()
+                targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (row['id'],))]
                 search = {key: row[key] for key in SEARCH_FIELDS}
-                search["telehealth"] = bool(search["telehealth"])
+                search['telehealth'] = bool(search['telehealth'])
                 _zone, earliest, latest = DoctolibClient._window(search, now)
-                search.update(effective_earliest_date=earliest.isoformat(), effective_latest_date=latest.isoformat())
-                snapshot = {"search": search, "targets": targets, "evaluated_at": precise_iso(now)}
-                changed = conn.execute(
-                    """UPDATE jobs SET lock_until=?,lock_run_id=?,lock_owner_token=?,last_started_at=? WHERE id=? AND status='active'
-                    AND (lock_until IS NULL OR lock_until<=?)""",
-                    (precise_iso(now + timedelta(minutes=10)), run_id, owner_token, now_text, row["id"], now_text),
-                ).rowcount
-                if not changed:
-                    continue
-                conn.execute(
-                    """INSERT INTO check_runs(id,job_id,job_name,started_at,outcome,search_revision,
-                    search_snapshot,snapshot_known,owner_token) VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (run_id, row["id"], row["name"], now_text, "running", row["search_revision"],
-                     json.dumps(snapshot, sort_keys=True), 1, owner_token),
-                )
-                claimed_job = dict(row)
-                claimed_job.update(owner_token=owner_token, search_snapshot=snapshot)
-                claimed.append((run_id, claimed_job))
-            conn.execute(
-                """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at)
-                VALUES(1,?,?) ON CONFLICT(singleton_id) DO UPDATE SET last_seen_at=excluded.last_seen_at""",
-                (now_text, now_text),
-            )
+                search.update(effective_earliest_date=earliest.isoformat(),effective_latest_date=latest.isoformat())
+                snapshot = {'search':search,'targets':targets,'evaluated_at':now_text}
+                conn.execute("""UPDATE jobs SET lock_until=?,lock_run_id=?,lock_owner_token=?,last_started_at=?,
+                    last_extra_started_at=CASE WHEN ? THEN ? ELSE last_extra_started_at END WHERE id=?""",
+                    (precise_iso(now+timedelta(minutes=10)),run_id,owner_token,now_text,int(intent is not None),now_text,row['id']))
+                trigger = intent['triggered_by'] if intent else 'schedule'
+                paused_manual = int(bool(intent and intent['paused_manual']))
+                intent_id = intent['id'] if intent else None
+                conn.execute("""INSERT INTO check_runs(id,job_id,job_name,started_at,outcome,search_revision,
+                    search_snapshot,snapshot_known,owner_token,triggered_by,intent_id,paused_manual,status_version)
+                    VALUES(?,?,?,?,'running',?,?,1,?,?,?,?,?)""",
+                    (run_id,row['id'],row['name'],now_text,row['search_revision'],json.dumps(snapshot,sort_keys=True),
+                     owner_token,trigger,intent_id,paused_manual,row['status_version']))
+                if intent:
+                    conn.execute("UPDATE check_intents SET status='running',run_id=? WHERE id=? AND status='queued'", (run_id,intent_id))
+                job = dict(row)
+                job.update(owner_token=owner_token,search_snapshot=snapshot,intent_id=intent_id,triggered_by=trigger,paused_manual=paused_manual)
+                claimed.append((run_id,job))
+            conn.execute("""INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at) VALUES(1,?,?)
+                ON CONFLICT(singleton_id) DO UPDATE SET last_seen_at=excluded.last_seen_at""", (now_text,now_text))
         return claimed
 
+    @staticmethod
+    def _run_capable(job, run):
+        return (job['status_version'] == run['status_version'] and
+                (job['status']=='active' or (job['status']=='paused' and run['paused_manual'] and
+                    job['search_revision']==run['search_revision'])))
+
+    def run_can_check(self, job_id, run_id, owner_token):
+        with self.database.connection() as conn:
+            run = self._owned(conn,job_id,run_id,owner_token)
+            job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return bool(run and job and self._run_capable(job,run))
+
     def renew_job_lock(self, job_id, run_id, owner_token=None, lease_minutes=10):
-        """Extend this run's lease before another outbound request starts."""
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            changed = conn.execute(
-                """UPDATE jobs SET lock_until=? WHERE id=? AND status='active' AND lock_run_id=?
-                AND lock_owner_token=? AND lock_until>? AND EXISTS
-                (SELECT 1 FROM check_runs WHERE id=? AND owner_token=? AND outcome='running')""",
-                (precise_iso(now + timedelta(minutes=lease_minutes)), job_id, run_id, owner_token,
-                 precise_iso(now), run_id, owner_token),
-            ).rowcount
-            return changed == 1
+            run = self._owned(conn,job_id,run_id,owner_token)
+            job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not run or not job or not self._run_capable(job,run):
+                return False
+            conn.execute("UPDATE jobs SET lock_until=? WHERE id=? AND lock_run_id=? AND lock_owner_token=?",
+                (precise_iso(utc_now()+timedelta(minutes=lease_minutes)),job_id,run_id,owner_token))
+            return True
 
     def _owned(self, conn, job_id, run_id, owner_token):
         if not owner_token:
@@ -388,9 +459,9 @@ class Repository:
             previous = conn.execute("SELECT id FROM check_results WHERE run_id=? AND target_id=?", (run_id, target["id"])).fetchone()
             if previous:
                 return previous["id"]
-            current = conn.execute("SELECT search_revision,status FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            current = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
             active = conn.execute("SELECT active FROM targets WHERE id=? AND job_id=?", (target["id"], job["id"])).fetchone()
-            published = (current["status"] == "active" and current["search_revision"] == run["search_revision"]
+            published = (self._run_capable(current, run) and current["search_revision"] == run["search_revision"]
                          and active is not None and active["active"])
             conn.execute(
                 """INSERT INTO check_results
@@ -477,7 +548,9 @@ class Repository:
                 JOIN jobs j ON j.id=t.job_id WHERE t.id=? AND j.id=?""",
                 (target["id"], job["id"]),
             ).fetchone()
-            if (state is None or not state["active"] or state["job_status"] != "active" or
+            current_job = conn.execute("SELECT * FROM jobs WHERE id=?", (job['id'],)).fetchone()
+            result_run = conn.execute("SELECT * FROM check_runs WHERE id=?", (result['run_id'],)).fetchone()
+            if (state is None or not state["active"] or not self._run_capable(current_job, result_run) or
                     not state["telegram_enabled"] or state["last_status"] != "available" or
                     state["last_earliest_slot"] != slot_text or state["search_revision"] != result["search_revision"]):
                 return None
@@ -498,7 +571,7 @@ class Repository:
             if existing["status"] == "cancelled":
                 reactivated = conn.execute(
                     """UPDATE alerts SET status='pending',result_id=?,next_attempt_at=?,search_revision=?,
-                    error_summary=NULL WHERE id=? AND claim_owner_token IS NULL AND delivery_state IN ('ready','retry') AND error_summary IN ('slot_expired','availability_disappeared','earliest_slot_changed')""",
+                    error_summary=NULL WHERE id=? AND claim_owner_token IS NULL AND delivery_state IN ('ready','retry') AND error_summary IN ('slot_expired','availability_disappeared','earliest_slot_changed','search_edited','job_paused','status_changed')""",
                     (result_id, now, result["search_revision"], existing["id"]),
                 ).rowcount
                 if not reactivated:
@@ -511,8 +584,9 @@ class Repository:
             """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
             r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
             j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
-            j.interval_seconds,t.active AS target_active,s.last_status,s.last_earliest_slot
-            FROM alerts a JOIN check_results r ON r.id=a.result_id
+            j.interval_seconds,j.status_version AS current_status_version, cr.status_version AS run_status_version,
+            cr.paused_manual,cr.intent_id,t.active AS target_active,s.last_status,s.last_earliest_slot
+            FROM alerts a JOIN check_results r ON r.id=a.result_id JOIN check_runs cr ON cr.id=r.run_id
             JOIN jobs j ON j.id=a.job_id LEFT JOIN targets t ON t.id=a.target_id
             LEFT JOIN target_alert_state s ON s.target_id=a.target_id
             WHERE (? IS NULL OR a.id=?) ORDER BY COALESCE(a.next_attempt_at,a.created_at),a.created_at,a.rowid""",
@@ -521,7 +595,8 @@ class Repository:
 
     @staticmethod
     def _delivery_eligible(alert, now):
-        return (alert['status'] in ('pending', 'failed') and alert['job_status'] == 'active'
+        return (alert['status'] in ('pending', 'failed') and (alert['job_status'] == 'active' or (alert['job_status'] == 'paused' and alert['paused_manual']))
+                and alert['current_status_version'] == alert['run_status_version']
                 and alert['telegram_enabled'] and alert['target_active']
                 and alert['snapshot_known'] and alert['published']
                 and alert['search_revision'] == alert['current_revision'] == alert['result_revision']
@@ -549,6 +624,10 @@ class Repository:
             reason = None
             if row['job_status'] == 'deleted':
                 reason = 'job_deleted'
+            elif row['current_status_version'] != row['run_status_version']:
+                reason = 'status_changed'
+            elif row['search_revision'] != row['current_revision']:
+                reason = 'search_edited'
             elif not row['target_active']:
                 reason = 'target_removed'
             elif (row['snapshot_known'] and row['published'] and
@@ -781,6 +860,8 @@ class Repository:
                 (precise_iso(now + timedelta(seconds=effective_interval)), precise_iso(now), outcome,
                  job_id, run_id, owner_token),
             )
+            if run['intent_id']:
+                conn.execute("UPDATE check_intents SET status='completed' WHERE id=? AND status='running'", (run['intent_id'],))
             conn.execute(
                 """INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at,last_completed_run_at,last_error)
                 VALUES(1,?,?,?,?) ON CONFLICT(singleton_id) DO UPDATE SET last_seen_at=excluded.last_seen_at,
@@ -800,6 +881,7 @@ class Repository:
                 OR r.owner_token IS NULL)""", (now,),
             ).fetchall()
             for run in stale:
+                conn.execute("UPDATE check_intents SET status='completed' WHERE run_id=? AND status='running'", (run['id'],))
                 conn.execute(
                     """UPDATE check_runs SET outcome='interrupted',finished_at=?,
                     successful_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status!='error'),
@@ -847,7 +929,7 @@ class Repository:
         with self.database.connection() as conn:
             runs = [dict(row) for row in conn.execute(
                 """SELECT id,job_id,job_name,started_at,finished_at,outcome,successful_targets,
-                failed_targets,triggered_by,search_revision,search_snapshot,snapshot_known FROM check_runs WHERE job_id=?
+                failed_targets,triggered_by,search_revision,search_snapshot,snapshot_known,intent_id,paused_manual,status_version FROM check_runs WHERE job_id=?
                 ORDER BY started_at DESC,rowid DESC LIMIT ? OFFSET ?""",
                 (job_id, limit, offset),
             ).fetchall()]

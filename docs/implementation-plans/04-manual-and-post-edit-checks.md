@@ -26,3 +26,7 @@ Inspect check-now routes, `set_job_due/update_job/claim_due_jobs/finish_run`, cu
 **Ship gate:** actual override plus post-edit flow works; wiring the old floor-respecting endpoint alone is insufficient. Handoff names budget/intent consumption semantics and manual paused capability so 06/10/12 preserve it.
 
 **Major risks:** paused checks permanently bypassing pause; old finish deleting latest intent; edit storms evading server budget; implying guaranteed immediate start; re-alerting unchanged slots on manual checks.
+
+## Local completion
+
+Implemented and verified on 2 October 2026 using only `feat/improvements`, then consolidated into local `master` under the existing authorization. See the [part 04 completion handoff](04-completion-handoff.md) for schema-6 contracts, adversarial fixes, backend/native UI verification and bounded real-provider evidence. Parts 05–14 remain plans; remote publication and production deployment are separate.

@@ -1,7 +1,7 @@
 import { renderDeliveryNotice } from "./delivery-view.js";
 import { api, createJobPayload, updateJobPayload, settingsPayload } from "./api.js";
 import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
-import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata } from "./pages/jobs.js";
+import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata, savedJobFeedback } from "./pages/jobs.js";
 import { renderSettings, settingWarning } from "./pages/settings.js";
 
 const app = document.querySelector("#app"), toast = document.querySelector("#toast"), dialog = document.querySelector("#confirm-dialog");
@@ -10,6 +10,7 @@ const state = {
   load: Object.fromEntries(["jobs", "settings", "status"].map(key => [key, {phase: "loading", error: null}])),
   views: new Map(), histories: new Map(), targetMetadata: new Map(),
   formDraft: null, editingId: null, original: null, pendingJobs: new Set(),
+  checkSubmitting: new Set(), checkErrors: new Map(),
   jobSubmitting: false, settingsSubmitting: false, jobError: null, settingsError: null,
   settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false,
   query: "", filter: "all", intervalFilter: "all", uncertainCreate: null
@@ -278,11 +279,11 @@ async function submitJob(form) {
   let payload;
   try { payload = state.original ? updateJobPayload(state.formDraft, state.original, state.settings) : createJobPayload(state.formDraft, state.settings); }
   catch (error) { state.jobError = error; showErrors(error, "job-form", "job-form-error"); return; }
-  const id = state.editingId, ids = new Set(state.jobs.map(job => job.id));
+  const id = state.editingId, original = state.original, ids = new Set(state.jobs.map(job => job.id));
   state.jobSubmitting = true; if (id) state.pendingJobs.add(id); render();
   try {
     const job = id ? await api.updateJob(id, payload) : await api.createJob(payload);
-    canonicalJob(job); resetEditor(); announce(id ? "Job saved." : "Job created."); await refresh();
+    canonicalJob(job); state.checkErrors.delete(job.id); resetEditor(); announce(id ? savedJobFeedback(original, job) : "Job created."); await refresh();
   } catch (error) {
     state.jobError = error;
     if (!id && error.ambiguous) state.uncertainCreate = {payload, ids};
@@ -350,6 +351,20 @@ async function mutateJob(job, action) {
   } catch (error) { announce(message(error)); if (error.ambiguous || error.status === 404) await refresh(); }
   finally { state.pendingJobs.delete(job.id); patchJobs(); }
 }
+async function requestJobCheck(job) {
+  if (state.pendingJobs.has(job.id) || job.check_intent?.status === "queued") return;
+  state.pendingJobs.add(job.id); state.checkSubmitting.add(job.id); state.checkErrors.delete(job.id); patchJobs();
+  try {
+    const intent = await api.checkNowJob(job.id);
+    canonicalJob({...job, check_intent: intent});
+    announce(intent.coalesced ? "The saved check request covers this revision." : job.status === "paused" ? "One check requested. The job remains paused." : "Check requested. It will start at the earliest eligible worker turn.");
+    await refresh();
+  } catch (error) {
+    const feedback = error.ambiguous ? `${message(error)} Refresh to inspect the saved request before trying again.` : message(error);
+    state.checkErrors.set(job.id, feedback); announce(feedback);
+    if (error.ambiguous || error.status === 404) await refresh();
+  } finally { state.pendingJobs.delete(job.id); state.checkSubmitting.delete(job.id); patchJobs(); }
+}
 let searchRefreshTimer;
 let targetValidationTimer, targetValidationActive = false, targetValidationNext = 0;
 function updateTargetMetadata() {
@@ -409,6 +424,7 @@ document.addEventListener("click", event => {
     dialog.showModal(); return;
   }
   if (!job || state.pendingJobs.has(job.id)) return;
+  if (action === "check-now") { requestJobCheck(job); return; }
   if (["pause", "resume"].includes(action)) { mutateJob(job, action); return; }
   if (action === "edit" && !state.jobSubmitting) {
     state.editingId = job.id; state.original = structuredClone(job);

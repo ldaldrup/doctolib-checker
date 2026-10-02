@@ -456,13 +456,13 @@ def test_edit_preserves_original_options_across_targets_in_same_run(tmp_path):
     job = response.json()
     updating = UpdatingDoctolib(client, doctolib.fixture_session, job["id"])
 
-    Journey(repository, updating, settings, notifier=FakeNotifier()).run_due()
+    Journey(repository, updating, settings, notifier=FakeNotifier()).run_due(limit=1)
 
     assert [search["insurance_sector"] for search in updating.searches] == ["public", "public"]
     assert [search["telehealth"] for search in updating.searches] == [False, False]
 
 
-def test_pause_resume_and_check_now_obey_minimum_interval_after_restart(tmp_path):
+def test_manual_intent_bypasses_floor_while_resume_preserves_it_after_restart(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
     notifier = FakeNotifier()
@@ -470,7 +470,9 @@ def test_pause_resume_and_check_now_obey_minimum_interval_after_restart(tmp_path
 
     queued = client.post("/api/v1/jobs/" + job["id"] + "/check-now")
     assert queued.status_code == 200
-    assert parse_time(queued.json()["next_check_at"]) >= utc_now() + timedelta(seconds=295)
+    assert queued.json()["status"] == "queued"
+    assert parse_time(queued.json()["eligible_at"]) <= utc_now()
+    assert parse_time(repository.get_job(job["id"])["next_check_at"]) >= utc_now() + timedelta(seconds=295)
     assert client.post("/api/v1/jobs/" + job["id"] + "/pause").json()["status"] == "paused"
     assert client.post("/api/v1/jobs/" + job["id"] + "/resume").json()["status"] == "active"
 
@@ -492,11 +494,12 @@ def test_edit_during_run_keeps_claim_and_uses_new_interval(tmp_path):
     assert edited.status_code == 200
     assert repository.get_job(job["id"])["lock_until"] == lock_until
     assert repository.claim_due_jobs(limit=1) == []
-    assert client.post("/api/v1/jobs/" + job["id"] + "/check-now").status_code == 409
+    assert client.post("/api/v1/jobs/" + job["id"] + "/check-now").status_code == 200
 
     repository.finish_run(run_id, job["id"], 0, 0, claimed_job["interval_seconds"], owner_token=claimed_job["owner_token"])
     current = repository.get_job(job["id"])
     assert current["interval_seconds"] == 600
+    assert current["check_intent"]["status"] == "queued"
     assert parse_time(current["next_check_at"]) >= utc_now() + timedelta(seconds=595)
 
 
@@ -569,7 +572,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -610,7 +613,7 @@ def test_failed_telegram_delivery_preserves_available_result_and_history(tmp_pat
     assert len(retry_notifier.sent) == 1
 
 
-def test_pending_telegram_alert_waits_until_job_active_and_telegram_enabled(tmp_path):
+def test_pause_revokes_old_alert_and_fresh_run_requires_telegram_enabled(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
     Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
@@ -631,6 +634,10 @@ def test_pending_telegram_alert_waits_until_job_active_and_telegram_enabled(tmp_
 
     assert client.patch("/api/v1/jobs/" + job["id"], json={"telegram_enabled": True}).status_code == 200
     checker.dispatch_pending()
+    assert retry_notifier.sent == []  # Resume cannot revive the pre-pause capability.
+    assert repository.alerts()[0]['status'] == 'cancelled'
+    repository.request_check(job['id'])
+    checker.run_due()
     assert len(retry_notifier.sent) == 1
 
 
@@ -706,11 +713,12 @@ def test_pause_and_error_do_not_make_an_old_alert_send_without_confirmation(tmp_
     run_id, claimed = claim_for_result(repository, job)
     target = claimed["search_snapshot"]["targets"][0]
     repository.insert_error_result(run_id, claimed, target, "doctolib_request_error", "retry later", owner_token=claimed["owner_token"])
-    assert repository.alerts()[0]["status"] == "failed"
+    assert repository.alerts()[0]["status"] == "cancelled"
     checker.dispatch_pending()
     assert notifier.sent == []
 
-    record_result(repository, job, "available", slot, 3)
+    target, result_id = record_result(repository, job, "available", slot, 3)
+    repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token'])
     checker.dispatch_pending()
     assert len(notifier.sent) == 1
 
@@ -771,7 +779,7 @@ def test_reappearance_alerts_again_but_count_change_does_not(tmp_path):
     assert all(alert["status"] == "sent" for alert in alerts)
 
 
-def test_configured_minimum_applies_to_patch_and_manual_scheduling(tmp_path):
+def test_configured_minimum_applies_to_recurring_but_manual_intent_overrides(tmp_path):
     client, repository, _settings, _doctolib = setup_backend(tmp_path, minimum_interval=600)
     too_fast = client.post("/api/v1/jobs", json={
         "name": "Too fast", "target_urls": [URL], "interval_seconds": 300,
@@ -797,7 +805,8 @@ def test_configured_minimum_applies_to_patch_and_manual_scheduling(tmp_path):
     assert parse_time(resumed.json()["next_check_at"]) >= floor
     check_now = client.post("/api/v1/jobs/" + job["id"] + "/check-now")
     assert check_now.status_code == 200
-    assert parse_time(check_now.json()["next_check_at"]) >= floor
+    assert parse_time(check_now.json()["eligible_at"]) <= utc_now()
+    assert parse_time(repository.get_job(job["id"])["next_check_at"]) >= floor
 
 
 def test_raising_server_minimum_normalizes_existing_job_and_default(tmp_path):
@@ -859,7 +868,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
@@ -933,7 +942,18 @@ def test_shared_request_gate_reservations_survive_repository_reopen(tmp_path, mo
     assert next_allowed == fixed_now + timedelta(seconds=6)
 
 
+def drop_intent_columns(conn):
+    conn.execute("DROP TABLE IF EXISTS check_intents")
+    for table, columns in {
+        "jobs": ("status_version", "last_extra_started_at"),
+        "check_runs": ("intent_id", "paused_manual", "status_version"),
+    }.items():
+        for column in columns:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+
 def drop_delivery_columns(conn, *, alerts=True):
+    drop_intent_columns(conn)
     conn.execute("DROP TABLE IF EXISTS dispatcher_heartbeat")
     if alerts:
         for column in ("delivery_state", "claim_owner_token", "claim_until", "claim_result_id", "claim_search_revision", "attempt_started_at", "last_attempt_at", "last_attempt_outcome", "delivery_epoch_at", "delivery_epoch_attempts"):
@@ -973,10 +993,10 @@ def test_effective_revision_equality_and_scheduler_versions(tmp_path):
 
 def test_claim_freezes_dates_and_target_metadata_and_hides_owner(tmp_path, monkeypatch):
     client, repository, _settings, _doctolib = setup_backend(tmp_path)
-    job = create_job(client)
-    client.patch('/api/v1/jobs/' + job['id'], json={'date_mode': 'first_available', 'horizon_days': 15})
     fixed = datetime(2026, 10, 1, 21, 59, tzinfo=timezone.utc)
     monkeypatch.setattr('app.storage.repositories.utc_now', lambda: fixed)
+    job = create_job(client)
+    client.patch('/api/v1/jobs/' + job['id'], json={'date_mode': 'first_available', 'horizon_days': 15})
     run_id, claimed = repository.claim_due_jobs(limit=1)[0]
     snapshot = claimed['search_snapshot']
     assert snapshot['search']['effective_earliest_date'] == '2026-10-01'
@@ -992,7 +1012,7 @@ def test_claim_freezes_dates_and_target_metadata_and_hides_owner(tmp_path, monke
     assert claimed['owner_token'] not in client.get('/api/v1/jobs/' + job['id']).text
 
 
-def test_obsolete_response_is_history_only_and_does_not_cancel_pending(tmp_path):
+def test_obsolete_response_is_history_only_after_edit_cancels_pending(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
     Journey(repository, doctolib, settings, notifier=FakeNotifier(False)).run_due()
@@ -1005,7 +1025,8 @@ def test_obsolete_response_is_history_only_and_does_not_cancel_pending(tmp_path)
     history = repository.checks(job['id'])[0]['results'][0]
     assert history['id'] == result_id and not history['published']
     assert history['search_revision'] == claimed['search_revision']
-    assert repository.alerts()[0]['status'] == pending['status']
+    assert repository.alerts()[0]['status'] == 'cancelled'
+    assert repository.alerts()[0]['error_summary'] == 'search_edited'
     assert repository.get_pending_alerts() == []
     with repository.database.connection() as conn:
         assert conn.execute('SELECT last_status FROM target_alert_state WHERE target_id=?', (target['id'],)).fetchone()[0] == 'available'
@@ -1069,7 +1090,7 @@ def test_blocked_inflight_response_after_narrowing_cannot_notify(tmp_path):
     checker = Journey(repository, BlockedDoctolib(), settings, notifier=notifier)
     def run():
         try:
-            checker.run_due()
+            checker.run_due(limit=1)
         except BaseException as exc:
             errors.append(exc)
     worker = threading.Thread(target=run)
@@ -1138,9 +1159,10 @@ def test_legacy_pending_needs_reconfirmation_while_sent_dedupe_survives_revision
 
 def test_request_after_midnight_uses_claim_calendar_and_live_slot_clock(tmp_path, monkeypatch):
     client, repository, _settings, doctolib = setup_backend(tmp_path)
+    before_midnight = datetime(2026, 10, 1, 21, 59, tzinfo=timezone.utc)
+    monkeypatch.setattr('app.storage.repositories.utc_now', lambda: before_midnight)
     job = create_job(client)
     client.patch('/api/v1/jobs/' + job['id'], json={'date_mode': 'first_available', 'horizon_days': 15})
-    before_midnight = datetime(2026, 10, 1, 21, 59, tzinfo=timezone.utc)
     after_midnight = datetime(2026, 10, 1, 22, 1, tzinfo=timezone.utc)
     monkeypatch.setattr('app.storage.repositories.utc_now', lambda: before_midnight)
     _run_id, claimed = repository.claim_due_jobs(limit=1)[0]

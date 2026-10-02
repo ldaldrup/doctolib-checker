@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Database:
@@ -18,7 +18,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5):
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" +
                 """
@@ -54,7 +54,9 @@ class Database:
                     lock_run_id TEXT,
                     lock_owner_token TEXT,
                     search_revision INTEGER NOT NULL DEFAULT 1,
-                    edit_version INTEGER NOT NULL DEFAULT 1
+                    edit_version INTEGER NOT NULL DEFAULT 1,
+                    status_version INTEGER NOT NULL DEFAULT 1,
+                    last_extra_started_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, next_check_at);
                 CREATE TABLE IF NOT EXISTS targets (
@@ -89,7 +91,10 @@ class Database:
                     search_revision INTEGER,
                     search_snapshot TEXT,
                     snapshot_known INTEGER NOT NULL DEFAULT 0,
-                    owner_token TEXT
+                    owner_token TEXT,
+                    intent_id TEXT,
+                    paused_manual INTEGER NOT NULL DEFAULT 0,
+                    status_version INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_job_time ON check_runs(job_id, started_at DESC);
                 CREATE TABLE IF NOT EXISTS check_results (
@@ -158,6 +163,20 @@ class Database:
                     last_seen_at TEXT NOT NULL,
                     last_error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS check_intents (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL REFERENCES jobs(id),
+                    search_revision INTEGER NOT NULL,
+                    triggered_by TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    eligible_at TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','cancelled')),
+                    paused_manual INTEGER NOT NULL DEFAULT 0,
+                    status_version INTEGER NOT NULL,
+                    run_id TEXT,
+                    cancel_reason TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_intents_pending_job ON check_intents(job_id) WHERE status='queued';
                 CREATE TABLE IF NOT EXISTS request_gate (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     next_allowed_at TEXT NOT NULL
@@ -241,6 +260,14 @@ class Database:
                     # silently replay an acknowledgement that was lost.
                     conn.execute("UPDATE alerts SET delivery_state='uncertain',last_attempt_outcome='legacy_unknown' WHERE status IN ('pending','failed')")
                     conn.execute("UPDATE alerts SET delivery_epoch_at=created_at,delivery_epoch_attempts=attempt_count")
+                    current_version = 5
+                if current_version == 5:
+                    for table, columns in {
+                        "jobs": ("status_version INTEGER NOT NULL DEFAULT 1", "last_extra_started_at TEXT"),
+                        "check_runs": ("intent_id TEXT", "paused_manual INTEGER NOT NULL DEFAULT 0", "status_version INTEGER NOT NULL DEFAULT 1"),
+                    }.items():
+                        for column in columns:
+                            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
                     conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
                 elif current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")

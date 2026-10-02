@@ -50,8 +50,9 @@ class CheckService:
         original_hook = getattr(self.doctolib, "before_request", None)
 
         def guard_request():
-            current = self.repository.get_job(job["id"])
-            if current is None or current["status"] != "active":
+            # Only a manual intent created while paused grants one-run access;
+            # status and revision changes revoke that capability in storage.
+            if not self.repository.run_can_check(job["id"], run_id, owner_token):
                 raise _RunStopped()
             if not self.repository.renew_job_lock(job["id"], run_id, owner_token=owner_token):
                 raise LeaseLostError("The check claim is no longer owned")
@@ -83,8 +84,9 @@ class CheckService:
                         # Re-read state after the HTTP request so a pause or
                         # notification edit suppresses delivery for this result.
                         current_job = self.repository.get_job(job["id"])
-                        if (current_job and current_job["status"] == "active"
-                                and current_job["telegram_enabled"]):
+                        if current_job and current_job["telegram_enabled"]:
+                            # Storage requires either active publication or the
+                            # still-current scoped paused manual capability.
                             self.repository.create_alert(
                                 current_job, target, result_id, result.earliest_slot, owner_token=owner_token
                             )

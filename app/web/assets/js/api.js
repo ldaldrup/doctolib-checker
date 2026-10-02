@@ -87,6 +87,7 @@ export const api = {
   updateJob: (id, values, options = {}) => request(`/jobs/${identifier(id)}`, {signal: options.signal, method: "PATCH", body: pick(values, JOB_FIELDS), timeout: Object.hasOwn(values, "target_urls") ? 120_000 : 15_000}),
   pauseJob: (id, options = {}) => request(`/jobs/${identifier(id)}/pause`, {signal: options.signal, method: "POST"}),
   resumeJob: (id, options = {}) => request(`/jobs/${identifier(id)}/resume`, {signal: options.signal, method: "POST"}),
+  checkNowJob: (id, options = {}) => request(`/jobs/${identifier(id)}/check-now`, {signal: options.signal, method: "POST"}),
   deleteJob: (id, options = {}) => request(`/jobs/${identifier(id)}`, {signal: options.signal, method: "DELETE"}),
   updateSettings: (values, options = {}) => request("/settings", {signal: options.signal, method: "PUT", body: pick(values, SETTINGS_FIELDS)})
 };
