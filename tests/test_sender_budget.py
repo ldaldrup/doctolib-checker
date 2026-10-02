@@ -200,7 +200,7 @@ def test_child_ready_permission_fences_and_persists_before_post(monkeypatch, tmp
     alert = repository.alerts()[0]
     assert alert['attempt_count'] == int(not pause_before_permission)
     assert _POST_EVENT.is_set() is not pause_before_permission
-    assert alert['status'] == ('pending' if pause_before_permission else 'sent')
+    assert alert['status'] == ('cancelled' if pause_before_permission else 'sent')
 
 
 def test_expired_budget_after_persisted_permission_never_starts_post(monkeypatch, tmp_path):

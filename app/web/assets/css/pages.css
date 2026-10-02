@@ -145,6 +145,7 @@
 .setup-form .form-fields { display: grid; gap: 18px; }
 .interval-choices { grid-template-columns: repeat(auto-fit, minmax(55px, 1fr)); }
 .job-evidence { margin: 0 0 12px; color: var(--color-muted); font-size: 12px; }
+.job-check-feedback { margin: 0 0 12px; color: var(--color-text); font-size: 12px; overflow-wrap: anywhere; }
 .notice { flex-wrap: wrap; }
 .notice > span { flex: 1; min-width: 160px; }
 .worker-unknown, .worker-unavailable { border-color: var(--color-border); background: var(--color-subtle); color: var(--color-muted); }

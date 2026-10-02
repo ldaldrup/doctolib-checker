@@ -16,7 +16,7 @@ export function safeBookingUrl(value) {
 
 // Includes search/target identity and scheduler evidence, never list.last_result.
 export function historyKey(job) {
-  return JSON.stringify([job.id, job.search_revision, job.updated_at, job.last_started_at, job.last_finished_at, job.last_outcome,
+  return JSON.stringify([job.id, job.search_revision, job.updated_at, job.last_started_at, job.last_finished_at, job.last_outcome, job.check_intent,
     job.date_mode, job.horizon_days, job.earliest_date, job.latest_date, job.time_zone,
     job.insurance_sector, job.telehealth,
     activeTargets(job).map(target => [target.id, target.booking_url, target.last_validated_at])]);

@@ -83,6 +83,42 @@ export function checkedAgo(value, now = Date.now()) {
   return `Checked ${Math.floor(seconds / size)}${suffix} ago`;
 }
 
+// Intent/run identity proves progress. A recent last_finished_at alone does not
+// prove that a user's requested revision was checked.
+export function checkIntentFeedback(job, state, now = Date.now()) {
+  if (state.pendingJobs?.has(job.id) && state.checkSubmitting?.has(job.id)) return "Requesting a check…";
+  const intent = job.check_intent;
+  if (!intent) return null;
+  const revision = intent.search_revision;
+  if (intent.status === "cancelled") return intent.cancel_reason === "search_edited"
+    ? "The saved search changed. The previous check request was cancelled; select Check once for the new search."
+    : "The check request was cancelled.";
+  if (revision !== job.search_revision) return "The requested check belongs to an earlier search revision; awaiting current evidence.";
+  if (intent.status === "queued") {
+    const eligible = Date.parse(intent.eligible_at || "");
+    const queue = Number.isFinite(eligible) && eligible > now
+      ? `Check queued; cooldown ends in ${compactDuration((eligible - now) / 1000)} (${formatSlot(intent.eligible_at, job.time_zone)}).`
+      : "Check queued for the earliest available worker turn.";
+    return `${intent.triggered_by === "search_edit" ? "Saved search: fresh check requested. " : ""}${queue}${state.load?.status?.phase !== "loaded" ? " Worker status is unknown; the request remains saved." : !state.status?.worker_alive ? " Worker unavailable; the request remains saved." : ""}`;
+  }
+  if (intent.status === "running" && intent.run_id) {
+    const progress = job.status === "paused" ? "Checking once; the job remains paused. Matching slots can notify the selected channel." : "Requested check in progress.";
+    return `${progress}${state.load?.status?.phase !== "loaded" ? " Worker status is unknown; this is the last saved running claim." : !state.status?.worker_alive ? " Worker unavailable; this is the last saved running claim and may need reconciliation." : ""}`;
+  }
+  if (intent.status === "completed" && intent.run_id) {
+    const labels = {completed: "Requested check completed.", partial_error: "Requested check completed with some target errors.", error: "Requested check failed.", interrupted: "Requested check was interrupted."};
+    return `${labels[intent.outcome] || "Requested check ended; load check history for its outcome."}${job.status === "paused" ? " The job remains paused." : ""}`;
+  }
+  return "Check request saved; awaiting run evidence.";
+}
+
+export function savedJobFeedback(previous, saved) {
+  if (previous && saved.search_revision !== previous.search_revision) return saved.status === "paused"
+    ? "Job saved. Monitoring remains paused; select Check once to check the changed search. Any obsolete pending check request was cancelled."
+    : "Job saved. A fresh check was requested for the saved search; the worker and shared request spacing determine when it starts.";
+  return "Job saved.";
+}
+
 export function jobStatus(job, state, now = Date.now()) {
   const view = viewFor(state, job);
   if (job.status === "paused") return {label: "Paused", tone: "paused", detail: "Checks are paused"};
@@ -101,6 +137,7 @@ function card(job, state) {
   const detected = view?.detected && view.slot;
   const pending = state.pendingJobs?.has(job.id);
   const status = jobStatus(job, state);
+  const checkFeedback = checkIntentFeedback(job, state);
   const range = job.date_mode === "custom" ? `${h(formatGermanDate(job.earliest_date))} – ${h(formatGermanDate(job.latest_date))}` : `Next ${h(job.horizon_days)} days`;
   return `<article class="panel job-card ${detected ? "job-card-last-detected" : ""}" data-job-id="${h(job.id)}" aria-busy="${Boolean(pending)}">
     ${detected ? `<div class="job-hero"><span class="job-hero-label">${icon("bellActive")} Historical slot detection</span><div class="job-hero-actions"><span class="slot-pill">${icon("calendar")} ${h(formatSlot(view.slot.earliest_slot, job.time_zone))}</span>${view.slot.booking_url ? `<a class="button button-primary button-small" href="${h(view.slot.booking_url)}" target="_blank" rel="noopener noreferrer" aria-label="Open detected target on Doctolib"><span>Open on Doctolib</span>${icon("external")}</a>` : ""}</div></div>` : ""}
@@ -110,8 +147,10 @@ function card(job, state) {
       ${detected ? `<p class="job-evidence">${h(view.slot.practitioner_name || view.slot.practice_name || "Detected target")}. Availability may have changed; opening the link does not reserve a slot.</p>` : ""}
       ${job.status === "paused" && detected ? '<p class="job-evidence">Monitoring is paused; this detection is from a previous check.</p>' : ""}
       ${view?.warning ? `<p class="notice notice-warning">${icon("warning")}<span>${h(view.warning)}</span></p>` : ""}
+      ${checkFeedback ? `<p class="job-check-feedback" role="status">${h(checkFeedback)}</p>` : ""}
+      ${state.checkErrors?.has(job.id) ? `<p class="notice notice-warning" role="status">${h(state.checkErrors.get(job.id))}</p>` : ""}
       <div class="job-meta"><span>Range: <strong>${range}</strong></span><span class="meta-dot">•</span><span>Interval: <strong>${h(compactDuration(job.interval_seconds))}</strong> <span title="${h(nextCheckTitle(job))}">(next: ${h(nextCheck(job, state))})</span></span><span class="meta-dot">•</span><span>Alert: <strong>${job.telegram_enabled ? "Telegram" : "Off"}</strong></span></div>
-      <div class="job-actions">${[[job.status === "paused" ? "resume" : "pause", job.status === "paused" ? "play" : "pause", job.status === "paused" ? "Resume" : "Pause"], ["edit", "edit", "Edit"], ["delete", "trash", "Delete"]].map(([action, symbol, label]) => `<button class="button button-quiet" type="button" data-action="${action}" aria-label="${label} ${h(job.name)}" ${pending ? "disabled" : ""}>${icon(symbol)}<span class="action-label">${label}</span></button>`).join("")}</div>
+      <div class="job-actions">${[["check-now", "bolt", job.status === "paused" ? "Check once" : "Check now"], ...(job.status === "paused" && ["queued", "running"].includes(job.check_intent?.status) ? [["pause", "pause", "Stop check"]] : []), [job.status === "paused" ? "resume" : "pause", job.status === "paused" ? "play" : "pause", job.status === "paused" ? "Resume" : "Pause"], ["edit", "edit", "Edit"], ["delete", "trash", "Delete"]].map(([action, symbol, label]) => `<button class="button button-quiet" type="button" data-action="${action}" aria-label="${label} ${h(job.name)}" ${pending || (action === "check-now" && job.check_intent?.status === "queued") ? "disabled" : ""}>${icon(symbol)}<span class="action-label">${label}</span></button>`).join("")}</div>
     </div></article>`;
 }
 

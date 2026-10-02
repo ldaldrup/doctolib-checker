@@ -3,7 +3,7 @@ import { api, ApiError, createJobPayload, updateJobPayload, settingsPayload } fr
 import { deriveJobView, historyKey, safeBookingUrl } from '/assets/js/job-view.js';
 
 import { settingWarning } from '/assets/js/pages/settings.js';
-import { jobStatus, checkedAgo, renderJobList, compactDuration, nextCheck, nextCheckTitle } from '/assets/js/pages/jobs.js';
+import { jobStatus, checkedAgo, renderJobList, compactDuration, nextCheck, nextCheckTitle, checkIntentFeedback, savedJobFeedback } from '/assets/js/pages/jobs.js';
 
 const lines = [];
 const assert = (condition, message = 'Assertion failed') => { if (!condition) throw new Error(message); };
@@ -24,6 +24,35 @@ async function rejects(fn, kind) {
   try { await fn(); throw new Error('Expected rejection'); }
   catch (error) { assert(error instanceof ApiError && error.kind === kind, `Expected ${kind}, got ${error.message}`); return error; }
 }
+await test('durable check intent shows cooldown, worker health and run outcome without timestamp inference', () => {
+  const now = Date.parse(t(0));
+  const state = {load: {status: {phase: 'loaded'}, jobs: {phase: 'loaded'}}, status: {worker_alive: true}, jobs: [], filter: 'all', intervalFilter: 'all', views: new Map()};
+  const queued = {...job, status: 'active', last_finished_at: t(59), check_intent: {id: 'intent', status: 'queued', search_revision: 1, eligible_at: t(30), triggered_by: 'search_edit'}};
+  assert(checkIntentFeedback(queued, state, now).includes('cooldown ends in 30s'));
+  assert(checkIntentFeedback(queued, state, now).includes('fresh check requested'));
+  state.status.worker_alive = false; assert(checkIntentFeedback(queued, state, now).includes('Worker unavailable'));
+  state.jobs = [queued]; assert(/data-action="check-now"[^>]*disabled/.test(renderJobList(state)));
+  state.checkErrors = new Map([[job.id, 'Uncertain request <script>']]);
+  assert(renderJobList(state).includes('Check queued') && renderJobList(state).includes('Uncertain request &lt;script&gt;'));
+  state.checkErrors.clear();
+  const paused = {...queued, status: 'paused', check_intent: {...queued.check_intent, status: 'running', run_id: 'run'}};
+  assert(checkIntentFeedback(paused, state, now).includes('remains paused'));
+  assert(checkIntentFeedback(paused, state, now).includes('Worker unavailable'));
+  state.jobs = [paused]; assert(renderJobList(state).includes('Check once'));
+  assert(renderJobList(state).includes('Stop check'));
+  state.load.status.phase = 'stale'; assert(checkIntentFeedback(paused, state, now).includes('Worker status is unknown'));
+  state.load.status.phase = 'loaded';
+  for (const [outcome, text] of [['completed', 'completed.'], ['partial_error', 'some target errors'], ['error', 'failed'], ['interrupted', 'interrupted']]) {
+    assert(checkIntentFeedback({...paused, check_intent: {...paused.check_intent, status: 'completed', outcome}}, state).includes(text));
+  }
+  assert(checkIntentFeedback({...paused, check_intent: {...paused.check_intent, status: 'completed', run_id: null}}, state).includes('awaiting run evidence'));
+  assert(checkIntentFeedback({...paused, search_revision: 2}, state).includes('earlier search revision'));
+  assert(checkIntentFeedback({...paused, check_intent: {...paused.check_intent, status: 'cancelled', cancel_reason: 'search_edited'}}, state).includes('select Check once'));
+  equal(checkIntentFeedback(job, state), null);
+  assert(savedJobFeedback(job, {...job, search_revision: 2, status: 'active'}).includes('fresh check was requested'));
+  assert(savedJobFeedback(job, {...job, search_revision: 2, status: 'paused'}).includes('select Check once'));
+  equal(savedJobFeedback(job, {...job, name: 'Renamed', edit_version: 2}), 'Job saved.');
+});
 await test('delivery notices separate dispatcher failure and recovery from checking', () => {
   const state = {load: {status: {phase: 'loaded'}}, status: {worker_alive: true, telegram_configured: true, dispatcher_alive: false,
     delivery_backlog: {queued: 2, action_required: 1, exhausted: 1, uncertain: 3}}};
@@ -226,6 +255,79 @@ await test('15-second refresh retains unchanged cards and unsaved editor control
     assert(!notices.some(text => text?.includes('Loading jobs')), 'Refresh showed transient loading notice');
     assert(!doc.querySelector('.page-actions [data-action="refresh"]'), 'Toolbar Refresh remains');
   } finally { frame.remove(); await api.deleteJob(saved.id); }
+});
+await test('card check requests survive unavailable worker, complete once while paused, and preserve unsaved editor', async () => {
+  const fixtureUrl = 'https://www.doctolib.de/praxis/berlin/beispiel/booking/availabilities?placeId=practice-123&motiveIds%5B%5D=789&practitionerId=456';
+  const saved = await api.createJob({...draft, name: 'Manual check journey', target_urls: [fixtureUrl], telegram_enabled: false});
+  await api.pauseJob(saved.id);
+  let activeSaved = null;
+  const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
+  const waitUntil = async predicate => {
+    const deadline = Date.now() + 7000;
+    while (!predicate()) { if (Date.now() > deadline) throw new Error('Manual check UI journey timed out'); await new Promise(resolve => setTimeout(resolve, 50)); }
+  };
+  try {
+    await waitUntil(() => frame.contentDocument?.querySelector(`[data-job-id="${saved.id}"] [data-action="check-now"]`));
+    const doc = frame.contentDocument, win = frame.contentWindow;
+    const card = () => doc.querySelector(`[data-job-id="${saved.id}"]`);
+    card().querySelector('[data-action="edit"]').click();
+    await waitUntil(() => doc.querySelector('#job-name')?.value === saved.name);
+    const name = doc.querySelector('#job-name'); name.value = 'Unsaved manual draft'; name.dispatchEvent(new win.Event('input', {bubbles: true})); name.focus();
+    const fetch = win.fetch.bind(win); let calls = 0;
+    win.fetch = async (url, options) => {
+      if (String(url).endsWith('/check-now')) { calls++; await new Promise(resolve => setTimeout(resolve, 150)); }
+      return fetch(url, options);
+    };
+    const button = card().querySelector('[data-action="check-now"]'); assert(button.textContent.includes('Check once'));
+    button.click(); button.click();
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('Check queued'));
+    equal(calls, 1); assert(card().querySelector('[data-action="check-now"]').disabled);
+    assert(card().querySelector('.job-check-feedback').textContent.includes('request remains saved'));
+    assert(doc.querySelector('#job-name') === name && name.value === 'Unsaved manual draft', 'Check refresh replaced unsaved editor');
+    const queued = await api.getJob(saved.id); equal(queued.status, 'paused'); equal(queued.check_intent.status, 'queued');
+    await nativeFetch('/__test/checks', {method: 'POST'});
+    doc.querySelector('[data-action="filter"][data-filter="all"]').click();
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('Requested check completed.'));
+    const finished = await api.getJob(saved.id); equal(finished.status, 'paused'); equal(finished.check_intent.status, 'completed');
+    card().querySelector('[data-action="check-now"]').click();
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('cooldown ends'));
+    equal(calls, 2); equal((await api.getJob(saved.id)).status, 'paused');
+    await waitUntil(() => !card().querySelector('[data-action="pause"]')?.disabled);
+    assert(card().querySelector('[data-action="pause"]').textContent.includes('Stop check'));
+    card().querySelector('[data-action="pause"]').click();
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('request was cancelled'));
+    equal((await api.getJob(saved.id)).status, 'paused');
+    await waitUntil(() => !card().querySelector('[data-action="check-now"]').disabled);
+    card().querySelector('[data-action="check-now"]').click();
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('cooldown ends'));
+    const horizon = doc.querySelector('#horizon-days'); horizon.value = '16'; horizon.dispatchEvent(new win.Event('input', {bubbles: true}));
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles: true, cancelable: true}));
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('previous check request was cancelled'));
+    assert(doc.querySelector('#toast').textContent.includes('select Check once'));
+    await api.resumeJob(saved.id); doc.querySelector('[data-action="filter"][data-filter="all"]').click();
+    await waitUntil(() => card().querySelector('[data-action="check-now"]')?.textContent.includes('Check now'));
+    card().querySelector('[data-action="edit"]').click();
+    await waitUntil(() => doc.querySelector('#job-name')?.value === 'Unsaved manual draft');
+    const activeHorizon = doc.querySelector('#horizon-days'); activeHorizon.value = '17'; activeHorizon.dispatchEvent(new win.Event('input', {bubbles: true}));
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles: true, cancelable: true}));
+    await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('fresh check requested'));
+    assert(doc.querySelector('#toast').textContent.includes('fresh check was requested'));
+    activeSaved = await api.createJob({...draft, name: 'Active manual check journey', target_urls: [fixtureUrl], telegram_enabled: false});
+    doc.querySelector('[data-action="filter"][data-filter="all"]').click();
+    const activeCard = () => doc.querySelector(`[data-job-id="${activeSaved.id}"]`);
+    await waitUntil(() => activeCard()?.querySelector('[data-action="check-now"]'));
+    assert(activeCard().querySelector('[data-action="check-now"]').textContent.includes('Check now'));
+    activeCard().querySelector('[data-action="check-now"]').click();
+    await waitUntil(() => activeCard().querySelector('.job-check-feedback')?.textContent.includes('Check queued'));
+    const activeIntent = (await api.getJob(activeSaved.id)).check_intent;
+    assert(activeIntent.id && activeIntent.status === 'queued' && activeIntent.triggered_by === 'manual');
+    await nativeFetch('/__test/checks', {method: 'POST'});
+    doc.querySelector('[data-action="filter"][data-filter="all"]').click();
+    await waitUntil(() => activeCard().querySelector('.job-check-feedback')?.textContent.includes('Requested check completed.'));
+    const activeCompleted = await api.getJob(activeSaved.id);
+    equal(activeCompleted.status, 'active'); equal(activeCompleted.check_intent.id, activeIntent.id);
+    equal(activeCompleted.check_intent.status, 'completed'); assert(activeCompleted.check_intent.run_id);
+  } finally { frame.remove(); await api.deleteJob(saved.id); if (activeSaved) await api.deleteJob(activeSaved.id); }
 });
 await test('settings autosave preserves edits during writes, skips invalid values and exposes retry', async () => {
   const original = await api.getSettings();

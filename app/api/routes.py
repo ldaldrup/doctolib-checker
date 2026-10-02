@@ -168,12 +168,12 @@ def create_router():
     @router.post("/api/v1/jobs/{job_id}/check-now")
     def check_now(job_id: str, request: Request):
         try:
-            due = request.app.state.repository.set_job_due(job_id, utc_now())
+            intent = request.app.state.repository.request_check(job_id)
         except NotFoundError:
             raise HTTPException(status_code=404, detail="job_not_found")
         except ConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        return {"job_id": job_id, "queued": True, "next_check_at": iso(due, timespec="microseconds")}
+        return intent
 
     @router.get("/api/v1/jobs/{job_id}/checks")
     def checks(job_id: str, request: Request, limit: int = Query(default=50, ge=1, le=100),
