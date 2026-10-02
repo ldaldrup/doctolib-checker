@@ -104,6 +104,12 @@ def create_harness(directory):
 document.querySelector('#width').onchange=e=>frame.width=e.target.value;
 document.querySelector('#page').onchange=e=>frame.src='/#'+e.target.value;</script></html>''')
 
+    @app.post("/__test/reset-worker", include_in_schema=False)
+    def reset_worker():
+        with database.connection() as connection:
+            connection.execute("DELETE FROM worker_heartbeat")
+        return {"reset": True}
+
     @app.post("/__test/checks", include_in_schema=False)
     def run_checks():
         return CheckService(repository, doctolib, settings).run_due()

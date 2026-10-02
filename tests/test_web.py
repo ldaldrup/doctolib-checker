@@ -53,7 +53,7 @@ def test_api_and_health_routes_still_take_precedence(client):
     assert settings.headers["cache-control"] == "no-store"
     assert settings.json()["minimum_poll_interval_seconds"] == 300
     updated = client.put("/api/v1/settings", json={
-        "default_interval_seconds": 600, "request_spacing_seconds": 3.5,
+        "default_interval_seconds": 600, "request_spacing_seconds": 3.5, "expected_version": settings.json()["edit_version"],
     })
     assert updated.status_code == 200
     assert updated.json()["default_interval_seconds"] == 600

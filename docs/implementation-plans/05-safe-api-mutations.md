@@ -28,3 +28,7 @@ Use current backend fakes/disposable UI harness. Run focused concurrency/save fl
 **Ship gate:** end-to-end client and API use the same keys/version semantics. Handoff includes expiry/recovery constants and save helpers for 06 onward; callers must not rely on an ignored expected_version field.
 
 **Major risks:** reserving idempotency only after expensive work; keys lost after timeout; replay recomputing changing defaults; autosave overwriting a newer draft; confusing edit_version with search_revision.
+
+## Local completion
+
+Implemented and verified on 2 October 2026 on the existing `feat/improvements` branch, then consolidated into local `master` under the standing authorization. See the [part 05 completion handoff](05-completion-handoff.md) for schema-7 migration, key/version contracts, bounded metadata ownership, adversarial fixes and actual browser/live HTTP evidence. Parts 06–14 remain plans; remote publication and production rollout remain separate.

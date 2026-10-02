@@ -1,14 +1,17 @@
 """Versioned job, result, and settings API."""
 
 from datetime import datetime, timedelta
+import hashlib
+import json
+import re
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, Header, status
 from requests import RequestException
 
-from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest
+from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
 from app.services.jobs import create_job, resolve_target, update_job
-from app.storage.repositories import ConflictError, NotFoundError, iso, utc_now
+from app.storage.repositories import ConflictError, NotFoundError, VersionConflictError, CreateReservationLostError, iso, utc_now
 
 
 def create_router():
@@ -76,25 +79,53 @@ def create_router():
         }
 
     @router.post("/api/v1/jobs", status_code=status.HTTP_201_CREATED)
-    def add_job(body: JobCreateRequest, request: Request):
+    def add_job(body: JobCreateRequest, request: Request, response: Response,
+                idempotency_key: str = Header(alias="Idempotency-Key")):
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", idempotency_key):
+            raise HTTPException(status_code=422, detail={"code": "invalid_idempotency_key"})
         settings = request.app.state.settings
-        values = body.model_dump()
-        supplied = body.model_fields_set
-        db_settings = request.app.state.repository.settings(
-            settings.minimum_poll_interval_seconds, settings.request_spacing_seconds
-        )
-        if "time_zone" not in supplied:
-            values["time_zone"] = settings.default_timezone
-        if "interval_seconds" not in supplied:
-            values["interval_seconds"] = db_settings["default_interval_seconds"]
-        if values["interval_seconds"] < settings.minimum_poll_interval_seconds:
-            raise HTTPException(status_code=422, detail="interval_seconds is below the server minimum")
+        repository = request.app.state.repository
+        # Fingerprint only supplied validated fields. Omitted server defaults
+        # remain omitted here and are frozen in the first owning reservation.
+        supplied = body.model_dump(mode="json", exclude_unset=True)
         try:
-            return create_job(request.app.state.repository, request.app.state.doctolib, settings, values)
-        except (BookingUrlError, MetadataResolutionError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            supplied["target_urls"] = [parse_booking_url(url)["url"] for url in body.target_urls]
+            if len(set(supplied["target_urls"])) != len(supplied["target_urls"]):
+                raise ValueError("duplicate targets")
+        except (BookingUrlError, ValueError):
+            raise HTTPException(status_code=422, detail={"code": "invalid_job", "retryable": False})
+        fingerprint = hashlib.sha256(json.dumps(supplied, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()
+        values = body.model_dump(mode="json")
+        values["target_urls"] = supplied["target_urls"]
+        db_settings = repository.settings(settings.minimum_poll_interval_seconds, settings.request_spacing_seconds)
+        if "time_zone" not in body.model_fields_set:
+            values["time_zone"] = settings.default_timezone
+        if "interval_seconds" not in body.model_fields_set:
+            values["interval_seconds"] = db_settings["default_interval_seconds"]
+        if values["telegram_enabled"] is None:
+            values["telegram_enabled"] = settings.telegram_enabled
+        try:
+            operation = repository.reserve_create(idempotency_key, fingerprint, values)
+        except ConflictError:
+            raise HTTPException(status_code=409, detail={"code": "idempotency_conflict"})
+        if operation["state"] != "owned":
+            return creation_outcome(operation, response)
+        try:
+            canonical = operation["canonical_values"]
+            if canonical["interval_seconds"] < settings.minimum_poll_interval_seconds:
+                raise ValueError("interval below server minimum")
+            job = create_job(repository, request.app.state.doctolib, settings, canonical, operation=operation)
+            response.status_code = 201
+            return job
+        except CreateReservationLostError as exc:
+            return creation_outcome(exc.operation, response)
+        except (BookingUrlError, MetadataResolutionError, ValueError):
+            outcome = fail_creation(repository, operation, "invalid_job", retryable=False)
+            return creation_outcome(outcome, response)
         except RequestException:
-            raise HTTPException(status_code=502, detail="doctolib_unavailable")
+            outcome = fail_creation(repository, operation, "doctolib_unavailable", retryable=True)
+            return creation_outcome(outcome, response)
 
     @router.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: str, request: Request):
@@ -107,6 +138,7 @@ def create_router():
     @router.patch("/api/v1/jobs/{job_id}")
     def patch_job(job_id: str, body: JobUpdateRequest, request: Request):
         values = body.model_dump(exclude_unset=True)
+        expected_version = values.pop("expected_version")
         if ("interval_seconds" in values and
                 values["interval_seconds"] < request.app.state.settings.minimum_poll_interval_seconds):
             raise HTTPException(status_code=422, detail="interval_seconds is below the server minimum")
@@ -117,6 +149,10 @@ def create_router():
         effective = request.app.state.repository.get_job(job_id)
         if effective is None:
             raise HTTPException(status_code=404, detail="job_not_found")
+        # Validate a draft against the configuration it was actually based on.
+        # Final repository CAS still closes races during metadata resolution.
+        if effective["edit_version"] != expected_version:
+            raise version_conflict(VersionConflictError(effective["edit_version"]))
         date_mode = values.get("date_mode", effective["date_mode"])
         if date_mode != "custom" and any(
             values.get(field) is not None for field in ("earliest_date", "latest_date")
@@ -135,7 +171,11 @@ def create_router():
                 raise HTTPException(status_code=422, detail="custom date range must not exceed 366 calendar dates")
         try:
             job = update_job(request.app.state.repository, request.app.state.doctolib,
-                             request.app.state.settings, job_id, values)
+                             request.app.state.settings, job_id, values, expected_version=expected_version)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
+        except NotFoundError:
+            raise HTTPException(status_code=404, detail="job_not_found")
         except (BookingUrlError, MetadataResolutionError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         except RequestException:
@@ -145,23 +185,29 @@ def create_router():
         return job
 
     @router.post("/api/v1/jobs/{job_id}/pause")
-    def pause_job(job_id: str, request: Request):
+    def pause_job(job_id: str, body: VersionedRequest, request: Request):
         try:
-            return request.app.state.repository.set_status(job_id, "paused")
+            return request.app.state.repository.set_status(job_id, "paused", expected_version=body.expected_version)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
         except NotFoundError:
             raise HTTPException(status_code=404, detail="job_not_found")
 
     @router.post("/api/v1/jobs/{job_id}/resume")
-    def resume_job(job_id: str, request: Request):
+    def resume_job(job_id: str, body: VersionedRequest, request: Request):
         try:
-            return request.app.state.repository.set_status(job_id, "active")
+            return request.app.state.repository.set_status(job_id, "active", expected_version=body.expected_version)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
         except NotFoundError:
             raise HTTPException(status_code=404, detail="job_not_found")
 
     @router.delete("/api/v1/jobs/{job_id}")
-    def delete_job(job_id: str, request: Request):
+    def delete_job(job_id: str, body: VersionedRequest, request: Request):
         try:
-            return request.app.state.repository.set_status(job_id, "deleted")
+            return request.app.state.repository.set_status(job_id, "deleted", expected_version=body.expected_version)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
         except NotFoundError:
             raise HTTPException(status_code=404, detail="job_not_found")
 
@@ -194,7 +240,7 @@ def create_router():
         values = request.app.state.repository.settings(
             settings.minimum_poll_interval_seconds, settings.request_spacing_seconds
         )
-        return {"default_interval_seconds": values["default_interval_seconds"],
+        return {"edit_version": values["edit_version"], "default_interval_seconds": values["default_interval_seconds"],
                 "request_spacing_seconds": values["request_spacing_seconds"],
                 "minimum_poll_interval_seconds": settings.minimum_poll_interval_seconds,
                 "telegram_configured": settings.telegram_enabled,
@@ -203,15 +249,44 @@ def create_router():
     @router.put("/api/v1/settings")
     def put_settings(body: SettingsUpdateRequest, request: Request):
         settings = request.app.state.settings
-        values = body.model_dump(exclude_unset=True, exclude_none=True)
+        values = body.model_dump(exclude_unset=True)
+        expected_version = values.pop("expected_version")
         try:
-            saved = request.app.state.repository.update_settings(values, settings.minimum_poll_interval_seconds)
+            saved = request.app.state.repository.update_settings(values, settings.minimum_poll_interval_seconds, expected_version=expected_version)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        return {"default_interval_seconds": saved["default_interval_seconds"],
+        return {"edit_version": saved["edit_version"], "default_interval_seconds": saved["default_interval_seconds"],
                 "request_spacing_seconds": saved["request_spacing_seconds"],
                 "minimum_poll_interval_seconds": settings.minimum_poll_interval_seconds,
                 "telegram_configured": settings.telegram_enabled,
                 "time_zone": settings.default_timezone}
 
     return router
+
+
+def version_conflict(exc):
+    return HTTPException(status_code=409, detail={"code": "version_conflict",
+                                                "current_version": exc.current_version})
+
+
+def creation_outcome(operation, response):
+    state = operation["state"]
+    if state == "completed":
+        response.status_code = 200
+        return operation["job"]
+    if state == "failed":
+        retryable = operation.get("retryable", False)
+        raise HTTPException(status_code=502 if retryable else 422,
+            detail={"code": operation.get("error_code", "invalid_job"), "retryable": retryable})
+    response.status_code = 202
+    response.headers["Retry-After"] = "2"
+    return {"status": "in_progress", "retry_after_seconds": 2}
+
+
+def fail_creation(repository, operation, code, retryable):
+    try:
+        return repository.fail_create(operation, code, retryable=retryable)
+    except CreateReservationLostError as exc:
+        return exc.operation

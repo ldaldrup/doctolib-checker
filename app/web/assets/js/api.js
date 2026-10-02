@@ -6,10 +6,10 @@ const SETTINGS_FIELDS = ["default_interval_seconds", "request_spacing_seconds"];
 const pick = (source, fields) => Object.fromEntries(fields.filter(key => Object.hasOwn(source, key) && source[key] !== undefined).map(key => [key, source[key]]));
 
 export class ApiError extends Error {
-  constructor(message, {kind = "http", status = null, fields = {}, ambiguous = false} = {}) {
+  constructor(message, {kind = "http", status = null, fields = {}, ambiguous = false, detail = null} = {}) {
     super(message);
     this.name = "ApiError";
-    Object.assign(this, {kind, status, fields, ambiguous});
+    Object.assign(this, {kind, status, fields, ambiguous, detail});
   }
 }
 
@@ -23,12 +23,12 @@ function responseError(status, body) {
     }
   }
   const fallback = {404: "This record no longer exists.", 409: "The operation conflicts with the current server state.", 422: "Check the supplied values.", 502: "Doctolib could not be reached. Try again later."};
-  const message = typeof detail === "string" ? detail.replaceAll("_", " ")
+  const message = detail && typeof detail === "object" && !Array.isArray(detail) ? (detail.message || {version_conflict: "The saved version changed. Review the latest values.", idempotency_conflict: "This saved creation request conflicts with another request.", invalid_job: "The job configuration was rejected. Correct the draft and try again.", doctolib_unavailable: "Doctolib could not be reached. Retry the saved request later."}[detail.code] || fallback[status] || "The request could not be completed.") : typeof detail === "string" ? detail.replaceAll("_", " ")
     : Object.values(fields).join("; ") || fallback[status] || `The server returned an error (${status}).`;
-  return new ApiError(message, {status, fields, kind: status === 422 ? "validation" : status === 404 ? "missing" : status === 409 ? "conflict" : status === 502 ? "upstream" : "http"});
+  return new ApiError(message, {status, fields, detail, kind: status === 422 ? "validation" : status === 404 ? "missing" : status === 409 ? "conflict" : status === 502 ? "upstream" : "http"});
 }
 
-async function request(path, {method = "GET", body, signal, timeout = 15_000} = {}) {
+async function request(path, {method = "GET", body, signal, headers = {}, timeout = 15_000} = {}) {
   const controller = new AbortController();
   const mutation = !["GET", "HEAD"].includes(method) && path !== "/targets/validate";
   let timedOut = false;
@@ -39,7 +39,7 @@ async function request(path, {method = "GET", body, signal, timeout = 15_000} = 
   try {
     const response = await fetch(`${ROOT}${path}`, {
       method, signal: controller.signal, credentials: "same-origin", redirect: "manual", cache: "no-store",
-      headers: body === undefined ? {Accept: "application/json"} : {Accept: "application/json", "Content-Type": "application/json"},
+      headers: {Accept: "application/json", ...(body === undefined ? {} : {"Content-Type": "application/json"}), ...headers},
       ...(body === undefined ? {} : {body: JSON.stringify(body)})
     });
     if (response.type === "opaqueredirect" || [301, 302, 303, 307, 308, 401, 403].includes(response.status)) {
@@ -83,13 +83,16 @@ export const api = {
   getJob: (id, options) => request(`/jobs/${identifier(id)}`, options),
   getChecks: (id, options = {}) => request(`/jobs/${identifier(id)}/checks?${page({...options, limit: options.limit ?? 10})}`, {signal: options.signal}),
   validateTarget: (booking_url, options = {}) => request("/targets/validate", {signal: options.signal, method: "POST", body: {booking_url}, timeout: 120_000}),
-  createJob: (values, options = {}) => request("/jobs", {signal: options.signal, method: "POST", body: pick(values, JOB_FIELDS), timeout: 120_000}),
-  updateJob: (id, values, options = {}) => request(`/jobs/${identifier(id)}`, {signal: options.signal, method: "PATCH", body: pick(values, JOB_FIELDS), timeout: Object.hasOwn(values, "target_urls") ? 120_000 : 15_000}),
-  pauseJob: (id, options = {}) => request(`/jobs/${identifier(id)}/pause`, {signal: options.signal, method: "POST"}),
-  resumeJob: (id, options = {}) => request(`/jobs/${identifier(id)}/resume`, {signal: options.signal, method: "POST"}),
+  createJob: (values, options = {}) => {
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(options.idempotencyKey || "")) throw new ApiError("A saved creation request key is required.", {kind: "validation"});
+    return request("/jobs", {signal: options.signal, method: "POST", body: pick(values, JOB_FIELDS), headers: {"Idempotency-Key": options.idempotencyKey}, timeout: 120_000});
+  },
+  updateJob: (id, values, options = {}) => request(`/jobs/${identifier(id)}`, {signal: options.signal, method: "PATCH", body: {...pick(values, JOB_FIELDS), expected_version: options.expectedVersion}, timeout: Object.hasOwn(values, "target_urls") ? 120_000 : 15_000}),
+  pauseJob: (id, options = {}) => request(`/jobs/${identifier(id)}/pause`, {signal: options.signal, method: "POST", body: {expected_version: options.expectedVersion}}),
+  resumeJob: (id, options = {}) => request(`/jobs/${identifier(id)}/resume`, {signal: options.signal, method: "POST", body: {expected_version: options.expectedVersion}}),
   checkNowJob: (id, options = {}) => request(`/jobs/${identifier(id)}/check-now`, {signal: options.signal, method: "POST"}),
-  deleteJob: (id, options = {}) => request(`/jobs/${identifier(id)}`, {signal: options.signal, method: "DELETE"}),
-  updateSettings: (values, options = {}) => request("/settings", {signal: options.signal, method: "PUT", body: pick(values, SETTINGS_FIELDS)})
+  deleteJob: (id, options = {}) => request(`/jobs/${identifier(id)}`, {signal: options.signal, method: "DELETE", body: {expected_version: options.expectedVersion}}),
+  updateSettings: (values, options = {}) => request("/settings", {signal: options.signal, method: "PUT", body: {...pick(values, SETTINGS_FIELDS), expected_version: options.expectedVersion}})
 };
 
 function invalid(field, message) { throw new ApiError(message, {kind: "validation", fields: {[field]: message}}); }

@@ -3,6 +3,8 @@
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import create_router
@@ -45,6 +47,13 @@ def create_app(settings=None, repository=None, doctolib=None):
     app.state.settings = settings
     app.state.repository = repository
     app.state.doctolib = doctolib
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation_error(_request, exc):
+        # Pydantic inputs/contexts can echo private URLs, keys or future secrets.
+        errors = [{key: error[key] for key in ("loc", "type", "msg")}
+                  for error in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     @app.middleware("http")
     async def uncached_api(request, call_next):

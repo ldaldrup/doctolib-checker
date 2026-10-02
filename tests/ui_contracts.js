@@ -188,20 +188,29 @@ await test('payload dates, URL safety, bounds, allowlisting, and Telegram preser
   equal(settingsPayload({default_interval_seconds: '600', request_spacing_seconds: '3.5', ignored: true}, settings), {default_interval_seconds: 600, request_spacing_seconds: 3.5});
 });
 const nativeFetch = globalThis.fetch;
+const create = values => api.createJob(values, {idempotencyKey: crypto.randomUUID()});
+const remove = async id => api.deleteJob(id, {expectedVersion: (await api.getJob(id)).edit_version});
+const setStatus = async (id, action) => api[`${action}Job`](id, {expectedVersion: (await api.getJob(id)).edit_version});
+const saveSettings = async values => api.updateSettings(values, {expectedVersion: (await api.getSettings()).edit_version});
 await test('native transport headers, relative paths, allowlists and no automatic mutation retry', async () => {
   const calls = [];
   globalThis.fetch = async (path, options) => { calls.push({path, options}); return new Response('{}', {headers: {'Content-Type': 'application/json'}}); };
-  await api.getSettings(); await api.createJob({...draft, unsupported: true}); await api.updateSettings({default_interval_seconds: 600, unsupported: true});
+  await api.getSettings(); await api.createJob({...draft, unsupported: true}, {idempotencyKey: "contract-key"}); await api.updateSettings({default_interval_seconds: 600, unsupported: true}, {expectedVersion: 7});
   for (const {path, options} of calls) { assert(path.startsWith('/api/v1/')); equal(options.credentials, 'same-origin'); equal(options.redirect, 'manual'); equal(options.cache, 'no-store'); equal(options.headers.Accept, 'application/json'); assert(options.signal instanceof AbortSignal); }
-  equal(calls[1].options.headers['Content-Type'], 'application/json'); assert(!JSON.parse(calls[1].options.body).unsupported); assert(!JSON.parse(calls[2].options.body).unsupported);
+  equal(calls[1].options.headers['Idempotency-Key'], 'contract-key'); equal(JSON.parse(calls[2].options.body).expected_version, 7); equal(calls[1].options.headers['Content-Type'], 'application/json'); assert(!JSON.parse(calls[1].options.body).unsupported); assert(!JSON.parse(calls[2].options.body).unsupported);
+  await api.updateJob('j', {name:'Updated'}, {expectedVersion:7});
+  await api.pauseJob('j', {expectedVersion:7}); await api.resumeJob('j', {expectedVersion:7}); await api.deleteJob('j', {expectedVersion:7});
+  for (const call of calls.slice(3)) equal(JSON.parse(call.options.body).expected_version, 7);
   let count = 0; globalThis.fetch = async () => { count++; throw new TypeError('Test connection failed'); };
-  const error = await rejects(() => api.createJob(draft), 'network'); assert(error.ambiguous); equal(count, 1);
+  const error = await rejects(() => api.createJob(draft, {idempotencyKey: "transport-key"}), 'network'); assert(error.ambiguous); equal(count, 1);
 });
 await test('redirect/auth, HTTP errors, JSON validation fields and protocol failures', async () => {
   for (const [status, kind] of [[302, 'auth'], [401, 'auth'], [403, 'auth'], [404, 'missing'], [409, 'conflict'], [422, 'validation'], [502, 'upstream']]) {
     globalThis.fetch = async () => new Response(JSON.stringify({detail: [{loc: ['body', 'name'], msg: 'Name required'}]}), {status, headers: {'Content-Type': 'application/json'}});
     const error = await rejects(() => api.getJob('a'), kind); equal(error.status, status); if (status === 422) equal(error.fields.name, 'Name required');
   }
+  globalThis.fetch = async () => new Response('<html>Unavailable</html>', {status:502, headers:{'Content-Type':'text/html'}});
+  await rejects(() => api.getStatus(), 'upstream');
   globalThis.fetch = async () => ({type: 'opaqueredirect', status: 0}); await rejects(() => api.getStatus(), 'auth');
   globalThis.fetch = async () => new Response('<html>Sign in</html>', {headers: {'Content-Type': 'text/html'}}); await rejects(() => api.getStatus(), 'protocol');
   globalThis.fetch = async () => new Response('{broken', {headers: {'Content-Type': 'application/json'}}); await rejects(() => api.getStatus(), 'protocol');
@@ -218,7 +227,7 @@ await test('timeout and cancellation are distinct, with uncertain mutation outco
   };
   try {
     globalThis.setTimeout = callback => nativeTimer(callback, 0);
-    const timeout = await rejects(() => api.createJob(draft), 'timeout'); assert(timeout.ambiguous); equal(calls, 1);
+    const timeout = await rejects(() => api.createJob(draft, {idempotencyKey: "transport-key"}), 'timeout'); assert(timeout.ambiguous); equal(calls, 1);
     globalThis.setTimeout = nativeTimer;
     const controller = new AbortController(); controller.abort();
     const cancelled = await rejects(() => api.getStatus({signal: controller.signal}), 'cancelled'); assert(!cancelled.ambiguous); equal(calls, 2);
@@ -226,8 +235,9 @@ await test('timeout and cancellation are distinct, with uncertain mutation outco
 });
 globalThis.fetch = nativeFetch;
 await test('15-second refresh retains unchanged cards and unsaved editor controls', async () => {
+  const reset = await nativeFetch('/__test/reset-worker', {method:'POST'}); assert(reset.ok, 'Disposable worker reset failed');
   const fixtureUrl = 'https://www.doctolib.de/praxis/berlin/beispiel/booking/availabilities?placeId=practice-123&motiveIds%5B%5D=789&practitionerId=456';
-  const saved = await api.createJob({...draft, name: 'Refresh regression', target_urls: [fixtureUrl], telegram_enabled: false});
+  const saved = await create({...draft, name: 'Refresh regression', target_urls: [fixtureUrl], telegram_enabled: false});
   const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
   const waitUntil = async predicate => {
     const deadline = Date.now() + 22000;
@@ -254,12 +264,12 @@ await test('15-second refresh retains unchanged cards and unsaved editor control
     assert(doc.activeElement === name, 'Refresh moved focus away from editor');
     assert(!notices.some(text => text?.includes('Loading jobs')), 'Refresh showed transient loading notice');
     assert(!doc.querySelector('.page-actions [data-action="refresh"]'), 'Toolbar Refresh remains');
-  } finally { frame.remove(); await api.deleteJob(saved.id); }
+  } finally { frame.remove(); await remove(saved.id); }
 });
 await test('card check requests survive unavailable worker, complete once while paused, and preserve unsaved editor', async () => {
   const fixtureUrl = 'https://www.doctolib.de/praxis/berlin/beispiel/booking/availabilities?placeId=practice-123&motiveIds%5B%5D=789&practitionerId=456';
-  const saved = await api.createJob({...draft, name: 'Manual check journey', target_urls: [fixtureUrl], telegram_enabled: false});
-  await api.pauseJob(saved.id);
+  const saved = await create({...draft, name: 'Manual check journey', target_urls: [fixtureUrl], telegram_enabled: false});
+  await setStatus(saved.id, "pause");
   let activeSaved = null;
   const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
   const waitUntil = async predicate => {
@@ -300,11 +310,14 @@ await test('card check requests survive unavailable worker, complete once while 
     await waitUntil(() => !card().querySelector('[data-action="check-now"]').disabled);
     card().querySelector('[data-action="check-now"]').click();
     await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('cooldown ends'));
+    doc.querySelector('[data-action="cancel-edit"]').click(); card().querySelector('[data-action="edit"]').click();
+    await waitUntil(() => doc.querySelector('#job-name')?.value === saved.name);
+    editControl(doc, win, '#job-name', 'Unsaved manual draft');
     const horizon = doc.querySelector('#horizon-days'); horizon.value = '16'; horizon.dispatchEvent(new win.Event('input', {bubbles: true}));
     doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles: true, cancelable: true}));
     await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('previous check request was cancelled'));
     assert(doc.querySelector('#toast').textContent.includes('select Check once'));
-    await api.resumeJob(saved.id); doc.querySelector('[data-action="filter"][data-filter="all"]').click();
+    await setStatus(saved.id, "resume"); doc.querySelector('[data-action="filter"][data-filter="all"]').click();
     await waitUntil(() => card().querySelector('[data-action="check-now"]')?.textContent.includes('Check now'));
     card().querySelector('[data-action="edit"]').click();
     await waitUntil(() => doc.querySelector('#job-name')?.value === 'Unsaved manual draft');
@@ -312,7 +325,7 @@ await test('card check requests survive unavailable worker, complete once while 
     doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles: true, cancelable: true}));
     await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('fresh check requested'));
     assert(doc.querySelector('#toast').textContent.includes('fresh check was requested'));
-    activeSaved = await api.createJob({...draft, name: 'Active manual check journey', target_urls: [fixtureUrl], telegram_enabled: false});
+    activeSaved = await create({...draft, name: 'Active manual check journey', target_urls: [fixtureUrl], telegram_enabled: false});
     doc.querySelector('[data-action="filter"][data-filter="all"]').click();
     const activeCard = () => doc.querySelector(`[data-job-id="${activeSaved.id}"]`);
     await waitUntil(() => activeCard()?.querySelector('[data-action="check-now"]'));
@@ -327,7 +340,7 @@ await test('card check requests survive unavailable worker, complete once while 
     const activeCompleted = await api.getJob(activeSaved.id);
     equal(activeCompleted.status, 'active'); equal(activeCompleted.check_intent.id, activeIntent.id);
     equal(activeCompleted.check_intent.status, 'completed'); assert(activeCompleted.check_intent.run_id);
-  } finally { frame.remove(); await api.deleteJob(saved.id); if (activeSaved) await api.deleteJob(activeSaved.id); }
+  } finally { frame.remove(); await remove(saved.id); if (activeSaved) await remove(activeSaved.id); }
 });
 await test('settings autosave preserves edits during writes, skips invalid values and exposes retry', async () => {
   const original = await api.getSettings();
@@ -369,7 +382,131 @@ await test('settings autosave preserves edits during writes, skips invalid value
     const choice = doc.querySelector('[name="default_interval_choice"][value="600"]'); choice.checked = true; choice.dispatchEvent(new win.Event('change', {bubbles: true}));
     await waitUntil(() => doc.querySelector('[data-setting-warning="default_interval_seconds"]').hidden && writes >= 5);
     equal((await api.getSettings()).default_interval_seconds, 600);
-  } finally { frame.remove(); await api.updateSettings({default_interval_seconds: original.default_interval_seconds, request_spacing_seconds: original.request_spacing_seconds}); }
+  } finally { frame.remove(); await saveSettings({default_interval_seconds: original.default_interval_seconds, request_spacing_seconds: original.request_spacing_seconds}); }
+});
+
+const waitUI = async predicate => {
+  const deadline = Date.now() + 10000;
+  while (!predicate()) { if (Date.now() > deadline) throw new Error('Mutation UI journey timed out'); await new Promise(resolve => setTimeout(resolve, 50)); }
+};
+const fixtureBooking = 'https://www.doctolib.de/praxis/berlin/beispiel/booking/availabilities?placeId=practice-123&motiveIds%5B%5D=789&practitionerId=456';
+function editControl(doc, win, selector, value) {
+  const input = doc.querySelector(selector); input.value = value; input.dispatchEvent(new win.Event('input', {bubbles: true})); return input;
+}
+await test('lost create response replays immutable key without heuristic matching or editing another job', async () => {
+  const unrelated = await create({...draft, name: 'Unrelated job', target_urls: [fixtureBooking], telegram_enabled: false});
+  const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
+  let created;
+  try {
+    await waitUI(() => frame.contentDocument?.querySelector('#job-form [type="submit"]')?.disabled === false);
+    const doc = frame.contentDocument, win = frame.contentWindow, fetch = win.fetch.bind(win), calls = [];
+    win.fetch = async (path, options) => {
+      if (path === '/api/v1/jobs' && options?.method === 'POST') {
+        calls.push({key: options.headers['Idempotency-Key'], body: options.body});
+        const response = await fetch(path, options);
+        if (calls.length === 1) { created = await response.clone().json(); return new win.Response('{}', {status: 503, headers: {'Content-Type': 'application/json'}}); }
+        return response;
+      }
+      assert(options?.method !== 'PATCH', 'Unresolved create became a PATCH'); return fetch(path, options);
+    };
+    editControl(doc, win, '#job-name', 'Lost response job'); editControl(doc, win, '#target-0', fixtureBooking);
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles: true, cancelable: true}));
+    await waitUI(() => doc.querySelector('[data-action="retry-create"]'));
+    assert(doc.querySelector('#job-name').matches(':disabled'), 'Uncertain draft remains editable');
+    doc.querySelector(`[data-job-id="${unrelated.id}"] [data-action="edit"]`).click();
+    equal(doc.querySelector('#job-name').value, 'Lost response job');
+    doc.querySelector('[data-action="retry-create"]').click();
+    await waitUI(() => !doc.querySelector('[data-action="retry-create"]'));
+    equal(calls.length, 2); equal(calls[0], calls[1]); assert(calls[0].key);
+    equal((await api.getJob(unrelated.id)).name, 'Unrelated job');
+    equal((await api.listJobs()).filter(item => item.name === 'Lost response job').length, 1);
+  } finally { frame.remove(); await remove(unrelated.id); if (created?.id) await remove(created.id); }
+});
+await test('in-progress create retains key and terminal validation permits corrected operation with new key', async () => {
+  const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
+  let saved;
+  try {
+    await waitUI(() => frame.contentDocument?.querySelector('#job-form [type="submit"]')?.disabled === false);
+    const doc = frame.contentDocument, win = frame.contentWindow, fetch = win.fetch.bind(win), calls = [];
+    win.fetch = async (path, options) => {
+      if (path === '/api/v1/jobs' && options?.method === 'POST') {
+        calls.push(options.headers['Idempotency-Key']);
+        if (calls.length === 1) return new win.Response(JSON.stringify({status:'in_progress', retry_after_seconds:2}), {status:202, headers:{'Content-Type':'application/json'}});
+        if (calls.length === 2) return new win.Response(JSON.stringify({detail:{code:'invalid_job', retryable:false}}), {status:422, headers:{'Content-Type':'application/json'}});
+        const response = await fetch(path, options); saved = await response.clone().json(); return response;
+      }
+      return fetch(path, options);
+    };
+    editControl(doc, win, '#job-name', 'Pending validation job'); editControl(doc, win, '#target-0', fixtureBooking);
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles:true, cancelable:true}));
+    await waitUI(() => doc.querySelector('[data-action="retry-create"]'));
+    doc.querySelector('[data-action="retry-create"]').click();
+    await waitUI(() => !doc.querySelector('[data-action="retry-create"]') && !doc.querySelector('#job-name').matches(':disabled'));
+    equal(doc.querySelector('#job-name').value, 'Pending validation job'); equal(calls[0], calls[1]);
+    editControl(doc, win, '#job-name', 'Corrected validation job');
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles:true, cancelable:true}));
+    await waitUI(() => saved?.id && doc.querySelector(`#job-list [data-job-id="${saved.id}"]`));
+    assert(calls[2] !== calls[1], 'Corrected operation reused terminal key');
+  } finally { frame.remove(); if (saved?.id) await remove(saved.id); }
+});
+await test('external settings conflict preserves newer draft and stops retries until explicit per-field reconciliation', async () => {
+  const original = await api.getSettings();
+  const frame = document.createElement('iframe'); frame.src = '/#settings'; document.body.append(frame);
+  try {
+    await waitUI(() => frame.contentDocument?.querySelector('#request-spacing'));
+    const doc = frame.contentDocument, win = frame.contentWindow, fetch = win.fetch.bind(win); let writes = 0, failedConflictRead = false;
+    win.fetch = async (path, options) => {
+      if (path === '/api/v1/settings' && (!options?.method || options.method === 'GET') && writes === 1 && !failedConflictRead) { failedConflictRead = true; return new win.Response('{}', {status:503, headers:{'Content-Type':'application/json'}}); }
+      if (options?.method === 'PUT') {
+        writes++;
+        if (writes === 1) {
+          await saveSettings({default_interval_seconds: 900, request_spacing_seconds: 6});
+          editControl(doc, win, '#request-spacing', '5');
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+      return fetch(path, options);
+    };
+    const input = editControl(doc, win, '#request-spacing', '4');
+    await waitUI(() => doc.querySelector('#settings-remote-notice [data-action="refresh"]'));
+    await new Promise(resolve => setTimeout(resolve, 800)); equal(writes, 1);
+    doc.querySelector('#settings-remote-notice [data-action="refresh"]').click();
+    await waitUI(() => doc.querySelector('[data-action="reconcile-settings"]'));
+    equal(input.value, '5'); assert(doc.querySelector('#request-spacing') === input);
+    await new Promise(resolve => setTimeout(resolve, 1000)); equal(writes, 1);
+    equal((await api.getSettings()).request_spacing_seconds, 6);
+    assert(doc.querySelector('#settings-remote-notice').textContent.includes('Server: 6'));
+    doc.querySelector('[name="reconcile-default_interval_seconds"][value="server"]').click();
+    doc.querySelector('[name="reconcile-request_spacing_seconds"][value="draft"]').click();
+    doc.querySelector('[data-action="reconcile-settings"]').click();
+    await waitUI(() => writes === 2 && doc.querySelector('[data-setting-warning="request_spacing_seconds"]')?.hidden);
+    const reconciled = await api.getSettings(); equal(reconciled.request_spacing_seconds, 5); equal(reconciled.default_interval_seconds, 900);
+  } finally { frame.remove(); await saveSettings({default_interval_seconds:original.default_interval_seconds, request_spacing_seconds:original.request_spacing_seconds}); }
+});
+
+await test('job conflict preserves draft and merges unchanged fields from latest server version', async () => {
+  const saved = await create({...draft, name:'Job conflict original', target_urls:[fixtureBooking], telegram_enabled:false});
+  const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
+  try {
+    await waitUI(() => frame.contentDocument?.querySelector(`[data-job-id="${saved.id}"] [data-action="edit"]`));
+    const doc = frame.contentDocument, win = frame.contentWindow;
+    doc.querySelector(`[data-job-id="${saved.id}"] [data-action="edit"]`).click();
+    editControl(doc, win, '#job-name', 'Job conflict draft');
+    await api.updateJob(saved.id, {name:'Job conflict server', interval_seconds:600}, {expectedVersion:saved.edit_version});
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles:true, cancelable:true}));
+    await waitUI(() => doc.querySelector('[data-action="reconcile-job"]'));
+    equal(doc.querySelector('#job-name').value, 'Job conflict draft');
+    equal((await api.getJob(saved.id)).name, 'Job conflict server');
+    assert(doc.querySelector('[name="job-reconcile-name"][value="draft"]'));
+    assert(!doc.querySelector('[name="job-reconcile-interval_seconds"]'), 'Unchanged numeric draft incorrectly marked conflicting');
+    doc.querySelector('[name="job-reconcile-name"][value="draft"]').click();
+    doc.querySelector('[data-action="reconcile-job"]').click();
+    equal(doc.querySelector('[name="interval_choice"]:checked').value, '600');
+    equal(doc.querySelector('#job-name').value, 'Job conflict draft');
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit', {bubbles:true, cancelable:true}));
+    await waitUI(() => doc.querySelector(`#job-list [data-job-id="${saved.id}"] h2`)?.textContent === 'Job conflict draft');
+    equal((await api.getJob(saved.id)).interval_seconds, 600);
+  } finally { frame.remove(); await remove(saved.id); }
 });
 document.querySelector('#results').textContent = lines.join('\n');
 document.documentElement.dataset.contracts = lines.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';
