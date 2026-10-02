@@ -149,6 +149,36 @@ class UpdatingDoctolib(DoctolibClient):
         return super().check(booking_url, search, meta=meta, now=now)
 
 
+class VersionedJourneyClient(TestClient):
+    """Existing behavioral journeys send the current mutation contract.
+
+    Contract tests use plain TestClient to exercise omitted/stale versions and
+    keys. Explicit expectations are never replaced by this test-only helper.
+    """
+    def request(self, method, url, **kwargs):
+        from urllib.parse import urlsplit
+        from uuid import uuid4
+        path = urlsplit(str(url)).path
+        method = method.upper()
+        if method == 'POST' and path == '/api/v1/jobs':
+            headers = dict(kwargs.get('headers') or {})
+            if not any(key.lower() == 'idempotency-key' for key in headers):
+                headers['Idempotency-Key'] = str(uuid4())
+            kwargs['headers'] = headers
+        config_job = ((method == 'PATCH' and path.startswith('/api/v1/jobs/')) or
+                      (method == 'DELETE' and path.startswith('/api/v1/jobs/')) or
+                      (method == 'POST' and path.endswith(('/pause', '/resume'))))
+        config_settings = method == 'PUT' and path == '/api/v1/settings'
+        if config_job or config_settings:
+            body = dict(kwargs.get('json') or {})
+            if 'expected_version' not in body:
+                read_path = '/api/v1/settings' if config_settings else '/api/v1/jobs/' + path.split('/')[4]
+                current = super().request('GET', read_path)
+                body['expected_version'] = current.json().get('edit_version', 1) if current.status_code == 200 else 1
+            kwargs['json'] = body
+        return super().request(method, url, **kwargs)
+
+
 def setup_backend(tmp_path, status="available", minimum_interval=300):
     database = Database(str(tmp_path / "checker.sqlite3"))
     database.initialize()
@@ -159,7 +189,7 @@ def setup_backend(tmp_path, status="available", minimum_interval=300):
                         minimum_poll_interval_seconds=minimum_interval)
     doctolib = FixtureDoctolib(no_availability=status == "no_availability")
     app = create_app(settings=settings, repository=repository, doctolib=doctolib)
-    return TestClient(app), repository, settings, doctolib
+    return VersionedJourneyClient(app), repository, settings, doctolib
 
 
 def create_job(client, interval_seconds=300):
@@ -353,9 +383,9 @@ def test_create_job_rejects_duplicate_urls_after_normalization(tmp_path):
     })
 
     assert response.status_code == 422
-    assert "unique after URL normalization" in response.text
+    assert response.json()["detail"]["code"] == "invalid_job"
+    assert doctolib.fixture_session.calls == []
     assert client.get("/api/v1/jobs").json() == []
-    assert len(doctolib.fixture_session.calls) == 2
 
 
 def test_no_match_stays_active_and_does_not_alert(tmp_path):
@@ -572,7 +602,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 7
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -868,7 +898,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 7
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
@@ -900,7 +930,7 @@ def test_one_target_failure_does_not_discard_another_target_result(tmp_path):
     repository = Repository(database)
     settings = Settings(database_path=str(tmp_path / "checker.sqlite3"))
     doctolib = RaisingDoctolib(session=FixtureSession())
-    client = TestClient(create_app(settings=settings, repository=repository, doctolib=doctolib))
+    client = VersionedJourneyClient(create_app(settings=settings, repository=repository, doctolib=doctolib))
     good_url = URL
     bad_url = URL + "&source=fail"
     response = client.post("/api/v1/jobs", json={
@@ -942,7 +972,13 @@ def test_shared_request_gate_reservations_survive_repository_reopen(tmp_path, mo
     assert next_allowed == fixed_now + timedelta(seconds=6)
 
 
+def drop_mutation_columns(conn):
+    conn.execute("DROP TABLE IF EXISTS create_operations")
+    conn.execute("ALTER TABLE settings DROP COLUMN edit_version")
+
+
 def drop_intent_columns(conn):
+    drop_mutation_columns(conn)
     conn.execute("DROP TABLE IF EXISTS check_intents")
     for table, columns in {
         "jobs": ("status_version", "last_extra_started_at"),

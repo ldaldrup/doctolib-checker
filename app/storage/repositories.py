@@ -45,6 +45,22 @@ class ConflictError(ValueError):
     pass
 
 
+class VersionConflictError(ConflictError):
+    def __init__(self, current_version):
+        super().__init__("edit_version_conflict")
+        self.current_version = current_version
+
+
+class CreateReservationLostError(ConflictError):
+    def __init__(self, operation):
+        super().__init__("create_reservation_lost")
+        self.operation = operation
+
+
+CREATE_LEASE_SECONDS = 120
+CREATE_RETENTION_DAYS = 7
+
+
 class LeaseLostError(RuntimeError):
     pass
 
@@ -81,7 +97,7 @@ class Repository:
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                """UPDATE settings SET default_interval_seconds=?,updated_at=?
+                """UPDATE settings SET default_interval_seconds=?,updated_at=?,edit_version=edit_version+1
                 WHERE default_interval_seconds<?""",
                 (minimum_poll_interval_seconds, iso(now), minimum_poll_interval_seconds),
             )
@@ -167,13 +183,86 @@ class Repository:
                 raise NotFoundError("Job not found")
             return self._queue_intent(conn, job, 'manual', utc_now())
 
-    def create_job(self, values, targets):
+    def _create_operation(self, conn, row, owned=False):
+        result = {key: row[key] for key in ("key", "state", "generation", "lease_until", "job_id",
+                                          "error_code", "retryable", "created_at", "expires_at")}
+        result["retryable"] = bool(result["retryable"])
+        if owned:
+            result.update(state="owned", owner_token=row["owner_token"],
+                          canonical_values=json.loads(row["canonical_values"]))
+        elif row["state"] == "completed":
+            result["job"] = self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (row["job_id"],)).fetchone(), conn)
+        return result
+
+    def reserve_create(self, key, fingerprint, canonical_values):
+        """Reserve metadata resolution before doing any network work.
+
+        Retries keep the first operation's defaults. Expired owners can never
+        finalize, even before a replacement claims the operation.
+        """
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            conn.execute("DELETE FROM create_operations WHERE expires_at<=?", (precise_iso(now),))
+            row = conn.execute("SELECT * FROM create_operations WHERE key=?", (key,)).fetchone()
+            if row is not None and row["fingerprint"] != fingerprint:
+                raise ConflictError("idempotency_key_conflict")
+            if row is not None and (row["state"] == "completed" or
+                    (row["state"] == "failed" and not row["retryable"]) or
+                    (row["state"] == "pending" and parse_time(row["lease_until"]) > now)):
+                return self._create_operation(conn, row)
+            owner = new_id()
+            lease = precise_iso(now + timedelta(seconds=CREATE_LEASE_SECONDS))
+            if row is None:
+                conn.execute("""INSERT INTO create_operations(key,fingerprint,canonical_values,state,owner_token,
+                    lease_until,created_at,expires_at) VALUES(?,?,?,'pending',?,?,?,?)""",
+                    (key, fingerprint, json.dumps(canonical_values, sort_keys=True), owner, lease,
+                     precise_iso(now), precise_iso(now + timedelta(days=CREATE_RETENTION_DAYS))))
+            else:
+                conn.execute("""UPDATE create_operations SET state='pending',owner_token=?,generation=generation+1,
+                    lease_until=?,error_code=NULL,retryable=0 WHERE key=?""", (owner, lease, key))
+            return self._create_operation(conn, conn.execute("SELECT * FROM create_operations WHERE key=?", (key,)).fetchone(), True)
+
+    def _owned_create_operation(self, conn, operation, now=None):
+        row = conn.execute("SELECT * FROM create_operations WHERE key=?", (operation["key"],)).fetchone()
+        now = now or utc_now()
+        if (row is None or row["state"] != "pending" or row["owner_token"] != operation.get("owner_token") or
+                row["generation"] != operation.get("generation") or parse_time(row["lease_until"]) <= now or
+                parse_time(row["expires_at"]) <= now):
+            authoritative = self._create_operation(conn, row) if row else {"key": operation["key"], "state": "expired"}
+            raise CreateReservationLostError(authoritative)
+        return row
+
+    def fail_create(self, operation, error_code, retryable=True):
+        # Never persist provider messages, URLs, or transport exception strings.
+        if error_code not in ("doctolib_unavailable", "invalid_job", "invalid_target", "metadata_unavailable", "create_failed"):
+            error_code = "create_failed"
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._owned_create_operation(conn, operation)
+            conn.execute("""UPDATE create_operations SET state='failed',owner_token=NULL,lease_until=NULL,
+                error_code=?,retryable=? WHERE key=?""", (error_code, int(retryable), operation["key"]))
+            return self._create_operation(conn, conn.execute("SELECT * FROM create_operations WHERE key=?", (operation["key"],)).fetchone())
+
+    def renew_create(self, operation):
+        """Renew before each bounded metadata request, never after expiry."""
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            self._owned_create_operation(conn, operation, now)
+            conn.execute("UPDATE create_operations SET lease_until=? WHERE key=?",
+                         (precise_iso(now + timedelta(seconds=CREATE_LEASE_SECONDS)), operation["key"]))
+            return self._create_operation(conn, conn.execute("SELECT * FROM create_operations WHERE key=?", (operation["key"],)).fetchone(), True)
+
+    def create_job(self, values, targets, operation=None):
         if values["interval_seconds"] < self.minimum_poll_interval_seconds:
             raise ValueError("interval_seconds is below the server minimum")
         job_id = new_id()
         now = iso()
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if operation is not None:
+                self._owned_create_operation(conn, operation)
             conn.execute(
                 """INSERT INTO jobs
                 (id,name,status,interval_seconds,date_mode,horizon_days,earliest_date,latest_date,
@@ -196,6 +285,13 @@ class Repository:
                      target.get("motive_name"), "ready", now),
                 )
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if operation is not None:
+                # Recheck the deadline after inserts, while the same transaction
+                # still owns the database write lock. Expiry rolls all inserts back.
+                self._owned_create_operation(conn, operation)
+                conn.execute("""UPDATE create_operations SET state='completed',job_id=?,owner_token=NULL,
+                    lease_until=NULL,error_code=NULL,retryable=0,expires_at=? WHERE key=?""",
+                    (job_id, precise_iso(utc_now() + timedelta(days=CREATE_RETENTION_DAYS)), operation["key"]))
             return self._job(row, conn)
 
     def get_job(self, job_id, include_deleted=False):
@@ -228,7 +324,7 @@ class Repository:
                 result.append(job)
             return result
 
-    def update_job(self, job_id, values, targets=None):
+    def update_job(self, job_id, values, targets=None, expected_version=None):
         if values.get("interval_seconds", self.minimum_poll_interval_seconds) < self.minimum_poll_interval_seconds:
             raise ValueError("interval_seconds is below the server minimum")
         with self.database.connection() as conn:
@@ -236,6 +332,8 @@ class Repository:
             row = conn.execute("SELECT * FROM jobs WHERE id=? AND status != 'deleted'", (job_id,)).fetchone()
             if row is None:
                 raise NotFoundError("Job not found")
+            if expected_version is not None and row["edit_version"] != expected_version:
+                raise VersionConflictError(row["edit_version"])
             previous_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
             previous_search = search_signature(dict(row), previous_targets)
             fields = ["name", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date",
@@ -296,7 +394,7 @@ class Repository:
                     WHERE job_id=? AND status IN ('pending','failed') AND search_revision IS NOT ?""", (job_id,current['search_revision']))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
-    def set_status(self, job_id, status):
+    def set_status(self, job_id, status, expected_version=None):
         if status not in ("active", "paused", "deleted"):
             raise ValueError("Invalid job status")
         with self.database.connection() as conn:
@@ -304,6 +402,8 @@ class Repository:
             row = conn.execute("SELECT * FROM jobs WHERE id=? AND status != 'deleted'", (job_id,)).fetchone()
             if row is None:
                 raise NotFoundError("Job not found")
+            if expected_version is not None and row["edit_version"] != expected_version:
+                raise VersionConflictError(row["edit_version"])
             if status != row['status'] or status == 'paused':
                 conn.execute("UPDATE jobs SET status_version=status_version+1 WHERE id=?", (job_id,))
                 conn.execute("UPDATE check_intents SET status='cancelled',cancel_reason='status_changed' WHERE job_id=? AND status='queued'", (job_id,))
@@ -324,7 +424,7 @@ class Repository:
             conn.execute("""UPDATE jobs SET status=?,next_check_at=?,lock_until=?,lock_run_id=?,
                          lock_owner_token=CASE WHEN ?='deleted' THEN NULL ELSE lock_owner_token END,
                          edit_version=edit_version+?,updated_at=? WHERE id=?""",
-                         (status, due, lock, lock_run_id, status, int(status != row["status"]), iso(), job_id))
+                         (status, due, lock, lock_run_id, status, int(status != row["status"] or status == "paused"), iso(), job_id))
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(), conn)
 
     def set_job_due(self, job_id, due_at):
@@ -980,20 +1080,27 @@ class Repository:
             row = conn.execute("SELECT * FROM settings WHERE singleton_id=1").fetchone()
             return dict(row)
 
-    def update_settings(self, values, minimum_interval):
-        current = self.settings(minimum_interval, 3.0)
-        default_interval = int(values.get("default_interval_seconds", current["default_interval_seconds"]))
-        spacing = float(values.get("request_spacing_seconds", current["request_spacing_seconds"]))
-        if default_interval < minimum_interval:
-            raise ValueError(f"default_interval_seconds must be at least {minimum_interval}")
-        if spacing < 3:
-            raise ValueError("request_spacing_seconds must be at least 3")
+    def update_settings(self, values, minimum_interval, expected_version=None):
         with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""INSERT OR IGNORE INTO settings(singleton_id,default_interval_seconds,
+                request_spacing_seconds,updated_at) VALUES(1,?,3.0,?)""", (minimum_interval, iso()))
+            current = conn.execute("SELECT * FROM settings WHERE singleton_id=1").fetchone()
+            if expected_version is not None and current["edit_version"] != expected_version:
+                raise VersionConflictError(current["edit_version"])
+            default_interval = int(values.get("default_interval_seconds", current["default_interval_seconds"]))
+            spacing = float(values.get("request_spacing_seconds", current["request_spacing_seconds"]))
+            if default_interval < minimum_interval:
+                raise ValueError(f"default_interval_seconds must be at least {minimum_interval}")
+            if not math.isfinite(spacing) or spacing < 3:
+                raise ValueError("request_spacing_seconds must be finite and at least 3")
+            changed = default_interval != current["default_interval_seconds"] or spacing != current["request_spacing_seconds"]
             conn.execute(
-                "UPDATE settings SET default_interval_seconds=?,request_spacing_seconds=?,updated_at=? WHERE singleton_id=1",
-                (default_interval, spacing, iso()),
+                """UPDATE settings SET default_interval_seconds=?,request_spacing_seconds=?,updated_at=?,
+                edit_version=edit_version+? WHERE singleton_id=1""",
+                (default_interval, spacing, iso() if changed else current["updated_at"], int(changed)),
             )
-        return self.settings(minimum_interval, 3.0)
+            return dict(conn.execute("SELECT * FROM settings WHERE singleton_id=1").fetchone())
 
     def reserve_request_turn(self, spacing_seconds):
         now = utc_now()

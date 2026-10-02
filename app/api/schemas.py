@@ -3,14 +3,22 @@
 from datetime import date
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 
-class TargetValidationRequest(BaseModel):
+class StrictRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class VersionedRequest(StrictRequest):
+    expected_version: StrictInt = Field(gt=0)
+
+
+class TargetValidationRequest(StrictRequest):
     booking_url: str = Field(min_length=1, max_length=4096)
 
 
-class JobCreateRequest(BaseModel):
+class JobCreateRequest(StrictRequest):
     name: str = Field(min_length=1, max_length=120)
     target_urls: List[str] = Field(min_length=1, max_length=100)
     interval_seconds: int = Field(default=300, ge=300, le=86400)
@@ -44,7 +52,7 @@ class JobCreateRequest(BaseModel):
         return self
 
 
-class JobUpdateRequest(BaseModel):
+class JobUpdateRequest(VersionedRequest):
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     target_urls: Optional[List[str]] = Field(default=None, min_length=1, max_length=100)
     interval_seconds: Optional[int] = Field(default=None, ge=300, le=86400)
@@ -75,6 +83,13 @@ class JobUpdateRequest(BaseModel):
         return self
 
 
-class SettingsUpdateRequest(BaseModel):
+class SettingsUpdateRequest(VersionedRequest):
     default_interval_seconds: Optional[int] = Field(default=None, ge=300, le=86400)
     request_spacing_seconds: Optional[float] = Field(default=None, ge=3, le=120)
+
+    @model_validator(mode="after")
+    def supplied_values_are_not_null(self):
+        for name in self.model_fields_set:
+            if getattr(self, name) is None:
+                raise ValueError(name + " cannot be null")
+        return self

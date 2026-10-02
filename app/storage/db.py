@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class Database:
@@ -18,7 +18,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6):
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6, 7):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" +
                 """
@@ -29,8 +29,24 @@ class Database:
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     default_interval_seconds INTEGER NOT NULL DEFAULT 300,
                     request_spacing_seconds REAL NOT NULL DEFAULT 3,
+                    edit_version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS create_operations (
+                    key TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    canonical_values TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending','completed','failed')),
+                    owner_token TEXT,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    lease_until TEXT,
+                    job_id TEXT REFERENCES jobs(id),
+                    error_code TEXT,
+                    retryable INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_create_operations_expiry ON create_operations(expires_at);
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -268,6 +284,9 @@ class Database:
                     }.items():
                         for column in columns:
                             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+                    current_version = 6
+                if current_version == 6:
+                    conn.execute("ALTER TABLE settings ADD COLUMN edit_version INTEGER NOT NULL DEFAULT 1")
                     conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
                 elif current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")

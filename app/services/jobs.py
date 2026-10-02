@@ -1,8 +1,11 @@
 """Validation and orchestration for job API operations."""
 
+from copy import copy
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.doctolib import BookingUrlError, DoctolibClient, MetadataResolutionError, parse_booking_url
+from app.storage.repositories import VersionConflictError
+from app.services.create_lease import MetadataLease
 
 
 def resolve_target(url, doctolib):
@@ -41,25 +44,44 @@ def normalize_targets(targets):
     return targets
 
 
-def create_job(repository, doctolib, settings, values):
+def create_job(repository, doctolib, settings, values, operation=None):
     validate_timezone(values["time_zone"])
     telegram_enabled = values.get("telegram_enabled")
     if telegram_enabled is None:
         telegram_enabled = settings.telegram_enabled
     if telegram_enabled and not settings.telegram_enabled:
         raise ValueError("Telegram is not configured on the server")
-    targets = normalize_targets([resolve_target(url, doctolib) for url in values["target_urls"]])
+    targets = []
+    for url in values["target_urls"]:
+        if operation is None:
+            targets.append(resolve_target(url, doctolib))
+            continue
+        with MetadataLease(repository, operation) as lease:
+            # A private copy keeps reservation guards separate from other
+            # requests using the application's shared Doctolib client.
+            guarded = copy(doctolib)
+            request_gate = doctolib.before_request
+            def guarded_request():
+                lease.guard()
+                request_gate()
+                lease.guard()
+            guarded.before_request = guarded_request
+            targets.append(resolve_target(url, guarded))
+            lease.guard()
+    targets = normalize_targets(targets)
     clean = dict(values)
     clean["telegram_enabled"] = bool(telegram_enabled)
-    clean["earliest_date"] = values["earliest_date"].isoformat() if values.get("earliest_date") else None
-    clean["latest_date"] = values["latest_date"].isoformat() if values.get("latest_date") else None
-    return repository.create_job(clean, targets)
+    clean["earliest_date"] = _date_text(values.get("earliest_date"))
+    clean["latest_date"] = _date_text(values.get("latest_date"))
+    return repository.create_job(clean, targets, operation=operation)
 
 
-def update_job(repository, doctolib, settings, job_id, values):
+def update_job(repository, doctolib, settings, job_id, values, expected_version=None):
     existing = repository.get_job(job_id)
     if existing is None:
         return None
+    if expected_version is not None and existing["edit_version"] != expected_version:
+        raise VersionConflictError(existing["edit_version"])
     values = dict(values)
     target_urls = values.pop("target_urls", None)
     if "time_zone" in values:
@@ -90,4 +112,8 @@ def update_job(repository, doctolib, settings, job_id, values):
     if values.get("telegram_enabled") and not settings.telegram_enabled:
         raise ValueError("Telegram is not configured on the server")
     targets = normalize_targets([resolve_target(url, doctolib) for url in target_urls]) if target_urls is not None else None
-    return repository.update_job(job_id, values, targets=targets)
+    return repository.update_job(job_id, values, targets=targets, expected_version=expected_version)
+
+
+def _date_text(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value

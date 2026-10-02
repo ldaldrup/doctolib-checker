@@ -24,7 +24,7 @@ MANIFEST_MEMBER = "manifest.json"
 FORMAT_VERSION = 1
 # Structure checks for the formats this release can rehearse. Future migrations
 # must extend these requirements before advertising a new restore format.
-SUPPORTED_SCHEMAS = {1, 2, 3, 4, 5, 6}
+SUPPORTED_SCHEMAS = {1, 2, 3, 4, 5, 6, 7}
 REQUIRED_COLUMNS = {
     "settings": "singleton_id default_interval_seconds request_spacing_seconds updated_at",
     "jobs": "id name status interval_seconds date_mode horizon_days earliest_date latest_date "
@@ -81,6 +81,9 @@ def _inspect(path):
                     requirements["jobs"] += " status_version last_extra_started_at"
                     requirements["check_runs"] += " intent_id paused_manual status_version"
                     requirements["check_intents"] = "id job_id search_revision triggered_by requested_at eligible_at status paused_manual status_version run_id cancel_reason"
+                if version >= 7:
+                    requirements["settings"] += " edit_version"
+                    requirements["create_operations"] = "key fingerprint canonical_values state owner_token generation lease_until job_id error_code retryable created_at expires_at"
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 for table, fields in requirements.items():
                     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}

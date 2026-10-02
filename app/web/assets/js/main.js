@@ -1,7 +1,7 @@
 import { renderDeliveryNotice } from "./delivery-view.js";
 import { api, createJobPayload, updateJobPayload, settingsPayload } from "./api.js";
 import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
-import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata, savedJobFeedback } from "./pages/jobs.js";
+import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata, savedJobFeedback, updateConflictFields, sameDraftValue } from "./pages/jobs.js";
 import { renderSettings, settingWarning } from "./pages/settings.js";
 
 const app = document.querySelector("#app"), toast = document.querySelector("#toast"), dialog = document.querySelector("#confirm-dialog");
@@ -12,7 +12,7 @@ const state = {
   formDraft: null, editingId: null, original: null, pendingJobs: new Set(),
   checkSubmitting: new Set(), checkErrors: new Map(),
   jobSubmitting: false, settingsSubmitting: false, jobError: null, settingsError: null,
-  settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false,
+  settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false, settingsConflict: null, jobConflict: null, jobConflictBlocked: false, createAttempt: null,
   query: "", filter: "all", intervalFilter: "all", uncertainCreate: null
 };
 let toastTimer, refreshTimer, refreshPromise, refreshAgain = false, refreshSettingsAgain = false, failures = 0, observer, deleteFocus;
@@ -102,8 +102,8 @@ function patchJobs() {
     interval.value = state.intervalFilter;
   }
   const canCreate = Boolean(state.settings) && state.load.jobs.phase === "loaded";
-  const newJob = document.querySelector('[data-action="new-job"]'); if (newJob) newJob.disabled = !canCreate || state.jobSubmitting;
-  const submit = document.querySelector('#job-form [type="submit"]'); if (submit) submit.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate);
+  const newJob = document.querySelector('[data-action="new-job"]'); if (newJob) newJob.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate);
+  const submit = document.querySelector('#job-form [type="submit"]'); if (submit) submit.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate) || state.jobConflictBlocked;
   observeCards(); restoreControl(focus);
 }
 function updateViews() {
@@ -167,7 +167,7 @@ async function loadJobs() {
       if (page.length < 100) break;
     }
     state.jobs = [...collected.values()]; state.load.jobs = {phase: "loaded", error: null};
-    updateViews(); reconcileCreate();
+    updateViews();
   } catch (error) { state.load.jobs = {phase: state.jobs ? "stale" : "error", error}; }
   patchJobs();
 }
@@ -182,8 +182,8 @@ async function loadSettings() {
   try {
     const settings = await api.getSettings();
     if (generation !== settingsGeneration) return;
-    if (state.settingsDirty && state.settings && JSON.stringify(settingsValues(settings)) !== JSON.stringify(settingsValues(state.settings))) state.remoteSettingsChanged = true;
-    state.settings = settings; state.load.settings = {phase: "loaded", error: null};
+    if (state.remoteSettingsChanged || (state.settingsDirty && state.settings && settings.edit_version !== state.settings.edit_version))  { state.remoteSettingsChanged = true; state.settingsConflict = settings; clearTimeout(settingsSaveTimer); }
+    if (!state.settingsConflict) state.settings = settings; state.load.settings = {phase: "loaded", error: null};
     if (!state.settingsDirty) state.settingsDraft = settingsValues(settings);
     if (!state.formDraft) state.formDraft = emptyDraft(settings);
   } catch (error) { if (generation === settingsGeneration) state.load.settings = {phase: state.settings ? "stale" : "error", error}; }
@@ -248,7 +248,7 @@ function showErrors(error, formId, errorId) {
   }
   output.focus?.(); announce(message(error));
 }
-function resetEditor() { state.editingId = null; state.original = null; state.formDraft = state.settings ? emptyDraft(state.settings) : null; state.jobError = null; }
+function resetEditor() { state.createAttempt = null; state.uncertainCreate = null; state.jobConflict = null; state.jobConflictBlocked = false; state.editingId = null; state.original = null; state.formDraft = state.settings ? emptyDraft(state.settings) : null; state.jobError = null; }
 function openEditor() {
   if (route() !== "jobs") location.hash = "#jobs"; else render();
   requestAnimationFrame(() => document.getElementById("job-name")?.focus());
@@ -259,34 +259,24 @@ function canonicalJob(job) {
   if (index < 0) state.jobs.unshift(job); else state.jobs[index] = job;
   updateViews();
 }
-function payloadMatches(job, payload) {
-  const normalized = value => { try { const url = new URL(value); url.hash = ""; return url.href; } catch { return value; } };
-  return Object.entries(payload).every(([key, value]) => key === "target_urls"
-    ? JSON.stringify(job.targets.map(target => normalized(target.booking_url))) === JSON.stringify(value.map(normalized))
-    : JSON.stringify(job[key]) === JSON.stringify(value));
-}
-function reconcileCreate() {
-  const uncertain = state.uncertainCreate; if (!uncertain || !state.jobs) return;
-  const matches = state.jobs.filter(job => !uncertain.ids.has(job.id) && payloadMatches(job, uncertain.payload));
-  if (matches.length === 1) {
-    state.uncertainCreate = null; resetEditor(); announce("The server contains the submitted job. Its creation was confirmed.");
-    if (!state.jobSubmitting) render();
-  }
-}
-async function submitJob(form) {
-  if (state.jobSubmitting || state.uncertainCreate || !state.settings || !state.jobs || state.load.jobs.phase !== "loaded") return;
-  state.formDraft = readDraft(form); state.jobError = null;
+async function submitJob(form, replay = false) {
+  if (state.jobSubmitting || (state.uncertainCreate && !replay) || state.jobConflictBlocked || !state.settings || !state.jobs || state.load.jobs.phase !== "loaded") return;
+  if (!replay) state.formDraft = readDraft(form); state.jobError = null;
   let payload;
-  try { payload = state.original ? updateJobPayload(state.formDraft, state.original, state.settings) : createJobPayload(state.formDraft, state.settings); }
+  try { payload = replay ? state.createAttempt.payload : state.original ? updateJobPayload(state.formDraft, state.original, state.settings) : createJobPayload(state.formDraft, state.settings); }
   catch (error) { state.jobError = error; showErrors(error, "job-form", "job-form-error"); return; }
-  const id = state.editingId, original = state.original, ids = new Set(state.jobs.map(job => job.id));
+  const id = replay ? null : state.editingId, original = state.original;
+  if (!id && !replay) state.createAttempt = {key: crypto.randomUUID(), payload: structuredClone(payload)};
   state.jobSubmitting = true; if (id) state.pendingJobs.add(id); render();
   try {
-    const job = id ? await api.updateJob(id, payload) : await api.createJob(payload);
+    const job = id ? await api.updateJob(id, payload, {expectedVersion: original.edit_version}) : await api.createJob(payload, {idempotencyKey: state.createAttempt.key});
+    if (!id && !job.id) { state.uncertainCreate = {pending: true}; state.jobError = new Error("Creation is in progress. Retry the saved request to retrieve its result."); return; }
     canonicalJob(job); state.checkErrors.delete(job.id); resetEditor(); announce(id ? savedJobFeedback(original, job) : "Job created."); await refresh();
   } catch (error) {
     state.jobError = error;
-    if (!id && error.ambiguous) state.uncertainCreate = {payload, ids};
+    if (!id && error.ambiguous) state.uncertainCreate = {pending: false};
+    if (!id && error.status === 422 && error.detail?.retryable === false) { state.uncertainCreate = null; state.createAttempt = null; }
+    if (id && error.status === 409) { state.jobConflictBlocked = true; try { state.jobConflict = await api.getJob(id); } catch {} }
     if (error.ambiguous || error.status === 404) await refresh();
   } finally {
     state.jobSubmitting = false; if (id) state.pendingJobs.delete(id); render();
@@ -310,14 +300,14 @@ function settingsFeedback() {
 function settingsEdited(immediate = false) {
   state.settingsDraft = readSettings(document.getElementById("settings-form"));
   state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
-  state.settingsError = null; settingsEditRevision++;
-  clearTimeout(settingsSaveTimer); settingsFeedback();
-  if (state.settingsDirty) settingsSaveTimer = setTimeout(() => submitSettings(), immediate ? 0 : 600);
+  if (!state.remoteSettingsChanged) state.settingsError = null; settingsEditRevision++;
+  clearTimeout(settingsSaveTimer); if (state.settingsConflict) showSettingsRead(); else settingsFeedback();
+  if (state.settingsDirty && !state.remoteSettingsChanged) settingsSaveTimer = setTimeout(() => submitSettings(), immediate ? 0 : 600);
 }
 async function submitSettings(form) {
   clearTimeout(settingsSaveTimer);
   if (form) state.settingsDraft = readSettings(form);
-  if (state.settingsSubmitting || !state.settings || !state.settingsDraft) return;
+  if (state.settingsSubmitting || state.remoteSettingsChanged || !state.settings || !state.settingsDraft) return;
   state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
   if (!state.settingsDirty) { settingsFeedback(); return; }
   let payload; try { payload = settingsPayload(state.settingsDraft, state.settings); }
@@ -325,14 +315,14 @@ async function submitSettings(form) {
   const revision = settingsEditRevision;
   ++settingsGeneration; state.settingsSubmitting = true; state.settingsError = null; settingsFeedback();
   try {
-    state.settings = await api.updateSettings(payload);
+    state.settings = await api.updateSettings(payload, {expectedVersion: state.settings.edit_version});
     state.load.settings = {phase: "loaded", error: null};
     state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
     state.remoteSettingsChanged = false;
-  } catch (error) { state.settingsError = error; }
+  } catch (error) { state.settingsError = error; if (error.status === 409) { state.remoteSettingsChanged = true; try { state.settingsConflict = await api.getSettings(); state.remoteSettingsChanged = true; } catch {} showSettingsRead(); } }
   finally {
     state.settingsSubmitting = false; settingsFeedback();
-    if (settingsEditRevision !== revision && state.settingsDirty) settingsSaveTimer = setTimeout(() => submitSettings(), 600);
+    if (settingsEditRevision !== revision && state.settingsDirty && !state.remoteSettingsChanged && !state.settingsError) settingsSaveTimer = setTimeout(() => submitSettings(), 600);
   }
 }
 
@@ -340,7 +330,7 @@ async function mutateJob(job, action) {
   if (state.pendingJobs.has(job.id)) return;
   state.pendingJobs.add(job.id); patchJobs();
   try {
-    const result = await api[`${action}Job`](job.id);
+    const result = await api[`${action}Job`](job.id, {expectedVersion: job.edit_version});
     if (action === "delete") {
       state.jobs = state.jobs.filter(value => value.id !== job.id); state.histories.delete(job.id);
       if (state.editingId === job.id) { resetEditor(); render(); }
@@ -348,7 +338,7 @@ async function mutateJob(job, action) {
     else canonicalJob(result);
     announce(action === "delete" ? "Job deleted. Check history is retained." : `Job ${action === "pause" ? "paused" : "resumed"}.`);
     await refresh();
-  } catch (error) { announce(message(error)); if (error.ambiguous || error.status === 404) await refresh(); }
+  } catch (error) { announce(message(error)); if (error.ambiguous || error.status === 404 || error.status === 409) await refresh(); }
   finally { state.pendingJobs.delete(job.id); patchJobs(); }
 }
 async function requestJobCheck(job) {
@@ -401,13 +391,13 @@ async function validateTargets() {
   }
 }
 
-document.addEventListener("click", event => {
+document.addEventListener("click", async event => {
   const control = event.target.closest("[data-action]"); if (!control || control.disabled) return;
   const action = control.dataset.action, job = state.jobs?.find(value => value.id === control.closest("[data-job-id]")?.dataset.jobId);
   if (["retry", "refresh"].includes(action)) { refresh(true); return; }
   if (action === "sign-in") { location.assign(location.href); return; }
   if (action === "filter") { state.filter = control.dataset.filter; patchJobs(); refresh(); return; }
-  if (["new-job", "cancel-edit"].includes(action)) { if (!state.jobSubmitting) { resetEditor(); openEditor(); refresh(); } return; }
+  if (["new-job", "cancel-edit"].includes(action)) { if (!state.jobSubmitting && !state.uncertainCreate) { resetEditor(); openEditor(); refresh(); } return; }
   if (["add-target", "remove-target"].includes(action)) {
     if (state.jobSubmitting || !state.formDraft) return;
     state.formDraft = readDraft(document.getElementById("job-form"));
@@ -416,26 +406,52 @@ document.addEventListener("click", event => {
     render(); document.getElementById(`target-${action === "add-target" ? state.formDraft.target_urls.length - 1 : Math.max(0, Number(control.dataset.index) - 1)}`)?.focus(); return;
   }
   if (action === "retry-settings") { submitSettings(); return; }
-  if (action === "retry-create" && state.uncertainCreate) {
-    deleteFocus = controlFocus(control); dialog.dataset.operation = "retry-create"; dialog.returnValue = "";
-    dialog.querySelector('[value="confirm"]').textContent = "Allow retry";
-    dialog.querySelector("#confirm-title").textContent = "Allow another creation attempt?";
-    dialog.querySelector("#confirm-copy").textContent = "The previous request may still create a job. Trying again can create a duplicate. Confirm only after checking the refreshed jobs list; this confirmation enables the form, and does not submit it.";
-    dialog.showModal(); return;
+  if (action === "retry-create" && state.uncertainCreate) { submitJob(null, true); return; }
+  if (action === "refetch-job-conflict" && state.editingId) {
+    try { state.jobConflict = await api.getJob(state.editingId); state.jobError = null; render(); } catch (error) { state.jobError = error; render(); } return;
+  }
+  if (action === "reconcile-job" && state.jobConflict) {
+    const prior = {...state.original, target_urls: state.original.targets.map(target => target.booking_url)}, latest = state.jobConflict;
+    const merged = {...latest, target_urls: latest.targets.map(target => target.booking_url), earliest_date: latest.earliest_date || "", latest_date: latest.latest_date || ""};
+    const conflicts = updateConflictFields(state);
+    for (const [key, value] of Object.entries(state.formDraft)) {
+      if (sameDraftValue(key, value, prior[key])) continue;
+      if (conflicts[key]) {
+        const choice = document.querySelector(`[name="job-reconcile-${key}"]:checked`);
+        if (!choice) { announce("Choose a value for each conflicting field."); return; }
+        if (choice.value === "server") continue;
+      }
+      merged[key] = value;
+    }
+    state.formDraft = merged; state.original = structuredClone(latest); state.jobConflict = null; state.jobConflictBlocked = false; state.jobError = null; render(); return;
+  }
+  if (action === "use-server-settings" && state.settingsConflict) {
+    state.settings = state.settingsConflict; state.settingsConflict = null; state.remoteSettingsChanged = false;
+    state.settingsDraft = settingsValues(state.settings); state.settingsDirty = false; state.settingsError = null; render(); return;
+  }
+  if (action === "reconcile-settings" && state.settingsConflict) {
+    const latest = state.settingsConflict, draft = {...state.settingsDraft};
+    for (const field of Object.keys(settingsValues(latest))) {
+      const choice = document.querySelector(`[name="reconcile-${field}"]:checked`);
+      if (!choice) { announce("Choose the server or your draft for each setting before saving."); return; }
+      if (choice.value === "server") draft[field] = latest[field];
+    }
+    state.settings = latest; state.settingsConflict = null; state.remoteSettingsChanged = false;
+    state.settingsDraft = draft; state.settingsError = null; state.settingsDirty = settingsDiffer(draft, latest); render(); submitSettings(); return;
   }
   if (!job || state.pendingJobs.has(job.id)) return;
   if (action === "check-now") { requestJobCheck(job); return; }
   if (["pause", "resume"].includes(action)) { mutateJob(job, action); return; }
-  if (action === "edit" && !state.jobSubmitting) {
+  if (action === "edit" && !state.jobSubmitting && !state.uncertainCreate) {
     state.editingId = job.id; state.original = structuredClone(job);
     state.formDraft = {...job, target_urls: job.targets.map(target => target.booking_url), earliest_date: job.earliest_date || "", latest_date: job.latest_date || ""};
     for (const target of job.targets) {
       if (state.targetMetadata.get(target.booking_url)?.phase !== "loading") state.targetMetadata.set(target.booking_url, {phase: "loaded", data: target, error: null, seeded: true});
     }
-    state.jobError = null; openEditor(); refresh(); return;
+    state.jobError = null; state.jobConflict = null; state.jobConflictBlocked = false; openEditor(); refresh(); return;
   }
   if (action === "delete") {
-    deleteFocus = controlFocus(control); dialog.dataset.operation = "delete"; dialog.dataset.jobId = job.id; dialog.returnValue = "";
+    deleteFocus = controlFocus(control); dialog.dataset.operation = "delete"; dialog.dataset.jobId = job.id; dialog.dataset.expectedVersion = String(job.edit_version); dialog.returnValue = "";
     dialog.querySelector('[value="confirm"]').textContent = "Delete job";
     dialog.querySelector("#confirm-title").textContent = `Delete ${job.name}?`;
     dialog.querySelector("#confirm-copy").textContent = "The job will stop being scheduled and its check history will be retained. A check already in flight may still record a result. Deletion persists after reload.";
@@ -456,12 +472,12 @@ document.addEventListener("input", event => {
       scheduleTargetValidation();
     }
   }
-  if (event.target.closest("#settings-form")) settingsEdited(event.target.type === "radio");
+  if (event.target.closest("#settings-form") && !event.target.name.startsWith("reconcile-")) settingsEdited(event.target.type === "radio");
 });
 document.addEventListener("change", event => {
   if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); refresh(); return; }
   if (event.target.closest("#job-form")) state.formDraft = readDraft(document.getElementById("job-form"));
-  if (event.target.closest("#settings-form")) settingsEdited(event.target.type === "radio");
+  if (event.target.closest("#settings-form") && !event.target.name.startsWith("reconcile-")) settingsEdited(event.target.type === "radio");
   const toggle = (wrapperId, custom, inputId) => {
     const wrapper = document.getElementById(wrapperId), input = document.getElementById(inputId);
     if (wrapper) wrapper.hidden = !custom;
@@ -483,9 +499,9 @@ document.addEventListener("submit", event => {
 });
 dialog.addEventListener("close", () => {
   if (dialog.returnValue === "confirm") {
-    if (dialog.dataset.operation === "retry-create") { state.uncertainCreate = null; state.jobError = null; render(); }
+
     if (dialog.dataset.operation === "delete") {
-      const job = state.jobs?.find(value => value.id === dialog.dataset.jobId); if (job) mutateJob(job, "delete");
+      const job = state.jobs?.find(value => value.id === dialog.dataset.jobId); if (job) mutateJob({...job, edit_version: Number(dialog.dataset.expectedVersion)}, "delete");
     }
   }
   if (!deleteFocus || !restoreControl(deleteFocus)) app.focus({preventScroll: true});
@@ -501,3 +517,5 @@ document.addEventListener("visibilitychange", () => {
 });
 render();
 refresh(true);
+
+window.addEventListener("beforeunload", event => { if (state.uncertainCreate) { event.preventDefault(); event.returnValue = ""; } });
