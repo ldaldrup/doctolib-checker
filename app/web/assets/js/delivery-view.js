@@ -3,7 +3,7 @@ import { escapeHtml as h } from "./ui.js";
 export function deliveryNotice(state) {
   if (state.load?.status?.phase !== "loaded") return "Notification delivery status is unknown. Availability checking has a separate worker.";
   const status = state.status || {};
-  if (!status.telegram_configured) return "Telegram is not configured on the server.";
+  if (!status.telegram_configured) return "No usable Telegram channel. Add or repair saved channels in Settings.";
   const backlog = status.delivery_backlog || {};
   const notices = [];
   if (!status.dispatcher_alive) notices.push("Notification dispatcher unavailable; queued alerts are retained. Availability checking runs independently.");

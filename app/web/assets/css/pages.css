@@ -160,3 +160,13 @@
   .job-actions .action-label { display: inline; }
   .job-hero-actions { flex-wrap: wrap; }
 }
+
+#channel-settings > p, #channel-settings > .notice, #channel-settings > .channel-form,
+#channel-settings > .button { margin: 16px 20px; }
+.channel-form { display: grid; gap: 12px; }
+.channel-form fieldset { display: grid; gap: 12px; min-width: 0; border: 0; padding: 0; }
+.channel-form .field { display: grid; gap: 6px; }
+.channel-form .checkbox-line { gap: 16px; }
+.channel-preview { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.channel-deliveries { margin: 8px 0; padding-left: 18px; color: var(--color-muted); font-size: 12px; }
+#channel-settings .settings-control { flex-wrap: wrap; }

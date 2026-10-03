@@ -7,6 +7,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     database_path: str = "./data/checker.sqlite3"
+    notification_secret_key: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_enabled: bool = False
@@ -31,6 +32,9 @@ class Settings:
 
     @classmethod
     def from_env(cls):
+        from app.notification_secrets import NotificationSecrets
+        secret_key = os.getenv("NOTIFICATION_SECRET_KEY", "").strip()
+        NotificationSecrets(secret_key)
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
@@ -43,6 +47,7 @@ class Settings:
         if not 1 <= page_days <= 15:
             raise ValueError("DOCTOLIB_PAGE_DAYS must be between 1 and 15")
         return cls(
+            notification_secret_key=secret_key,
             database_path=os.getenv("DATABASE_PATH", "./data/checker.sqlite3"),
             telegram_bot_token=token,
             telegram_chat_id=chat_id,

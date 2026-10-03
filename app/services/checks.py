@@ -80,16 +80,6 @@ class CheckService:
                         last_error = result.error_code or "doctolib_incomplete_result"
                     else:
                         successful += 1
-                    if result.status == "available" and result.earliest_slot:
-                        # Re-read state after the HTTP request so a pause or
-                        # notification edit suppresses delivery for this result.
-                        current_job = self.repository.get_job(job["id"])
-                        if current_job and current_job["telegram_enabled"]:
-                            # Storage requires either active publication or the
-                            # still-current scoped paused manual capability.
-                            self.repository.create_alert(
-                                current_job, target, result_id, result.earliest_slot, owner_token=owner_token
-                            )
                 except (_RunStopped, LeaseLostError):
                     break
                 except Exception as exc:

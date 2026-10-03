@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.routes import create_router
 from app.doctolib import DoctolibClient
 from app.settings import Settings
+from app.notification_secrets import NotificationSecrets
 from app.storage.db import Database
 from app.storage.repositories import Repository
 
@@ -25,6 +26,7 @@ class WebFiles(StaticFiles):
 
 def create_app(settings=None, repository=None, doctolib=None):
     settings = settings or Settings.from_env()
+    secrets = NotificationSecrets(settings.notification_secret_key)
     if repository is None:
         database = Database(settings.database_path)
         database.initialize()
@@ -45,6 +47,7 @@ def create_app(settings=None, repository=None, doctolib=None):
 
     app = FastAPI(title="Doctolib Checker API", version="1.0.0")
     app.state.settings = settings
+    app.state.notification_secrets = secrets
     app.state.repository = repository
     app.state.doctolib = doctolib
 

@@ -1,3 +1,4 @@
+import { renderChannels } from "./channels.js";
 import { renderDeliveryNotice } from "../delivery-view.js";
 import { escapeHtml as h, icon } from "../ui.js";
 const pollInterval = seconds => seconds % 3600 === 0 ? `${seconds / 3600} hr` : seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} sec`;
@@ -31,6 +32,6 @@ export function renderSettings(state) {
       ${row("Outbound request spacing", "Minimum delay between Doctolib requests across jobs.", `<label class="visually-hidden" for="request-spacing">Request spacing in seconds</label><input class="input numeric" id="request-spacing" name="request_spacing_seconds" type="number" min="3" max="120" step="any" value="${h(draft.request_spacing_seconds)}" required><span class="unit">sec</span>`, "request_spacing_seconds", state)}
       ${row("Server polling floor", "Configured on the server; minimum interval allowed for every job.", `<span class="numeric">${h(settings.minimum_poll_interval_seconds)} seconds</span>`)}
       ${row("Default time zone", "Configured on the server; used for new jobs.", `<span>${h(settings.time_zone || "Unknown")}</span>`)}
-    </section><section class="panel" aria-labelledby="notification-heading"><div class="panel-header">${icon("bellActive")}<div><h2 id="notification-heading">Notifications</h2><p>Per-job Telegram preferences are available in Jobs.</p></div></div>${row("Telegram Bot Alerts", "Credentials are configured on the server.", `<span class="${settings.telegram_configured ? "settings-channel-status" : "muted"}">${settings.telegram_configured ? "Configured on server" : "Not configured"}</span>`)}</section></fieldset>
-    </form>`;
+    </section></fieldset>
+    </form>${renderChannels(state)}`;
 }

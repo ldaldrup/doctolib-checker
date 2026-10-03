@@ -1,3 +1,4 @@
+import { channelController } from "./pages/channels.js";
 import { renderDeliveryNotice } from "./delivery-view.js";
 import { api, createJobPayload, updateJobPayload, settingsPayload } from "./api.js";
 import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
@@ -18,6 +19,7 @@ const state = {
 let toastTimer, refreshTimer, refreshPromise, refreshAgain = false, refreshSettingsAgain = false, failures = 0, observer, deleteFocus;
 let historyActive = 0, settingsGeneration = 0, historyEpoch = 0;
 const historyQueue = [], historyQueued = new Set(), searchSignatures = new Map(), invalidations = new Map();
+const channels = channelController(state, {render, announce, refreshJobs: () => refresh(true), onLoad: patchJobChannels});
 const route = () => location.hash === "#settings" ? "settings" : "jobs";
 const message = error => error?.message || "The request failed.";
 const settingsValues = settings => ({default_interval_seconds: settings.default_interval_seconds, request_spacing_seconds: settings.request_spacing_seconds});
@@ -105,6 +107,14 @@ function patchJobs() {
   const newJob = document.querySelector('[data-action="new-job"]'); if (newJob) newJob.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate);
   const submit = document.querySelector('#job-form [type="submit"]'); if (submit) submit.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate) || state.jobConflictBlocked;
   observeCards(); restoreControl(focus);
+}
+function patchJobChannels() {
+  if (route() !== "jobs") return;
+  const current = document.getElementById("job-channel-options");
+  if (!current || !state.settings) return;
+  const template = document.createElement("template"); template.innerHTML = renderJobs(state);
+  const next = template.content.querySelector("#job-channel-options");
+  if (next && current.innerHTML !== next.innerHTML) { const focus = controlFocus(); current.innerHTML = next.innerHTML; restoreControl(focus); }
 }
 function updateViews() {
   for (const job of state.jobs || []) {
@@ -215,7 +225,7 @@ function refresh(includeSettings = false) {
     try {
       do {
         refreshAgain = false;
-        await Promise.all([loadJobs(), loadStatus(), ...(settings ? [loadSettings()] : [])]);
+        await Promise.all([loadJobs(), loadStatus(), channels.load(), ...(settings ? [loadSettings()] : [])]);
         failures = [state.load.jobs, state.load.status].some(load => ["error", "stale"].includes(load.phase)) ? Math.min(failures + 1, 2) : 0;
         if (settings) showSettingsRead();
         settings = refreshSettingsAgain; refreshSettingsAgain = false;
@@ -232,7 +242,7 @@ function readDraft(form) {
     date_mode: data.get("date_mode"), horizon_days: form.querySelector("#horizon-days")?.value || state.formDraft?.horizon_days || 15,
     earliest_date: form.querySelector("#earliest-date")?.value || "", latest_date: form.querySelector("#latest-date")?.value || "",
     time_zone: state.original?.time_zone || state.settings.time_zone, insurance_sector: data.get("insurance_sector"),
-    telehealth: data.has("telehealth"), telegram_enabled: state.settings.telegram_configured && data.has("telegram_enabled")};
+    telehealth: data.has("telehealth"), telegram_enabled: data.has("telegram_enabled"), notification_channel_ids: [...data.getAll("notification_channel_ids"), ...(state.formDraft?.notification_channel_ids || []).filter(id => ![...form.querySelectorAll('[name="notification_channel_ids"]')].some(input => input.value === id))]};
 }
 function readSettings(form) {
   const data = new FormData(form), interval = data.get("default_interval_choice");
@@ -393,6 +403,7 @@ async function validateTargets() {
 
 document.addEventListener("click", async event => {
   const control = event.target.closest("[data-action]"); if (!control || control.disabled) return;
+  if (control.closest("#channel-settings")) { await channels.click(control); return; }
   const action = control.dataset.action, job = state.jobs?.find(value => value.id === control.closest("[data-job-id]")?.dataset.jobId);
   if (["retry", "refresh"].includes(action)) { refresh(true); return; }
   if (action === "sign-in") { location.assign(location.href); return; }
@@ -459,6 +470,7 @@ document.addEventListener("click", async event => {
   }
 });
 document.addEventListener("input", event => {
+  if (channels.input(event)) return;
   if (event.target.id === "job-search") { state.query = event.target.value; patchJobs(); clearTimeout(searchRefreshTimer); searchRefreshTimer = setTimeout(() => refresh(), 300); return; }
   if (event.target.closest("#job-form")) {
     state.formDraft = readDraft(document.getElementById("job-form"));
@@ -475,6 +487,7 @@ document.addEventListener("input", event => {
   if (event.target.closest("#settings-form") && !event.target.name.startsWith("reconcile-")) settingsEdited(event.target.type === "radio");
 });
 document.addEventListener("change", event => {
+  if (channels.input(event)) return;
   if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); refresh(); return; }
   if (event.target.closest("#job-form")) state.formDraft = readDraft(document.getElementById("job-form"));
   if (event.target.closest("#settings-form") && !event.target.name.startsWith("reconcile-")) settingsEdited(event.target.type === "radio");
@@ -494,6 +507,7 @@ document.addEventListener("change", event => {
   }
 });
 document.addEventListener("submit", event => {
+  if (event.target.id === "channel-form") { event.preventDefault(); channels.submit(event.target); }
   if (event.target.id === "job-form") { event.preventDefault(); submitJob(event.target); }
   if (event.target.id === "settings-form") { event.preventDefault(); submitSettings(event.target); }
 });
@@ -518,4 +532,4 @@ document.addEventListener("visibilitychange", () => {
 render();
 refresh(true);
 
-window.addEventListener("beforeunload", event => { if (state.uncertainCreate) { event.preventDefault(); event.returnValue = ""; } });
+window.addEventListener("beforeunload", event => { if (state.uncertainCreate || state.channelUI?.createAttempt || state.channelUI?.draft) { event.preventDefault(); event.returnValue = ""; } });

@@ -35,7 +35,9 @@ def test_retry_turn_uses_freshly_revalidated_payload_for_same_episode(tmp_path):
         conn.execute('UPDATE alerts SET next_attempt_at=? WHERE id=?', (iso(utc_now()), original['id']))
     assert not dispatcher.run_once()  # Old evidence cannot dispatch after the edit.
     target, result_id = record_result(repository, job, 'available', slot, 3)
-    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) == original['id']
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) is None
+    assert not dispatcher.run_once()  # Cancellation is never revived implicitly.
+    assert repository.recover_alert(original['id'])
     assert dispatcher.run_once()
     assert messages[-1] == 'New practitioner label' and len(messages) == 2
     assert repository.alerts()[0]['status'] == 'sent'

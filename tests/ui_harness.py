@@ -18,6 +18,9 @@ from app.api.app import create_app
 from app.doctolib import DoctolibClient
 from app.models import AvailabilityResult
 from app.services.checks import CheckService
+from app.services.delivery import DeliveryService
+from app.notifications import DeliveryOutcome
+from cryptography.fernet import Fernet
 from app.settings import Settings
 from app.storage.db import Database
 from app.storage.repositories import Repository
@@ -56,7 +59,7 @@ class FixtureDoctolib(DoctolibClient):
 
 def create_harness(directory):
     directory.mkdir(parents=True, exist_ok=True)
-    settings = Settings(database_path=str(directory / "checker.sqlite3"))
+    settings = Settings(database_path=str(directory / "checker.sqlite3"), notification_secret_key=Fernet.generate_key().decode(), telegram_bot_token="12345:synthetic_fixture_token_for_ui_only", telegram_chat_id="-100000001", telegram_enabled=True)
     database = Database(settings.database_path)
     database.initialize()
     repository = Repository(database)
@@ -113,6 +116,12 @@ document.querySelector('#page').onchange=e=>frame.src='/#'+e.target.value;</scri
     @app.post("/__test/checks", include_in_schema=False)
     def run_checks():
         return CheckService(repository, doctolib, settings).run_due()
+
+    @app.post("/__test/deliver", include_in_schema=False)
+    def run_delivery(outcome: str = "sent"):
+        def fixture_sender(settings, alert):
+            return DeliveryOutcome("uncertain" if outcome == "uncertain" else "sent", attempted=True)
+        return {"processed": DeliveryService(repository, settings, sender=fixture_sender).run_once()}
 
     app.router.routes.append(static_mount)
     return app

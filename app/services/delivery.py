@@ -1,6 +1,8 @@
 """SQLite-owned, serial delivery turns independent of availability polling."""
 
 from app.notifications import DeliveryOutcome, send_telegram_alert
+from app.notification_secrets import SecretUnavailable
+from app.services.channel_tests import channel_settings, run_test_once
 
 
 class DeliveryService:
@@ -13,18 +15,25 @@ class DeliveryService:
         """Process at most one network attempt; retry scheduling lives in SQLite."""
         self.repository.reconcile_alert_claims()
         self.repository.touch_dispatcher()
-        if (self.sender is send_telegram_alert and
-                (not self.settings.telegram_enabled or not self.settings.telegram_bot_token
-                 or not self.settings.telegram_chat_id)):
-            # Configuration failure is not a network attempt. Leave work ready
-            # and expose the operator action through the dispatcher heartbeat.
-            self.repository.touch_dispatcher(last_error="telegram_not_configured")
-            return False
+        if run_test_once(self.repository, self.settings, self.sender):
+            return True
         claimed = self.repository.claim_alert(lease_seconds=60)
         if claimed is None:
             return False
         token = claimed["owner_token"]
         started = False
+        configured = None
+        try:
+            channel = self.repository.get_channel(claimed['channel_config_id'], private=True)
+            if (channel is None or channel['destination_version'] != claimed['destination_version']
+                    or channel['credential_version'] != claimed['credential_version']):
+                raise SecretUnavailable('notification_channel_changed')
+            configured = channel_settings(self.settings, channel)
+        except SecretUnavailable as exc:
+            self.repository.finish_unstarted_delivery(claimed['id'], token,
+                'retry' if str(exc)=='notification_channel_changed' else 'action_required', error_code=str(exc))
+            self.repository.touch_dispatcher(last_error=str(exc))
+            return False
 
         def before_send(remaining_seconds=None):
             nonlocal started
@@ -34,13 +43,13 @@ class DeliveryService:
 
         try:
             if self.sender is send_telegram_alert:
-                outcome = self.sender(self.settings, claimed, before_send=before_send)
+                outcome = self.sender(configured, claimed, before_send=before_send)
             else:
                 payload = self.repository.begin_alert_attempt(claimed["id"], token)
                 if payload is None:
                     return False
                 started = True
-                outcome = self.sender(self.settings, payload)
+                outcome = self.sender(configured, payload)
             if not isinstance(outcome, DeliveryOutcome):
                 outcome = DeliveryOutcome("uncertain" if started else "retry",
                                           "telegram_invalid_sender_outcome", attempted=started)

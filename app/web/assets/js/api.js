@@ -1,7 +1,7 @@
 import { safeBookingUrl } from "./job-view.js";
 
 const ROOT = "/api/v1";
-const JOB_FIELDS = ["name", "target_urls", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth", "telegram_enabled"];
+const JOB_FIELDS = ["name", "target_urls", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth", "telegram_enabled", "notification_channel_ids"];
 const SETTINGS_FIELDS = ["default_interval_seconds", "request_spacing_seconds"];
 const pick = (source, fields) => Object.fromEntries(fields.filter(key => Object.hasOwn(source, key) && source[key] !== undefined).map(key => [key, source[key]]));
 
@@ -77,6 +77,14 @@ const page = ({limit = 100, offset = 0, status} = {}) => {
 };
 
 export const api = {
+  listChannels: options => request("/channels", options),
+  createChannel: (values, key) => request("/channels", {method: "POST", body: values, headers: {"Idempotency-Key": key}}),
+  updateChannel: (id, values, version) => request(`/channels/${identifier(id)}`, {method: "PATCH", body: {...values, expected_version: version}}),
+  deleteChannel: (id, version) => request(`/channels/${identifier(id)}`, {method: "DELETE", body: {expected_version: version, confirmed: true}}),
+  importLegacyChannel: key => request("/channels/import-legacy", {method: "POST", body: {}, headers: {"Idempotency-Key": key}}),
+  channelPreview: id => request(`/channels/${identifier(id)}/preview`),
+  testChannel: (id, version, key) => request(`/channels/${identifier(id)}/tests`, {method: "POST", body: {expected_version: version}, headers: {"Idempotency-Key": key}}),
+  getChannelTest: id => request(`/channel-tests/${identifier(id)}`),
   getSettings: options => request("/settings", options),
   getStatus: options => request("/status", options),
   listJobs: (options = {}) => request(`/jobs?${page(options)}`, {signal: options.signal}),
@@ -129,7 +137,10 @@ export function createJobPayload(draft, settings) {
     insurance_sector: draft.insurance_sector, telehealth: Boolean(draft.telehealth), telegram_enabled: Boolean(draft.telegram_enabled)
   };
   try { new Intl.DateTimeFormat("en", {timeZone: payload.time_zone}); } catch { invalid("time_zone", "Choose a valid IANA time zone."); }
-  if (payload.telegram_enabled && !settings.telegram_configured) invalid("telegram_enabled", "Telegram is not configured on the server.");
+  if (Object.hasOwn(draft, "notification_channel_ids")) {
+    if (!Array.isArray(draft.notification_channel_ids) || draft.notification_channel_ids.some(id => typeof id !== "string" || !id)) invalid("notification_channel_ids", "Choose saved notification channels.");
+    payload.notification_channel_ids = [...new Set(draft.notification_channel_ids)];
+  } else if (payload.telegram_enabled && !settings.telegram_configured) invalid("telegram_enabled", "Telegram is not configured on the server.");
   if (payload.date_mode === "custom") {
     payload.earliest_date = date(draft.earliest_date, "earliest_date");
     payload.latest_date = date(draft.latest_date, "latest_date");

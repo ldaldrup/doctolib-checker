@@ -24,7 +24,7 @@ MANIFEST_MEMBER = "manifest.json"
 FORMAT_VERSION = 1
 # Structure checks for the formats this release can rehearse. Future migrations
 # must extend these requirements before advertising a new restore format.
-SUPPORTED_SCHEMAS = {1, 2, 3, 4, 5, 6, 7}
+SUPPORTED_SCHEMAS = {1, 2, 3, 4, 5, 6, 7, 8}
 REQUIRED_COLUMNS = {
     "settings": "singleton_id default_interval_seconds request_spacing_seconds updated_at",
     "jobs": "id name status interval_seconds date_mode horizon_days earliest_date latest_date "
@@ -84,6 +84,14 @@ def _inspect(path):
                 if version >= 7:
                     requirements["settings"] += " edit_version"
                     requirements["create_operations"] = "key fingerprint canonical_values state owner_token generation lease_until job_id error_code retryable created_at expires_at"
+                if version >= 8:
+                    requirements["alerts"] += " event_id channel_config_id destination_version credential_version channel_name"
+                    requirements["notification_channels"] = "id type name enabled deleted edit_version destination_version credential_version token_ciphertext chat_ciphertext destination_identity created_at updated_at"
+                    requirements["job_channels"] = "job_id channel_config_id"
+                    requirements["availability_events"] = "id job_id target_id result_id dedupe_key search_revision observed_at routed_at routing_snapshot"
+                    requirements["channel_mutations"] = "key fingerprint channel_id created_at expires_at"
+                    requirements["notification_onboarding"] = "singleton_id channel_id"
+                    requirements["channel_tests"] = "id key fingerprint channel_config_id destination_version credential_version status owner_token claim_until attempt_started_at attempt_count error_code created_at updated_at expires_at"
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 for table, fields in requirements.items():
                     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -230,6 +238,9 @@ async def _health(path):
         repository.get_job(job_id)
         repository.get_targets(job_id)
         repository.checks(job_id, limit=1)
+    channels = repository.list_channels()["items"]
+    if channels:
+        repository.get_channel(channels[0]["id"])
     repository.alerts(limit=1)
     repository.dashboard_status()
     messages = []

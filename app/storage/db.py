@@ -4,8 +4,10 @@ import os
 import sqlite3
 from contextlib import contextmanager
 
+from app.storage.channel_operations import CHANNEL_SCHEMA
 
-SCHEMA_VERSION = 7
+
+SCHEMA_VERSION = 8
 
 
 class Database:
@@ -18,9 +20,9 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6, 7):
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6, 7, 8):
                     raise RuntimeError("Unsupported database schema version")
-            conn.executescript("BEGIN IMMEDIATE;" +
+            conn.executescript("BEGIN IMMEDIATE;" + CHANNEL_SCHEMA +
                 """
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER NOT NULL
@@ -139,6 +141,22 @@ class Database:
                     last_earliest_slot TEXT,
                     episode INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS job_channels (
+                    job_id TEXT NOT NULL REFERENCES jobs(id),
+                    channel_config_id TEXT NOT NULL REFERENCES notification_channels(id),
+                    PRIMARY KEY(job_id,channel_config_id)
+                );
+                CREATE TABLE IF NOT EXISTS availability_events (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT REFERENCES jobs(id),
+                    target_id TEXT REFERENCES targets(id),
+                    result_id TEXT REFERENCES check_results(id),
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    search_revision INTEGER,
+                    observed_at TEXT NOT NULL,
+                    routed_at TEXT NOT NULL,
+                    routing_snapshot TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
                     job_id TEXT REFERENCES jobs(id),
@@ -163,7 +181,12 @@ class Database:
                     last_attempt_at TEXT,
                     last_attempt_outcome TEXT,
                     delivery_epoch_at TEXT,
-                    delivery_epoch_attempts INTEGER NOT NULL DEFAULT 0
+                    delivery_epoch_attempts INTEGER NOT NULL DEFAULT 0,
+                    event_id TEXT REFERENCES availability_events(id),
+                    channel_config_id TEXT REFERENCES notification_channels(id),
+                    destination_version INTEGER,
+                    credential_version INTEGER,
+                    channel_name TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
                 CREATE TABLE IF NOT EXISTS worker_heartbeat (
@@ -287,12 +310,57 @@ class Database:
                     current_version = 6
                 if current_version == 6:
                     conn.execute("ALTER TABLE settings ADD COLUMN edit_version INTEGER NOT NULL DEFAULT 1")
-                    conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
-                elif current_version != SCHEMA_VERSION:
+                    current_version = 7
+                if current_version == 7:
+                    self._migrate_channels(conn)
+                    current_version = 8
+                if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
+            conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_event_destination ON alerts(event_id,channel_config_id,destination_version)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_results_known_run_target ON check_results(run_id,target_id) WHERE snapshot_known=1")
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+
+    @staticmethod
+    def _migrate_channels(conn):
+        """Quiesced transition: retain evidence, never replay an unknown recipient."""
+        import uuid
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        for column in ("event_id TEXT REFERENCES availability_events(id)",
+                       "channel_config_id TEXT REFERENCES notification_channels(id)",
+                       "destination_version INTEGER", "credential_version INTEGER", "channel_name TEXT"):
+            conn.execute(f"ALTER TABLE alerts ADD COLUMN {column}")
+        rows = conn.execute("SELECT * FROM alerts ORDER BY rowid").fetchall()
+        if rows:
+            conn.execute("""INSERT OR IGNORE INTO notification_channels
+                (id,type,name,enabled,deleted,edit_version,destination_version,credential_version,
+                 destination_identity,created_at,updated_at)
+                VALUES('legacy-telegram','telegram','Legacy Telegram',0,1,1,1,1,'legacy',?,?)""", (now, now))
+        for row in rows:
+            event_id = str(uuid.uuid4())
+            conn.execute("""INSERT OR IGNORE INTO availability_events
+                (id,job_id,target_id,result_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)
+                VALUES(?,?,?,?,?,?,?,?, '[]')""", (event_id,row['job_id'],row['target_id'],row['result_id'],
+                row['dedupe_key'],row['search_revision'],row['created_at'],now))
+            event_id = conn.execute("SELECT id FROM availability_events WHERE dedupe_key=?", (row['dedupe_key'],)).fetchone()[0]
+            conn.execute("""UPDATE alerts SET event_id=?,channel_config_id='legacy-telegram',
+                destination_version=1,credential_version=1,channel_name='Legacy Telegram',
+                status=CASE WHEN status IN ('pending','failed') THEN 'cancelled' ELSE status END,
+                error_summary=CASE WHEN status IN ('pending','failed') THEN 'migration_legacy_requires_import' ELSE error_summary END,
+                next_attempt_at=CASE WHEN status IN ('pending','failed') THEN NULL ELSE next_attempt_at END WHERE id=?""",
+                (event_id,row['id']))
+        for state in conn.execute("""SELECT s.*,t.job_id,j.search_revision FROM target_alert_state s
+                JOIN targets t ON t.id=s.target_id JOIN jobs j ON j.id=t.job_id
+                WHERE s.last_status='available' AND s.last_earliest_slot IS NOT NULL""").fetchall():
+            key = state['target_id'] + ':slot:' + state['last_earliest_slot']
+            if state['episode']:
+                key += ':episode:' + str(state['episode'])
+            conn.execute("""INSERT OR IGNORE INTO availability_events
+                (id,job_id,target_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)
+                VALUES(?,?,?,?,?,?,?, '[]')""", (str(uuid.uuid4()),state['job_id'],state['target_id'],key,
+                state['search_revision'],now,now))
 
     @contextmanager
     def connection(self):

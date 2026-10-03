@@ -7,6 +7,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from app.doctolib import DoctolibClient
+from app.storage.channel_operations import ChannelOperations
 
 
 def utc_now():
@@ -85,7 +86,7 @@ def search_signature(job, targets):
     return json.dumps([search, sorted(metadata, key=lambda item: item["booking_url"])], sort_keys=True)
 
 
-class Repository:
+class Repository(ChannelOperations):
     def __init__(self, database, minimum_poll_interval_seconds=300):
         self.database = database
         self.minimum_poll_interval_seconds = minimum_poll_interval_seconds
@@ -134,6 +135,19 @@ class Repository:
             item["targets"] = [dict(target) for target in conn.execute(
                 "SELECT * FROM targets WHERE job_id=? AND active=1 ORDER BY rowid", (item["id"],)
             ).fetchall()]
+        if conn is not None:
+            item["notification_channel_ids"] = [channel[0] for channel in conn.execute(
+                "SELECT channel_config_id FROM job_channels WHERE job_id=? ORDER BY channel_config_id", (item["id"],))]
+        if conn is not None:
+            item['notification_channels'] = []
+            for channel in conn.execute("""SELECT c.* FROM notification_channels c JOIN job_channels jc
+                    ON jc.channel_config_id=c.id WHERE jc.job_id=? ORDER BY c.name,c.id""", (item['id'],)):
+                latest = conn.execute("SELECT status,delivery_state,error_summary,claim_owner_token FROM alerts WHERE job_id=? AND channel_config_id=? ORDER BY rowid DESC LIMIT 1", (item['id'],channel['id'])).fetchone()
+                item['notification_channels'].append({'id':channel['id'],'name':channel['name'],
+                    'enabled':bool(channel['enabled']) and not channel['deleted'],
+                    'usable':bool(channel['enabled'] and not channel['deleted'] and channel['token_ciphertext'] and channel['chat_ciphertext']),
+                    'delivery_status':('in_flight' if latest['claim_owner_token'] else latest['status']) if latest else None,
+                    'error_code':latest['error_summary'] if latest else None})
         for key in ("telehealth", "telegram_enabled"):
             item[key] = bool(item[key])
         return item
@@ -273,6 +287,7 @@ class Repository:
                  values["time_zone"], values["insurance_sector"], int(values["telehealth"]),
                  int(values["telegram_enabled"]), now, now, now),
             )
+            self._set_job_channels(conn, job_id, values.get("notification_channel_ids", []))
             for target in targets:
                 conn.execute(
                     """INSERT INTO targets
@@ -336,6 +351,13 @@ class Repository:
                 raise VersionConflictError(row["edit_version"])
             previous_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
             previous_search = search_signature(dict(row), previous_targets)
+            previous_channels = [r[0] for r in conn.execute("SELECT channel_config_id FROM job_channels WHERE job_id=? ORDER BY channel_config_id", (job_id,))]
+            if "notification_channel_ids" in values:
+                self._set_job_channels(conn, job_id, values["notification_channel_ids"])
+                removed = set(previous_channels) - set(values["notification_channel_ids"])
+                for channel_id in removed:
+                    conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='channel_detached'
+                        WHERE job_id=? AND channel_config_id=? AND status IN ('pending','failed')""", (job_id,channel_id))
             fields = ["name", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date",
                       "time_zone", "insurance_sector", "telehealth", "telegram_enabled"]
             update = {key: values[key] for key in fields if key in values}
@@ -380,7 +402,11 @@ class Repository:
             current = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
             current_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
             search_changed = search_signature(current, current_targets) != previous_search
-            changed = search_changed or any(current[key] != row[key] for key in fields)
+            channels_changed = "notification_channel_ids" in values and sorted(values["notification_channel_ids"]) != previous_channels
+            changed = search_changed or channels_changed or any(current[key] != row[key] for key in fields)
+            if not current['telegram_enabled'] and row['telegram_enabled']:
+                conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='notifications_disabled'
+                    WHERE job_id=? AND status IN ('pending','failed')""", (job_id,))
             if changed:
                 conn.execute("UPDATE jobs SET search_revision=search_revision+?,edit_version=edit_version+1,updated_at=? WHERE id=?",
                              (int(search_changed), iso(), job_id))
@@ -600,14 +626,16 @@ class Repository:
                     conn.execute(
                         """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,
                         error_summary='earliest_slot_changed'
-                        WHERE target_id=? AND status IN ('pending','failed') AND dedupe_key!=?""",
+                        WHERE target_id=? AND status IN ('pending','failed') AND event_id NOT IN (SELECT id FROM availability_events WHERE dedupe_key=?)""",
                         (target["id"], current_key),
                     )
                     conn.execute(
-                        """UPDATE alerts SET result_id=?,search_revision=? WHERE target_id=? AND dedupe_key=?
+                        """UPDATE alerts SET result_id=?,search_revision=? WHERE target_id=?
+                        AND event_id IN (SELECT id FROM availability_events WHERE dedupe_key=?)
                         AND status IN ('pending','failed') AND claim_owner_token IS NULL""",
                         (result_id, run["search_revision"], target["id"], current_key),
                     )
+                    self._observe_event(conn, current, target, result_id, current_key, run['search_revision'])
         return result_id
 
     def insert_error_result(self, run_id, job, target, error_code, error_message, *, owner_token=None):
@@ -630,53 +658,66 @@ class Repository:
             ).fetchone()
             return row["id"] if row else None
 
+    @staticmethod
+    def _set_job_channels(conn, job_id, channel_ids):
+        if len(set(channel_ids)) != len(channel_ids):
+            raise ValueError("Channel selections must be unique")
+        for channel_id in channel_ids:
+            if not conn.execute("SELECT 1 FROM notification_channels WHERE id=? AND deleted=0", (channel_id,)).fetchone():
+                raise ValueError("Selected channel is unavailable")
+        conn.execute("DELETE FROM job_channels WHERE job_id=?", (job_id,))
+        conn.executemany("INSERT INTO job_channels(job_id,channel_config_id) VALUES(?,?)",
+                         [(job_id, channel_id) for channel_id in channel_ids])
+
+    @staticmethod
+    def _observe_event(conn, job, target, result_id, dedupe, revision):
+        if conn.execute("SELECT 1 FROM availability_events WHERE dedupe_key=?", (dedupe,)).fetchone():
+            return
+        channels = [dict(row) for row in conn.execute("""SELECT c.id,c.name,c.destination_version,c.credential_version
+            FROM job_channels jc JOIN notification_channels c ON c.id=jc.channel_config_id
+            WHERE jc.job_id=? AND c.enabled=1 AND c.deleted=0
+            AND c.token_ciphertext IS NOT NULL AND c.chat_ciphertext IS NOT NULL""", (job['id'],))] if job['telegram_enabled'] else []
+        event_id, now = new_id(), precise_iso()
+        conn.execute("""INSERT INTO availability_events
+            (id,job_id,target_id,result_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)
+            VALUES(?,?,?,?,?,?,?,?,?)""", (event_id,job['id'],target['id'],result_id,dedupe,revision,now,now,json.dumps(channels)))
+        for channel in channels:
+            conn.execute("""INSERT INTO alerts
+                (id,job_id,target_id,result_id,channel,event_type,dedupe_key,status,created_at,next_attempt_at,
+                 search_revision,event_id,channel_config_id,destination_version,credential_version,channel_name)
+                VALUES(?,?,?,?,?,'slot_found',?,'pending',?,?,?,?,?,?,?,?)""",
+                (new_id(),job['id'],target['id'],result_id,'telegram',dedupe+':channel:'+channel['id']+':destination:'+str(channel['destination_version']),
+                 now,now,revision,event_id,channel['id'],channel['destination_version'],channel['credential_version'],channel['name']))
+
     def create_alert(self, job, target, result_id, earliest_slot, *, owner_token=None):
-        alert_id = new_id()
-        slot_text = iso(earliest_slot)
-        now = iso()
+        # Events and their original routing are committed with observation.
+        # Reconfirming an episode never attaches recipients or revives cancellation.
         with self.database.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            result = conn.execute("SELECT * FROM check_results WHERE id=? AND job_id=? AND target_id=?",
-                                  (result_id, job["id"], target["id"])).fetchone()
-            if (result is None or not result["published"] or result["earliest_slot"] != slot_text or
-                    self._owned(conn, job["id"], result["run_id"], owner_token) is None):
+            result = conn.execute("SELECT * FROM check_results WHERE id=?", (result_id,)).fetchone()
+            if result is None or self._owned(conn, job['id'], result['run_id'], owner_token) is None:
                 return None
-            state = conn.execute(
-                """SELECT s.episode,s.last_status,s.last_earliest_slot,t.active,
-                j.status AS job_status,j.telegram_enabled,j.search_revision
-                FROM target_alert_state s JOIN targets t ON t.id=s.target_id
-                JOIN jobs j ON j.id=t.job_id WHERE t.id=? AND j.id=?""",
-                (target["id"], job["id"]),
-            ).fetchone()
-            current_job = conn.execute("SELECT * FROM jobs WHERE id=?", (job['id'],)).fetchone()
-            result_run = conn.execute("SELECT * FROM check_runs WHERE id=?", (result['run_id'],)).fetchone()
-            if (state is None or not state["active"] or not self._run_capable(current_job, result_run) or
-                    not state["telegram_enabled"] or state["last_status"] != "available" or
-                    state["last_earliest_slot"] != slot_text or state["search_revision"] != result["search_revision"]):
-                return None
-            dedupe = alert_dedupe_key(target["id"], slot_text, state["episode"])
-            inserted = conn.execute(
-                """INSERT OR IGNORE INTO alerts(id,job_id,target_id,result_id,channel,event_type,dedupe_key,
-                status,created_at,next_attempt_at,search_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (alert_id, job["id"], target["id"], result_id, "telegram", "slot_found", dedupe,
-                 "pending", now, now, result["search_revision"]),
-            ).rowcount
-            if inserted:
-                return alert_id
-            existing = conn.execute("SELECT id,status FROM alerts WHERE dedupe_key=?", (dedupe,)).fetchone()
-            if existing is None:
-                raise RuntimeError("Alert insert was ignored without a matching dedupe key")
-            if existing["status"] == "sent":
-                return None
-            if existing["status"] == "cancelled":
-                reactivated = conn.execute(
-                    """UPDATE alerts SET status='pending',result_id=?,next_attempt_at=?,search_revision=?,
-                    error_summary=NULL WHERE id=? AND claim_owner_token IS NULL AND delivery_state IN ('ready','retry') AND error_summary IN ('slot_expired','availability_disappeared','earliest_slot_changed','search_edited','job_paused','status_changed')""",
-                    (result_id, now, result["search_revision"], existing["id"]),
-                ).rowcount
-                if not reactivated:
-                    return None
-            return existing["id"]
+            row = conn.execute("""SELECT id FROM alerts WHERE result_id=? AND status IN ('pending','failed')
+                ORDER BY rowid LIMIT 1""", (result_id,)).fetchone()
+            return row[0] if row else None
+
+    def _channel_changed(self, conn, before, after, recover_failed=False):
+        changed_destination = before['destination_version'] != after['destination_version']
+        disabled = not after['enabled'] or after['deleted']
+        incomplete = not after['token_ciphertext'] or not after['chat_ciphertext']
+        if changed_destination or disabled or incomplete:
+            reason = 'destination_changed' if changed_destination else ('channel_deleted' if after['deleted'] else ('channel_disabled' if disabled else 'channel_incomplete'))
+            conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary=?
+                WHERE channel_config_id=? AND status IN ('pending','failed')""", (reason,after['id']))
+        elif recover_failed and before['credential_version'] != after['credential_version']:
+            now = utc_now()
+            for row in self._delivery_rows(conn):
+                if (row['channel_config_id'] == after['id'] and row['destination_version'] == after['destination_version']
+                        and row['status'] == 'failed' and row['delivery_state'] in ('action_required','exhausted')
+                        and not row['claim_owner_token'] and self._delivery_eligible(row, now)):
+                    self._release_delivery(conn,row['id'],'ready')
+                    conn.execute("""UPDATE alerts SET status='pending',credential_version=?,next_attempt_at=?,
+                        delivery_epoch_at=?,delivery_epoch_attempts=0,error_summary=NULL WHERE id=?""",
+                        (after['credential_version'],precise_iso(now),precise_iso(now),row['id']))
 
     @staticmethod
     def _delivery_rows(conn, alert_id=None):
@@ -685,10 +726,15 @@ class Repository:
             r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
             j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
             j.interval_seconds,j.status_version AS current_status_version, cr.status_version AS run_status_version,
-            cr.paused_manual,cr.intent_id,t.active AS target_active,s.last_status,s.last_earliest_slot
+            cr.paused_manual,cr.intent_id,t.active AS target_active,s.last_status,s.last_earliest_slot,
+            c.enabled AS channel_enabled,c.deleted AS channel_deleted,c.destination_version AS current_destination_version,
+            c.credential_version AS current_credential_version,
+            (c.token_ciphertext IS NOT NULL AND c.chat_ciphertext IS NOT NULL) AS channel_complete,
+            EXISTS(SELECT 1 FROM job_channels jc WHERE jc.job_id=a.job_id AND jc.channel_config_id=a.channel_config_id) AS channel_selected
             FROM alerts a JOIN check_results r ON r.id=a.result_id JOIN check_runs cr ON cr.id=r.run_id
             JOIN jobs j ON j.id=a.job_id LEFT JOIN targets t ON t.id=a.target_id
             LEFT JOIN target_alert_state s ON s.target_id=a.target_id
+            LEFT JOIN notification_channels c ON c.id=a.channel_config_id
             WHERE (? IS NULL OR a.id=?) ORDER BY COALESCE(a.next_attempt_at,a.created_at),a.created_at,a.rowid""",
             (alert_id, alert_id),
         ).fetchall()
@@ -698,6 +744,8 @@ class Repository:
         return (alert['status'] in ('pending', 'failed') and (alert['job_status'] == 'active' or (alert['job_status'] == 'paused' and alert['paused_manual']))
                 and alert['current_status_version'] == alert['run_status_version']
                 and alert['telegram_enabled'] and alert['target_active']
+                and alert['channel_enabled'] and not alert['channel_deleted'] and alert['channel_complete']
+                and alert['channel_selected'] and alert['destination_version'] == alert['current_destination_version']
                 and alert['snapshot_known'] and alert['published']
                 and alert['search_revision'] == alert['current_revision'] == alert['result_revision']
                 and alert['earliest_slot'] and parse_time(alert['earliest_slot']) > now
@@ -730,6 +778,16 @@ class Repository:
                 reason = 'search_edited'
             elif not row['target_active']:
                 reason = 'target_removed'
+            elif not row['channel_selected']:
+                reason = 'channel_detached'
+            elif row['channel_deleted'] or row['channel_deleted'] is None:
+                reason = 'channel_deleted'
+            elif not row['channel_enabled']:
+                reason = 'channel_disabled'
+            elif row['destination_version'] != row['current_destination_version']:
+                reason = 'destination_changed'
+            elif not row['channel_complete']:
+                reason = 'channel_incomplete'
             elif (row['snapshot_known'] and row['published'] and
                   row['search_revision'] == row['current_revision'] == row['result_revision']):
                 if not row['earliest_slot'] or parse_time(row['earliest_slot']) <= now:
@@ -797,10 +855,11 @@ class Repository:
                     continue
                 token = new_id()
                 conn.execute("""UPDATE alerts SET claim_owner_token=?,claim_until=?,claim_result_id=result_id,
-                             claim_search_revision=search_revision,attempt_started_at=NULL WHERE id=?""",
-                             (token, precise_iso(now + timedelta(seconds=lease_seconds)), row['id']))
+                             claim_search_revision=search_revision,credential_version=?,attempt_started_at=NULL WHERE id=?""",
+                             (token, precise_iso(now + timedelta(seconds=lease_seconds)), row['current_credential_version'],row['id']))
                 alert = self._public_alert(row)
                 alert['owner_token'] = token
+                alert['credential_version'] = row['current_credential_version']
                 alert['claim_until'] = precise_iso(now + timedelta(seconds=lease_seconds))
                 return alert
         return None
@@ -824,6 +883,7 @@ class Repository:
                     or parse_time(row['claim_until']) <= now or row['attempt_started_at']):
                 return None
             if (row['claim_result_id'] != row['result_id'] or row['claim_search_revision'] != row['search_revision']
+                    or row['credential_version'] != row['current_credential_version']
                     or not self._delivery_eligible(row, now) or not self._delivery_budget(row, now)):
                 self._release_delivery(conn, alert_id, 'exhausted' if not self._delivery_budget(row, now)
                                        else ('retry' if row['attempt_count'] else 'ready'))
@@ -862,7 +922,7 @@ class Repository:
                     next_attempt = precise_iso(now + timedelta(seconds=delay))
             self._release_delivery(conn, alert_id, state)
             conn.execute("""UPDATE alerts SET status=CASE WHEN status='cancelled' THEN status ELSE 'failed' END,
-                         next_attempt_at=?,error_summary=? WHERE id=?""", (next_attempt, error_code, alert_id))
+                         next_attempt_at=?,error_summary=CASE WHEN status='cancelled' THEN error_summary ELSE ? END WHERE id=?""", (next_attempt, error_code, alert_id))
             return True
 
     def finish_delivery(self, alert_id, owner_token, outcome, error_code=None, retry_after=None):
@@ -889,7 +949,7 @@ class Repository:
                 if state == 'retry':
                     next_attempt = precise_iso(now + timedelta(seconds=delay))
             self._release_delivery(conn, alert_id, state, outcome)
-            conn.execute("""UPDATE alerts SET status=?,sent_at=?,next_attempt_at=?,error_summary=? WHERE id=?""",
+            conn.execute("""UPDATE alerts SET status=?,sent_at=?,next_attempt_at=?,error_summary=CASE WHEN status='cancelled' THEN error_summary ELSE ? END WHERE id=?""",
                          ('cancelled' if row['status'] == 'cancelled' else ('sent' if outcome == 'sent' else 'failed'),
                           precise_iso(now) if outcome == 'sent' else None, next_attempt, error_code, alert_id))
             return True
@@ -901,18 +961,45 @@ class Repository:
             rows = self._delivery_rows(conn, alert_id)
             if not rows:
                 raise NotFoundError('Alert not found')
-            row = rows[0]
-            if row['status'] == 'sent' or row['delivery_state'] not in ('action_required', 'exhausted', 'uncertain'):
+            row = dict(rows[0])
+            cancelled = row['status'] == 'cancelled'
+            if row['status'] == 'sent' or row['sent_at'] or (not cancelled and row['delivery_state'] not in ('action_required', 'exhausted', 'uncertain')):
                 raise ConflictError('Alert is not recoverable')
+            if row['last_attempt_outcome'] == 'sent':
+                raise ConflictError('A delivered alert is not recoverable')
             if row['delivery_state'] == 'uncertain' and not acknowledge_duplicate_risk:
                 raise ConflictError('Uncertain delivery requires duplicate-risk acknowledgement')
             if row['claim_owner_token']:
                 raise ConflictError('Alert is still claimed')
-            if not self._delivery_eligible(row, now):
+            if cancelled:
+                event = conn.execute('SELECT * FROM availability_events WHERE id=?', (row['event_id'],)).fetchone()
+                authorized = event and any(c['id'] == row['channel_config_id'] and c['destination_version'] == row['destination_version']
+                    for c in json.loads(event['routing_snapshot']))
+                current_state = conn.execute('SELECT * FROM target_alert_state WHERE target_id=?', (row['target_id'],)).fetchone()
+                same_episode = current_state and current_state['last_status'] == 'available' and event and event['dedupe_key'] == alert_dedupe_key(row['target_id'],current_state['last_earliest_slot'],current_state['episode'])
+                if not authorized or not same_episode:
+                    return False
+                # Explicit same-recipient recovery may use a newer owned
+                # confirmation. It never redirects an old event to a new recipient.
+                result = conn.execute("""SELECT id,search_revision FROM check_results WHERE target_id=?
+                    AND status='available' AND earliest_slot=? AND published=1 AND search_revision=?
+                    ORDER BY rowid DESC LIMIT 1""", (row['target_id'],row['earliest_slot'],row['current_revision'])).fetchone()
+                if result is None:
+                    return False
+                conn.execute('SAVEPOINT recovery')
+                conn.execute("UPDATE alerts SET status='pending',result_id=?,search_revision=? WHERE id=?",
+                    (result['id'],result['search_revision'],alert_id))
+                row = dict(self._delivery_rows(conn, alert_id)[0])
+                if not self._delivery_eligible(row, now):
+                    conn.execute('ROLLBACK TO recovery')
+                    return False
+                conn.execute('RELEASE recovery')
+            elif not self._delivery_eligible(row, now):
                 return False
             self._release_delivery(conn, alert_id, 'ready')
-            conn.execute("""UPDATE alerts SET status='pending',delivery_epoch_attempts=0,delivery_epoch_at=?,next_attempt_at=?,
-                         error_summary=NULL WHERE id=?""", (precise_iso(now), precise_iso(now), alert_id))
+            conn.execute("""UPDATE alerts SET status='pending',credential_version=?,delivery_epoch_attempts=0,
+                delivery_epoch_at=?,next_attempt_at=?,error_summary=NULL WHERE id=?""",
+                (row['current_credential_version'],precise_iso(now),precise_iso(now),alert_id))
             return True
 
     def touch_dispatcher(self, last_error=None):
