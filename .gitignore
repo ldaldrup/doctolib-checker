@@ -2,7 +2,6 @@
 config.json
 .env
 .env.*
-!.env.example
 
 # State & logs
 state/
@@ -31,6 +30,8 @@ env/
 # IDE
 .vscode/
 .idea/
+.codex/
+.claude/
 *.swp
 *.swo
 *~
@@ -40,15 +41,9 @@ AGENTS.md
 **/AGENTS.md
 .agents/
 docs/*
-!docs/improvement-overview.md
-!docs/implementation-plans/
-docs/implementation-plans/*
-!docs/implementation-plans/*.md
-plans/
-**/plans/
-*.plan.md
-*_plan.md
 *-plan.md
+*-issues.md
+*-overview.md
 
 # OS
 .DS_Store
@@ -57,3 +52,4 @@ desktop.ini
 
 # Keep examples
 !config.example.json
+!.env.example
