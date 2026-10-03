@@ -27,6 +27,7 @@ def test_root_and_native_assets(client):
 
     for path, mime_types in (
         ("/assets/js/main.js", ("text/javascript", "application/javascript")),
+        ("/assets/js/pages/channels.js", ("text/javascript", "application/javascript")),
         ("/assets/css/tokens.css", ("text/css",)),
         ("/assets/fonts/InterVariable.woff2", ("font/woff2",)),
         ("/assets/favicon.svg", ("image/svg+xml",)),
@@ -64,7 +65,7 @@ def test_api_and_health_routes_still_take_precedence(client):
     "/unknown-page", "/assets/unknown.js", "/api/v1/unknown",
     "/.env", "/requirements.txt", "/README.md", "/config.json",
     "/app/settings.py", "/tests/fixtures/info_de.json", "/checker.sqlite3",
-    "/__test/contracts", "/__test/responsive",
+    "/__test/contracts", "/__test/responsive", "/__test/deliver",
     "/%2e%2e/settings.py", "/assets/%2e%2e/%2e%2e/%2e%2e/settings.py",
 ])
 def test_unknown_and_private_paths_are_not_spa_fallbacks(client, path):

@@ -5,3 +5,4 @@ colorama>=0.4.6
 fastapi>=0.128.8,<0.129
 uvicorn[standard]>=0.34,<1
 tzdata>=2024.1
+cryptography>=46,<47

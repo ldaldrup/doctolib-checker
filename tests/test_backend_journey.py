@@ -165,6 +165,13 @@ class VersionedJourneyClient(TestClient):
             if not any(key.lower() == 'idempotency-key' for key in headers):
                 headers['Idempotency-Key'] = str(uuid4())
             kwargs['headers'] = headers
+            # Old journeys opt into their explicitly saved fixture destination.
+            # Raw channel/API contract tests bypass this helper.
+            body = dict(kwargs.get('json') or {})
+            if 'notification_channel_ids' not in body and body.get('telegram_enabled') is not False:
+                channels = self.app.state.repository.list_channels()['items']
+                body['notification_channel_ids'] = [item['id'] for item in channels if item['usable']]
+            kwargs['json'] = body
         config_job = ((method == 'PATCH' and path.startswith('/api/v1/jobs/')) or
                       (method == 'DELETE' and path.startswith('/api/v1/jobs/')) or
                       (method == 'POST' and path.endswith(('/pause', '/resume'))))
@@ -183,10 +190,21 @@ def setup_backend(tmp_path, status="available", minimum_interval=300):
     database = Database(str(tmp_path / "checker.sqlite3"))
     database.initialize()
     repository = Repository(database)
+    from cryptography.fernet import Fernet
+    from app.notification_secrets import NotificationSecrets
+    secret_key = Fernet.generate_key().decode()
     settings = Settings(database_path=str(tmp_path / "checker.sqlite3"),
+                        notification_secret_key=secret_key,
                         telegram_bot_token="test-token-never-return-this",
                         telegram_chat_id="12345", telegram_enabled=True,
                         minimum_poll_interval_seconds=minimum_interval)
+    secrets = NotificationSecrets(secret_key)
+    token = "123456:fixture_secret_for_offline_checks_123"
+    chat = "12345"
+    repository.create_channel({"name": "Fixture Telegram", "enabled": True,
+        "token_ciphertext": secrets.encrypt(token), "chat_ciphertext": secrets.encrypt(chat),
+        "destination_identity": secrets.identity("123456:" + chat)},
+        "fixture-channel", "fixture-channel")
     doctolib = FixtureDoctolib(no_availability=status == "no_availability")
     app = create_app(settings=settings, repository=repository, doctolib=doctolib)
     return VersionedJourneyClient(app), repository, settings, doctolib
@@ -602,7 +620,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -668,6 +686,11 @@ def test_pause_revokes_old_alert_and_fresh_run_requires_telegram_enabled(tmp_pat
     assert repository.alerts()[0]['status'] == 'cancelled'
     repository.request_check(job['id'])
     checker.run_due()
+    assert retry_notifier.sent == []  # Reconfirmation does not revive cancelled routing.
+    record_result(repository, job, 'no_availability')
+    slot = datetime.fromisoformat(alert['earliest_slot'])
+    record_result(repository, job, 'available', slot, 3)
+    checker.dispatch_pending()
     assert len(retry_notifier.sent) == 1
 
 
@@ -750,6 +773,10 @@ def test_pause_and_error_do_not_make_an_old_alert_send_without_confirmation(tmp_
     target, result_id = record_result(repository, job, "available", slot, 3)
     repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token'])
     checker.dispatch_pending()
+    assert notifier.sent == []
+    record_result(repository, job, 'no_availability')
+    record_result(repository, job, 'available', slot, 3)
+    checker.dispatch_pending()
     assert len(notifier.sent) == 1
 
 
@@ -761,12 +788,15 @@ def test_new_confirmed_result_cancels_contradicted_alert(tmp_path, new_status, n
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
     Journey(repository, doctolib, settings, notifier=FakeNotifier(successful=False)).run_due()
+    old_id = repository.alerts()[0]["id"]
     record_result(repository, job, new_status, new_slot, int(new_slot is not None))
 
     notifier = FakeNotifier()
     Journey(repository, doctolib, settings, notifier=notifier).dispatch_pending()
-    assert notifier.sent == []
-    assert client.get("/api/v1/alerts").json()[0]["status"] == "cancelled"
+    assert len(notifier.sent) == int(new_slot is not None)
+    if new_slot:
+        assert notifier.sent[0]["earliest_slot"] == iso(new_slot)
+    assert next(item for item in repository.alerts() if item["id"] == old_id)["status"] == "cancelled"
 
 
 def test_expired_slot_and_removed_target_cancel_pending_alerts(tmp_path, monkeypatch):
@@ -898,11 +928,11 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
-        sent_job["id"]: "sent", failed_job["id"]: "failed",
+        sent_job["id"]: "sent", failed_job["id"]: "cancelled",
     }
 
     for job in (sent_job, failed_job):
@@ -910,7 +940,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
         slot = datetime.fromisoformat(old_alert["earliest_slot"])
         target, result_id = record_result(repository, job, "available", slot, 3)
         duplicate = repository.create_alert(job, target, result_id, slot, owner_token=job["owner_token"])
-        assert duplicate == (None if job == sent_job else old_alert["id"])
+        assert duplicate is None
     assert len(repository.alerts()) == 2
     legacy_failed = next(alert for alert in repository.alerts() if alert["job_id"] == failed_job["id"])
     assert legacy_failed["delivery_state"] == "uncertain"
@@ -919,8 +949,8 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
     assert not dispatcher.run_once() and sender.sent == []
     with pytest.raises(ConflictError, match="acknowledgement"):
         repository.recover_alert(legacy_failed["id"])
-    assert repository.recover_alert(legacy_failed["id"], acknowledge_duplicate_risk=True)
-    assert dispatcher.run_once() and len(sender.sent) == 1
+    assert not repository.recover_alert(legacy_failed["id"], acknowledge_duplicate_risk=True)
+    assert not dispatcher.run_once() and sender.sent == []
     assert len(repository.alerts()) == 2
 
 
@@ -972,7 +1002,22 @@ def test_shared_request_gate_reservations_survive_repository_reopen(tmp_path, mo
     assert next_allowed == fixed_now + timedelta(seconds=6)
 
 
+def drop_channel_columns(conn):
+    # Current fixtures contain one destination per legacy episode. Remove its
+    # schema-8 delivery suffix to recreate the historical event-only identity.
+    for row in conn.execute("SELECT id,dedupe_key FROM alerts").fetchall():
+        conn.execute("UPDATE alerts SET dedupe_key=? WHERE id=?", (row[1].split(':channel:')[0], row[0]))
+    conn.execute("DROP INDEX IF EXISTS idx_alerts_event_destination")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(alerts)")}
+    for column in ("event_id", "channel_config_id", "destination_version", "credential_version", "channel_name"):
+        if column in columns:
+            conn.execute(f"ALTER TABLE alerts DROP COLUMN {column}")
+    for table in ("channel_tests", "channel_mutations", "notification_onboarding", "job_channels", "availability_events", "notification_channels"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def drop_mutation_columns(conn):
+    drop_channel_columns(conn)
     conn.execute("DROP TABLE IF EXISTS create_operations")
     conn.execute("ALTER TABLE settings DROP COLUMN edit_version")
 
@@ -1183,7 +1228,8 @@ def test_legacy_pending_needs_reconfirmation_while_sent_dedupe_survives_revision
     assert notifier.sent == []
     slot = datetime.fromisoformat(original['earliest_slot'])
     target, result_id = record_result(repository, job, 'available', slot, 3)
-    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) == original['id']
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) is None
+    assert repository.recover_alert(original['id'])
     checker.dispatch_pending()
     assert len(notifier.sent) == 1
     client.patch('/api/v1/jobs/' + job['id'], json={'insurance_sector': 'private'})

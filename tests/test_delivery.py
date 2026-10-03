@@ -204,7 +204,7 @@ def test_provider_retry_after_is_capped_and_twenty_four_hour_age_exhausts(tmp_pa
     assert repository.alerts()[0]['delivery_state'] == 'exhausted'
 
 
-def test_v4_zero_attempt_pending_preserves_uncertain_acceptance_until_acknowledged(tmp_path):
+def test_v4_zero_attempt_pending_preserves_uncertainty_and_cancels_unknown_recipient(tmp_path):
     _client, repository, settings, _doctolib, job = pending(tmp_path)
     original = repository.alerts()[0]
     with repository.database.connection() as conn:
@@ -212,7 +212,7 @@ def test_v4_zero_attempt_pending_preserves_uncertain_acceptance_until_acknowledg
         conn.execute('UPDATE schema_version SET version=4')
     repository.database.initialize()
     alert = repository.alerts()[0]
-    assert alert['id'] == original['id'] and alert['status'] == 'pending'
+    assert alert['id'] == original['id'] and alert['status'] == 'cancelled'
     assert alert['attempt_count'] == 0 and alert['delivery_state'] == 'uncertain'
     sender = FakeNotifier()
     dispatcher = DeliveryService(repository, settings, sender=sender)
@@ -224,10 +224,10 @@ def test_v4_zero_attempt_pending_preserves_uncertain_acceptance_until_acknowledg
     assert not repository.recover_alert(alert['id'], acknowledge_duplicate_risk=True)
     slot = datetime.fromisoformat(alert['earliest_slot'])
     target, result_id = record_result(repository, job, 'available', slot, 3)
-    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) == alert['id']
-    assert repository.recover_alert(alert['id'], acknowledge_duplicate_risk=True)
-    assert dispatcher.run_once() and len(sender.sent) == 1
-    assert repository.alerts()[0]['status'] == 'sent'
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) is None
+    assert not repository.recover_alert(alert['id'], acknowledge_duplicate_risk=True)
+    assert not dispatcher.run_once() and sender.sent == []
+    assert repository.alerts()[0]['status'] == 'cancelled'
 
 
 def test_attempted_delivery_cancelled_during_send_stays_cancelled_after_crash(tmp_path):

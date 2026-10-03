@@ -48,9 +48,7 @@ def create_job(repository, doctolib, settings, values, operation=None):
     validate_timezone(values["time_zone"])
     telegram_enabled = values.get("telegram_enabled")
     if telegram_enabled is None:
-        telegram_enabled = settings.telegram_enabled
-    if telegram_enabled and not settings.telegram_enabled:
-        raise ValueError("Telegram is not configured on the server")
+        telegram_enabled = bool(values.get("notification_channel_ids"))
     targets = []
     for url in values["target_urls"]:
         if operation is None:
@@ -109,8 +107,6 @@ def update_job(repository, doctolib, settings, job_id, values, expected_version=
         values["latest_date"] = None
         if new_mode == "first_available":
             values["horizon_days"] = values.get("horizon_days", existing["horizon_days"] or 15)
-    if values.get("telegram_enabled") and not settings.telegram_enabled:
-        raise ValueError("Telegram is not configured on the server")
     targets = normalize_targets([resolve_target(url, doctolib) for url in target_urls]) if target_urls is not None else None
     return repository.update_job(job_id, values, targets=targets, expected_version=expected_version)
 

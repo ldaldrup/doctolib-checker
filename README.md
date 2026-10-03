@@ -56,9 +56,15 @@ A new database starts empty. The worker must remain running to perform checks. R
 
 ### Enable Telegram alerts
 
-Create a bot with [BotFather](https://t.me/BotFather), start a conversation with it, and obtain the destination chat ID. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment of **all three processes**, then restart them. The dispatcher performs sends; the API and worker use the configuration to expose and enqueue Telegram preferences. Enable Telegram for the jobs you want to notify.
+Create a bot with [BotFather](https://t.me/BotFather), start a conversation with it, and obtain the destination chat ID. In Settings, add a named Telegram destination, enter its bot token and chat ID, then explicitly Save. Each job selects any combination of saved destinations. Renaming a destination preserves selections and delivery identity.
 
-The timezone, polling minimum, and Telegram credentials are server configuration; they cannot be edited in the web interface. Keep credentials out of job records and source control.
+The API and dispatcher need the same external `NOTIFICATION_SECRET_KEY`. It is a [Fernet key](https://cryptography.io/en/latest/fernet/): URL-safe base64 encoding of 32 random bytes. Generate it with `cryptography.fernet.Fernet.generate_key()`, keep it in protected operator configuration outside SQLite/source control, and back it up separately. Invalid key syntax prevents startup; an absent key permits inspection/checking but blocks secret writes and sends. An unreadable saved credential remains stored and is shown as unusable. The timezone and polling minimum also remain operator configuration.
+
+Settings masks both credentials and offers explicit Keep, Replace and Clear actions. Credential forms use explicit Save; polling settings retain autosave. Saved-config Test sends a synthetic message through the dispatcher and returns an operation ID. The UI polls for a bounded period and retains the operation for explicit status checks. An unknown acknowledgement is visible and never automatically resent. Preview is synthetic and escaped; it does not send anything.
+
+For an existing environment configuration, use **Import legacy Telegram** once. This creates **Telegram1** and selects it only for existing opted-in jobs. Startup never imports or overwrites saved configuration. Saved destinations become authoritative; environment credentials are only an optional onboarding source. Importing again preserves the saved destination and mappings. The legacy JSON CLI retains its separate configuration.
+
+An observed availability episode consumes its event identity even with notifications off or no selected destinations. Attaching/enabling a destination applies to future episodes, not repeated confirmation of the same slot. Each destination has independent attempts and status. Disable, clear, delete, detach or recipient changes cancel unsent work; an already-started attempt records its actual outcome without redirecting it. Same-destination credential repair may explicitly recover eligible failed work. Cancelled work requires explicit eligible recovery and is never revived automatically. Deleted destinations retain historical delivery identity.
 
 ### API
 
@@ -76,7 +82,7 @@ The editor retains its creation key and payload in memory for explicit retry, wa
 
 Create reservations have a **120-second lease**, renewed every **30 seconds** while metadata work is active. A **5-minute per-target ownership budget** releases stuck work for retry; it fences late results without forcibly cancelling a transport already waiting. Retryable metadata failures return a safe **502** and retain the key/defaults for retry; definitive invalid configurations return **422**. Pending/failed operation state expires seven days after first reservation.
 
-Schema **7** and these request contracts require the matching API, worker, dispatcher and UI release. During a separately authorized upgrade, stop old writers, back up and rehearse the previous database, install compatible processes together and reload browser tabs. Old clients missing keys/versions are rejected rather than silently accepting destructive writes.
+Schema **8** and these request contracts require the matching API, worker, dispatcher and UI release. During a separately authorized upgrade, stop old writers, back up and rehearse the previous database, install compatible processes together and reload browser tabs. Old clients missing keys/versions are rejected rather than silently accepting destructive writes.
 
 <details>
 <summary>Alert delivery behavior</summary>
@@ -95,7 +101,7 @@ Availability checks queue alerts without sending. The independent serial dispatc
 
 Run a single dispatch turn with `python -m app.dispatcher --once`. Inspect alert IDs and delivery states using `/api/v1/alerts`; the CLI prints safe recovery outcomes and never provider response bodies or credentials.
 
-After repairing credentials or the recipient, explicitly reevaluate an action-required/exhausted alert:
+After repairing credentials for the same destination, explicitly reevaluate an action-required/exhausted alert:
 
 ```bash
 python -m app.dispatcher --recover ALERT_UUID
@@ -109,7 +115,7 @@ python -m app.dispatcher --recover ALERT_UUID --acknowledge-duplicate-risk
 
 Recovery never replays sent work. It requires a current active run event or a still-authorized paused manual event, an active target, enabled Telegram, matching current revision, future slot and fresh successful confirmation. If evidence is stale, active jobs can await a recurring check; paused jobs require an explicit Check once before recovery. Paused jobs are never refreshed automatically. Recovery preserves lifetime attempt counts and starts a new bounded epoch. It does not send directly.
 
-For an upgrade from inline delivery, stop every old API/worker writer, create and rehearse a protected backup, migrate with compatible schema-7 code, and start the API, availability worker and one dispatcher against the same DB. Do not run old inline senders alongside the dispatcher. Legacy pending and failed alerts become uncertain because an earlier send may have been accepted without a stored acknowledgement; fresh confirmation alone cannot resolve that ambiguity. Review them before acknowledged recovery. Migration preserves their status, IDs and history.
+For an upgrade from inline delivery, stop every old API/worker writer, create and rehearse a protected backup, migrate with compatible schema-8 code, and start the API, availability worker and one dispatcher against the same DB. Do not run old inline senders alongside the dispatcher. Schema 8 preserves sent/cancelled history and all attempt/claim evidence. Legacy unsent work is cancelled with `migration_legacy_requires_import`, because its old recipient cannot be safely associated with a new saved destination. Earlier inline acceptance ambiguity remains recorded as uncertain. Explicit import never redirects or replays these rows, even after fresh confirmation.
 
 The default sender uses connect/read timeouts of 3/7 seconds and a 15-second overall transport deadline. A short-lived network child enforces that deadline independently, with bounded cleanup; the dispatcher remains serial. Shut down every process for maintenance or restore. Rollback restores the pre-upgrade database and matching earlier code after stopping writers, never an in-place schema downgrade.
 
@@ -172,7 +178,8 @@ The API, worker and dispatcher read process environment variables. `.env.example
 | Variable | Local default | Purpose |
 | --- | --- | --- |
 | `DATABASE_PATH` | `./data/checker.sqlite3` | Shared SQLite file; use the same path for API, worker and dispatcher. |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Empty | Set both to enable Telegram delivery. |
+| `NOTIFICATION_SECRET_KEY` | Empty | External Fernet key shared by API and dispatcher; protects saved credentials. |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Empty | Optional source for explicit one-time legacy onboarding; saved destinations control delivery. |
 | `DEFAULT_TIMEZONE` | `Europe/Berlin` | Default timezone for new jobs. |
 | `MINIMUM_POLL_INTERVAL_SECONDS` | `300` | Polling floor; values below 300 are clamped. |
 | `REQUEST_SPACING_SECONDS` | `3` | Minimum spacing between requests; values below 3 are clamped. |
@@ -236,7 +243,7 @@ Only `app/web/` is served as static content. Repository files, configuration, te
 | Symptom | What to check |
 | --- | --- |
 | Jobs do not run | Start the worker; verify its heartbeat and that all three processes use the same database. |
-| No Telegram alerts | Start the dispatcher, set both credentials for all three processes, enable Telegram on the job, and inspect delivery state in alert history. CLI dry-run suppresses sends. |
+| No Telegram alerts | Start the dispatcher, check the shared encryption key and saved destination usability, select channels on the job, and inspect independent delivery state. CLI dry-run suppresses sends. |
 | URL rejected | Copy the final availability URL, preserving practice and motive parameters. |
 | Database permission error | Use a writable directory; for Docker bind mounts, account for UID/GID `10001:10001`. |
 | Blocked requests or transient failures | Keep conservative polling/request spacing and inspect reported errors. Doctolib can change its API or anti-bot behavior. |
@@ -308,16 +315,18 @@ python -m app.admin verify \
 
 The parent directory must exist; the work directory must not. Verification checks the checksum, SQLite integrity, foreign keys, manifest/schema agreement and required checker tables/columns for supported versions **before** initialization can create tables. It retains an extracted original snapshot as `checker.sqlite3`, copies it to `restored.sqlite3`, migrates only that second copy with the current application, and exercises representative job/target/history/alert/status repository reads plus the real `/healthz` ASGI endpoint without opening a server/socket or starting a worker. Explicit offline settings disable Telegram and upstream access; ambient `DATABASE_PATH`/Telegram environment values are not used. Success prints safe aggregate JSON with backup/restored schema versions and health status. Failure removes only the disposable directory newly created by this invocation; it never removes an existing directory. Keep the successful rehearsal directory private or remove it deliberately after inspection.
 
-Current code can rehearse schema versions 1, 2, 3, 4 and 5. A newer unsupported schema is refused before attempting migration. `verify --integrity-only` checks an archive without migration or API health, allowing archival integrity checks independently of application compatibility. Re-run rehearsal with the intended application revision before each upgrade; passing health proves DB access, not upstream availability or delivery.
+Current code can rehearse schema versions 1 through 8. A newer unsupported schema is refused before attempting migration. `verify --integrity-only` checks an archive without migration or API health, allowing archival integrity checks independently of application compatibility. Re-run rehearsal with the intended application revision before each upgrade; passing health proves DB access, not upstream availability or delivery.
+
+Schema 8 notification credentials also require the external `NOTIFICATION_SECRET_KEY`. Keep a protected backup of this key alongside the database backup lifecycle, but outside the SQLite archive and source control. API and dispatcher must receive the same key. Rehearsal health does not test decryption or send notifications. A full recovery must also prove decryption with the original key before enabling delivery. Losing the key leaves encrypted credentials unreadable; restoring SQLite alone cannot repair them. Restore the matching key from protected storage, or explicitly replace each saved credential with known values after configuring a new key. Never discard encrypted data automatically when a key is absent or wrong.
 
 For an **actual offline restore**, stop every API/worker writer first. Preserve the current database using a separate backup, choose an application version compatible with the archive, and rehearse verification into a new private location. With writers stopped, promote the verified `restored.sqlite3` to a **new database path**, update all process configurations to that same path, and start the compatible application. Never overwrite a live database or combine restored data with old `-wal`/`-shm` files; do not start the worker during rehearsal. Check jobs/settings/targets/history and internal health before intentionally enabling real checks/notifications. Restored in-flight work and pending alerts require review because provider acceptance may have occurred after the snapshot; replay can duplicate an external notification. Record the cutover and keep the prior path available until rollback is no longer needed.
 
-Rollback restores the matching earlier database **and** application version after stopping writers. It cannot retain changes made after that backup and must not downgrade a newer schema in place. These instructions do not create a production backup schedule or authorize a live restore/deployment. Future stored notification secrets will also require their external encryption key; current backend credentials remain separate environment configuration.
+Rollback restores the matching earlier database **and** application version after stopping writers. It cannot retain changes made after that backup and must not downgrade a newer schema in place. These instructions do not create a production backup schedule or authorize a live restore/deployment. Saved notification credentials require the matching external encryption key as described above.
 
 ## Improvement work and branch policy
 
 Completed improvements are consolidated into `master`. Continue the numbered [implementation plans](docs/implementation-plans/README.md) sequentially on the single shared `feat/improvements` branch, starting from the latest `master`. Reuse that branch for every remaining part; do not create per-part, agent, review or auxiliary branches. Merge completed, reviewed work into `master`, then bring `feat/improvements` forward before continuing.
 
-Parts 01–05 are committed and consolidated into local `master`. Part 05 was implemented on the same `feat/improvements` branch; see its [completion handoff](docs/implementation-plans/05-completion-handoff.md). The [part 03 handoff](docs/implementation-plans/03-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.
+Parts 01–06 are committed and consolidated into local `master`. Part 06 was implemented on the same `feat/improvements` branch; see its [completion handoff](docs/implementation-plans/06-completion-handoff.md). The [part 03 handoff](docs/implementation-plans/03-completion-handoff.md) records verification and rollout requirements. Old feature branches are retired after their work is verified as included in `master`. Commits and branch merges do not deploy or authorize production migrations.
 
 Consolidation checkpoint (2 October 2026): only local `master` and `feat/improvements` remain; the remote has only `master` and no open pull requests. The interrupted part 04 work was subsequently completed locally on `feat/improvements`; its handoff records verification. Keep all remaining implementation and adversarial reviews on that one feature branch. Remote publication remains prohibited by the current instruction.

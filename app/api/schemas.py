@@ -30,6 +30,7 @@ class JobCreateRequest(StrictRequest):
     insurance_sector: Literal["public", "private"] = "public"
     telehealth: bool = False
     telegram_enabled: Optional[bool] = None
+    notification_channel_ids: List[str] = Field(default_factory=list,max_length=100)
 
     @field_validator("target_urls")
     @classmethod
@@ -64,6 +65,7 @@ class JobUpdateRequest(VersionedRequest):
     insurance_sector: Optional[Literal["public", "private"]] = None
     telehealth: Optional[bool] = None
     telegram_enabled: Optional[bool] = None
+    notification_channel_ids: Optional[List[str]] = Field(default=None,max_length=100)
 
     @field_validator("target_urls")
     @classmethod
@@ -93,3 +95,32 @@ class SettingsUpdateRequest(VersionedRequest):
             if getattr(self, name) is None:
                 raise ValueError(name + " cannot be null")
         return self
+
+
+class ChannelCreateRequest(StrictRequest):
+    name: str = Field(min_length=1,max_length=120)
+    enabled: bool = True
+    token_action: Literal['replace','clear'] = 'replace'
+    chat_action: Literal['replace','clear'] = 'replace'
+    bot_token: Optional[str] = Field(default=None,max_length=200)
+    chat_id: Optional[str] = Field(default=None,max_length=200)
+
+
+class ChannelUpdateRequest(VersionedRequest):
+    name: Optional[str] = Field(default=None,min_length=1,max_length=120)
+    enabled: Optional[bool] = None
+    token_action: Literal['keep','replace','clear'] = 'keep'
+    chat_action: Literal['keep','replace','clear'] = 'keep'
+    bot_token: Optional[str] = Field(default=None,max_length=200)
+    chat_id: Optional[str] = Field(default=None,max_length=200)
+    recover_failed: bool = False
+
+    @model_validator(mode='after')
+    def nonnull(self):
+        if any(getattr(self,key) is None for key in self.model_fields_set & {'name','enabled'}):
+            raise ValueError('Channel fields cannot be null')
+        return self
+
+
+class ChannelDeleteRequest(VersionedRequest):
+    confirmed: Literal[True]

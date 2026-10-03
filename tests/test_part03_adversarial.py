@@ -24,7 +24,8 @@ def test_unsent_inline_migration_never_automatically_replays_possible_acceptance
     # pending/count0 state; a migration cannot prove it was never transmitted.
     repository.database.initialize()
     migrated = repository.alerts()[0]
-    assert migrated['status'] == legacy_status
+    assert migrated['status'] == 'cancelled'
+    assert migrated['error_summary'] == 'migration_legacy_requires_import'
     assert migrated['delivery_state'] == 'uncertain'
     assert migrated['last_attempt_outcome'] == 'legacy_unknown'
     assert migrated['attempt_count'] == attempt_count
@@ -33,13 +34,13 @@ def test_unsent_inline_migration_never_automatically_replays_possible_acceptance
     assert not dispatcher.run_once() and not sender.sent
     slot = datetime.fromisoformat(original['earliest_slot'])
     target, result_id = record_result(repository, job, 'available', slot, 3)
-    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) == original['id']
+    assert repository.create_alert(job, target, result_id, slot, owner_token=job['owner_token']) is None
     assert not dispatcher.run_once() and not sender.sent  # Fresh evidence alone cannot resolve acceptance.
     with pytest.raises(ConflictError, match='acknowledgement'):
         repository.recover_alert(original['id'])
-    assert repository.recover_alert(original['id'], acknowledge_duplicate_risk=True)
-    assert dispatcher.run_once() and len(sender.sent) == 1
-    assert repository.alerts()[0]['attempt_count'] == attempt_count + 1
+    assert not repository.recover_alert(original['id'], acknowledge_duplicate_risk=True)
+    assert not dispatcher.run_once() and not sender.sent
+    assert repository.alerts()[0]['attempt_count'] == attempt_count
 
 
 def test_proven_unstarted_failure_release_does_not_increment_attempts(tmp_path):
