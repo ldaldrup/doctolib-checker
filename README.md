@@ -20,7 +20,7 @@ python -m pip install -r requirements.txt
 Run these three processes in separate terminals from the repository directory. They must use the same database and compatible application version:
 
 ```bash
-python -m app.api.main       # web app: http://127.0.0.1:8000/
+python -m app.api.main       # web app
 python -m app.worker.main    # scheduled checks
 python -m app.dispatcher     # notification delivery
 ```
@@ -87,7 +87,7 @@ python checker.py --once --dry-run # one cycle without sends
 python quick_check.py              # inspect the first configured URL
 ```
 
-Keep `config.json` and `quick_check.py` output private. Dry-run still contacts Doctolib.
+Keep `config.json` and `quick_check.py` output out of source control. Dry-run still contacts Doctolib.
 
 ## Configuration
 
@@ -103,54 +103,12 @@ The backend reads environment variables. It does not load `.env` automatically. 
 | `REQUEST_SPACING_SECONDS` | `3` | Minimum Doctolib request spacing. Values below 3 are clamped. |
 | `DOCTOLIB_PROFILE` | `safari2601` | Availability transport profile. No browser runs. |
 | `DOCTOLIB_PAGE_DAYS` | `15` | Availability page size, 1–15 days. |
-| `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | API bind address and port. |
 
 Use the same `DATABASE_PATH` and `NOTIFICATION_SECRET_KEY` for the API and dispatcher. The worker needs the database path too.
-
-## Backup and restore
-
-Back up before schema changes or maintenance:
-
-```bash
-python -m app.admin backup \
-  --source ./data/checker.sqlite3 \
-  --destination /protected-backups/checker-before-upgrade.zip
-```
-
-Verify into a new disposable directory:
-
-```bash
-python -m app.admin verify \
-  --archive /protected-backups/checker-before-upgrade.zip \
-  --work-directory /private/tmp/checker-restore-rehearsal
-```
-
-Verification checks the archive, SQLite integrity, foreign keys, schema migration, representative reads, and `/healthz` without starting a server or contacting Doctolib or Telegram. Backups contain private job and appointment data and are not encrypted. Protect them and keep the matching `NOTIFICATION_SECRET_KEY` separately.
-
-For a real restore, stop the API, worker, and dispatcher first. Restore the database and matching application version together. Never downgrade a newer schema in place or combine a restored database with old `-wal` or `-shm` files.
 
 ## Deployment
 
 The Docker image runs as UID/GID `10001:10001`. Mount a writable data directory and run the API, worker, and dispatcher as separate services using the same database. Protect the API and UI with an authenticated reverse proxy; the application does not provide authentication.
-
-## Development
-
-Run the offline suite:
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest
-```
-
-The browser fixture harness is disposable and local-only:
-
-```bash
-PYTHONPATH=. python tests/ui_harness.py --directory /tmp/checker-ui --port 9376
-```
-
-Stop the harness and remove its temporary directory after testing.
-
-Implementation plans and completion handoffs live in [implementation-plans](implementation-plans/README.md). Parts 01–06 are complete locally; parts 07–14 remain planned. Continue work on the single `feat/improvements` branch. Remote publication and production rollout require separate authorization.
 
 ## Limits
 
