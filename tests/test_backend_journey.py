@@ -620,7 +620,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -702,7 +702,7 @@ def test_notifier_exception_is_sanitized_and_marked_uncertain(tmp_path):
 
     alert = client.get("/api/v1/alerts").json()[0]
     assert alert["delivery_state"] == "uncertain"
-    assert alert["error_summary"] == "telegram_delivery_error"
+    assert alert["error_summary"] == "notification_delivery_error"
     assert b"private-token" not in client.get("/api/v1/alerts").content
     assert latest_result(client, job["id"])["status"] == "available"
 
@@ -928,7 +928,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 9
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {

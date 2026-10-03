@@ -98,12 +98,21 @@ class SettingsUpdateRequest(VersionedRequest):
 
 
 class ChannelCreateRequest(StrictRequest):
+    type: Literal['telegram','ntfy','webhook'] = 'telegram'
     name: str = Field(min_length=1,max_length=120)
     enabled: bool = True
     token_action: Literal['replace','clear'] = 'replace'
     chat_action: Literal['replace','clear'] = 'replace'
     bot_token: Optional[str] = Field(default=None,max_length=200)
     chat_id: Optional[str] = Field(default=None,max_length=200)
+    endpoint_action: Literal['replace','clear'] = 'replace'
+    endpoint: Optional[str] = Field(default=None,max_length=4096)
+    auth_type: Literal['none','bearer','basic'] = 'none'
+    auth_action: Literal['keep','replace','clear'] = 'keep'
+    auth_token: Optional[str] = Field(default=None,max_length=2000)
+    auth_username: Optional[str] = Field(default=None,max_length=200)
+    auth_password: Optional[str] = Field(default=None,max_length=2000)
+    ntfy_priority: StrictInt = Field(default=3,ge=1,le=5)
 
 
 class ChannelUpdateRequest(VersionedRequest):
@@ -113,11 +122,19 @@ class ChannelUpdateRequest(VersionedRequest):
     chat_action: Literal['keep','replace','clear'] = 'keep'
     bot_token: Optional[str] = Field(default=None,max_length=200)
     chat_id: Optional[str] = Field(default=None,max_length=200)
+    endpoint_action: Literal['keep','replace','clear'] = 'keep'
+    endpoint: Optional[str] = Field(default=None,max_length=4096)
+    auth_type: Optional[Literal['none','bearer','basic']] = None
+    auth_action: Literal['keep','replace','clear'] = 'keep'
+    auth_token: Optional[str] = Field(default=None,max_length=2000)
+    auth_username: Optional[str] = Field(default=None,max_length=200)
+    auth_password: Optional[str] = Field(default=None,max_length=2000)
+    ntfy_priority: Optional[StrictInt] = Field(default=None,ge=1,le=5)
     recover_failed: bool = False
 
     @model_validator(mode='after')
     def nonnull(self):
-        if any(getattr(self,key) is None for key in self.model_fields_set & {'name','enabled'}):
+        if any(getattr(self,key) is None for key in self.model_fields_set & {'name','enabled','auth_type','ntfy_priority'}):
             raise ValueError('Channel fields cannot be null')
         return self
 

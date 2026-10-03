@@ -10,8 +10,9 @@ from requests import RequestException
 
 from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, StrictRequest
 from app.notification_secrets import SecretUnavailable
-from app.notifications import format_slot_alert
-from app.services.channel_tests import synthetic_alert
+from app.services.channel_tests import notification_preview
+from app.storage.channel_operations import channel_secret_columns
+from app.webhooks import validate_endpoint
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
 from app.services.jobs import create_job, resolve_target, update_job
 from app.storage.repositories import ConflictError, NotFoundError, VersionConflictError, CreateReservationLostError, iso, utc_now
@@ -355,9 +356,10 @@ def create_router():
 
     @router.get('/api/v1/channels/{channel_id}/preview')
     def preview_channel(channel_id: str,request: Request):
-        if request.app.state.repository.get_channel(channel_id) is None:
+        channel = request.app.state.repository.get_channel(channel_id)
+        if channel is None or channel['deleted']:
             raise HTTPException(404,detail='channel_not_found')
-        return {'html':format_slot_alert(synthetic_alert())}
+        return notification_preview(channel)
 
     @router.post('/api/v1/channels/{channel_id}/tests',status_code=202)
     def test_channel(channel_id: str,body: VersionedRequest,request: Request,
@@ -367,8 +369,8 @@ def create_router():
         def validate_usable(channel):
             try:
                 secrets = request.app.state.notification_secrets
-                secrets.decrypt(channel['token_ciphertext'])
-                secrets.decrypt(channel['chat_ciphertext'])
+                for column in channel_secret_columns(channel):
+                    secrets.decrypt(channel[column])
             except SecretUnavailable:
                 raise HTTPException(409,detail={'code':'channel_unusable'})
         try:
@@ -439,10 +441,16 @@ def channel_public(request,channel):
     raw = request.app.state.repository.get_channel(channel['id'],private=True)
     try:
         secrets = request.app.state.notification_secrets
-        secrets.decrypt(raw['token_ciphertext'])
-        secrets.decrypt(raw['chat_ciphertext'])
+        for column in channel_secret_columns(raw):
+            secrets.decrypt(raw[column])
+        if raw['type'] != 'telegram' and raw['endpoint_ciphertext']:
+            _,host = validate_endpoint(secrets.decrypt(raw['endpoint_ciphertext']),raw['type'],request.app.state.settings.webhook_allowlist)
+            public['endpoint_host'] = host[:253]
     except SecretUnavailable:
         public['usable'] = False
+    except ValueError:
+        public['usable'] = False
+    public.setdefault('endpoint_host',None)
     return public
 
 
@@ -453,6 +461,15 @@ def credential_values(request,supplied,existing=None):
         values['name'] = values['name'].strip()
         if not values['name']:
             raise HTTPException(422,detail={'code':'invalid_channel_name'})
+    kind = existing['type'] if existing else supplied.get('type','telegram')
+    if not existing:
+        values['type'] = kind
+    if kind != 'telegram':
+        return endpoint_values(request,supplied,existing,values,kind)
+    if any(supplied.get(field) is not None for field in ('endpoint','auth_token','auth_username','auth_password')) or supplied.get('auth_type','none') != 'none':
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    if supplied.get('endpoint_action','keep' if existing else 'replace') != ('keep' if existing else 'replace') or supplied.get('auth_action','keep') != 'keep' or supplied.get('ntfy_priority',3) != 3:
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
     plaintext = {}
     changed = False
     for prefix,field,column in [('token','bot_token','token_ciphertext'),('chat','chat_id','chat_ciphertext')]:
@@ -495,8 +512,66 @@ def job_public(request,job):
         raw = request.app.state.repository.get_channel(channel['id'],private=True)
         try:
             secrets = request.app.state.notification_secrets
-            secrets.decrypt(raw['token_ciphertext'])
-            secrets.decrypt(raw['chat_ciphertext'])
-        except SecretUnavailable:
+            for column in channel_secret_columns(raw):
+                secrets.decrypt(raw[column])
+            if raw['type'] != 'telegram':
+                validate_endpoint(secrets.decrypt(raw['endpoint_ciphertext']),raw['type'],request.app.state.settings.webhook_allowlist)
+        except (SecretUnavailable, ValueError):
             channel['usable'] = False
     return job
+
+
+def endpoint_values(request,supplied,existing,values,kind):
+    secrets = request.app.state.notification_secrets
+    if any(supplied.get(field) is not None for field in ('bot_token','chat_id')):
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    if any(supplied.get(field,'keep' if existing else 'replace') != ('keep' if existing else 'replace') for field in ('token_action','chat_action')):
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    if kind == 'ntfy':
+        if 'ntfy_priority' in supplied:
+            values['ntfy_priority'] = supplied['ntfy_priority']
+    elif supplied.get('ntfy_priority',3) != 3:
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    action = supplied.get('endpoint_action','keep' if existing else 'replace')
+    endpoint = supplied.get('endpoint')
+    if action == 'keep':
+        if endpoint is not None:
+            raise HTTPException(422,detail={'code':'credential_action_required'})
+    else:
+        if not secrets.available:
+            raise HTTPException(503,detail={'code':'notification_secret_key_unavailable'})
+        if action == 'clear':
+            if endpoint is not None:
+                raise HTTPException(422,detail={'code':'credential_action_required'})
+            values.update(endpoint_ciphertext=None,destination_identity=None)
+        else:
+            try:
+                endpoint,_ = validate_endpoint(endpoint or '',kind,request.app.state.settings.webhook_allowlist)
+            except ValueError:
+                raise HTTPException(422,detail={'code':'invalid_notification_endpoint'})
+            values.update(endpoint_ciphertext=secrets.encrypt(endpoint),destination_identity=secrets.identity(kind+':'+endpoint))
+        if supplied.get('recover_failed') and (not existing or values['destination_identity'] != existing['destination_identity']):
+            raise HTTPException(422,detail={'code':'recovery_requires_same_destination'})
+    auth_type = supplied.get('auth_type',existing['auth_type'] if existing else 'none')
+    auth_action = supplied.get('auth_action','keep')
+    auth_fields = ('auth_token','auth_username','auth_password')
+    if auth_action == 'keep':
+        if any(supplied.get(field) is not None for field in auth_fields) or (existing and auth_type != existing['auth_type']) or (not existing and auth_type != 'none'):
+            raise HTTPException(422,detail={'code':'credential_action_required'})
+    else:
+        if not secrets.available:
+            raise HTTPException(503,detail={'code':'notification_secret_key_unavailable'})
+        required = {'none':(), 'bearer':('auth_token',),'basic':('auth_username','auth_password')}[auth_type]
+        if auth_action == 'clear' and auth_type != 'none':
+            raise HTTPException(422,detail={'code':'credential_action_required'})
+        if any(supplied.get(field) is not None for field in set(auth_fields)-set(required)):
+            raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+        for field in auth_fields:
+            value = supplied.get(field)
+            if field in required and (not value or any(ord(c)<32 or ord(c)==127 for c in value) or (field=='auth_username' and ':' in value)):
+                raise HTTPException(422,detail={'code':'invalid_notification_auth'})
+            if field == 'auth_token' and field in required and not re.fullmatch(r'[A-Za-z0-9._~+/-]+=*',value):
+                raise HTTPException(422,detail={'code':'invalid_notification_auth'})
+            values[field+'_ciphertext'] = secrets.encrypt(value) if field in required else None
+        values['auth_type'] = auth_type
+    return values

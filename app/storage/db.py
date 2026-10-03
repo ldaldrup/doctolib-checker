@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class Database:
@@ -20,7 +20,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6, 7, 8):
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" + CHANNEL_SCHEMA +
                 """
@@ -314,6 +314,12 @@ class Database:
                 if current_version == 7:
                     self._migrate_channels(conn)
                     current_version = 8
+                if current_version == 8:
+                    channel_columns = {row[1] for row in conn.execute('PRAGMA table_info(notification_channels)')}
+                    for column in ('endpoint_ciphertext TEXT', "auth_type TEXT NOT NULL DEFAULT 'none'", 'auth_token_ciphertext TEXT', 'auth_username_ciphertext TEXT', 'auth_password_ciphertext TEXT','ntfy_priority INTEGER NOT NULL DEFAULT 3'):
+                        if column.split()[0] not in channel_columns:
+                            conn.execute('ALTER TABLE notification_channels ADD COLUMN '+column)
+                    current_version = 9
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
             conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))

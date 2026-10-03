@@ -19,7 +19,7 @@ const settings = {minimum_poll_interval_seconds: 300, time_zone: 'Europe/Berlin'
 const draft = {...job, target_urls: job.targets.map(item => item.booking_url)};
 async function test(name, fn) {
   try { await fn(); lines.push(`PASS ${name}`); }
-  catch (error) { lines.push(`FAIL ${name}: ${error.message}`); }
+  catch (error) { lines.push(`FAIL ${name}: ${error.stack || error.message}`); }
 }
 async function rejects(fn, kind) {
   try { await fn(); throw new Error('Expected rejection'); }
@@ -616,7 +616,61 @@ await test('channel create lost response replays original credentials and key, t
     await waitUI(()=>!doc.querySelector(`[data-channel-id="${created.id}"]`));created=null;
   } finally {frame.remove();if(created?.id){const channel=(await api.listChannels()).items.find(item=>item.id===created.id);if(channel)await api.deleteChannel(channel.id,channel.edit_version);}}
 });
-await test('explicit legacy import is idempotent and job multiselect survives saved rename and reload',async()=>{
+await test('Settings creates ntfy and webhook channels, tests saved destinations and preserves explicit endpoint/auth edits',async()=>{
+  const frame=document.createElement('iframe');frame.src='/#settings';document.body.append(frame);const created=[];
+  try{
+    await waitUI(()=>frame.contentDocument?.querySelector('[data-action="new-channel"]')?.disabled===false);
+    const doc=frame.contentDocument,win=frame.contentWindow;win.confirm=()=>true;
+    for(const [type,name,auth] of [['ntfy','Native ntfy','bearer'],['webhook','Native webhook','basic']]){
+      doc.querySelector('[data-action="new-channel"]').click();editControl(doc,win,'#channel-type',type);
+      editControl(doc,win,'#channel-name',name);editControl(doc,win,'#channel-endpoint',`https://notify.example/${type}-private-topic`);
+      editControl(doc,win,'#channel-auth_type',auth);
+      if(auth==='bearer')editControl(doc,win,'#channel-auth_token','synthetic_bearer_secret');
+      else {editControl(doc,win,'#channel-auth_username','synthetic_user');editControl(doc,win,'#channel-auth_password','synthetic_password');}
+      if(type==='ntfy')editControl(doc,win,'#channel-ntfy_priority','4');
+      doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+      await waitUI(()=>!doc.querySelector('#channel-form'));
+      const saved=(await api.listChannels()).items.find(item=>item.name===name);assert(saved?.usable);created.push(saved);
+      const json=JSON.stringify(saved);assert(!json.includes('private-topic')&&!json.includes('synthetic_bearer_secret')&&!json.includes('synthetic_password'));
+      doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="edit-channel"]`).click();editControl(doc,win,'#channel-name',`${name} unsaved`);
+      const previewFetch=win.fetch;let releasePreview;
+      const previewGate=new Promise(resolve=>{releasePreview=resolve;});
+      win.fetch=async(path,options)=>{if(String(path).endsWith(`/${saved.id}/preview`))await previewGate;return previewFetch(path,options);};
+      doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="preview-channel"]`).click();
+      await waitUI(()=>doc.querySelector('#channel-name').matches(':disabled'));equal(doc.querySelector('#channel-name').value,`${name} unsaved`);
+      releasePreview();
+      await waitUI(()=>doc.querySelector('.channel-preview'));assert(doc.querySelector('.channel-preview').textContent.includes('Example'));
+      win.fetch=previewFetch;equal(doc.querySelector('#channel-name').value,`${name} unsaved`);assert(!doc.querySelector('#channel-name').matches(':disabled'));
+      assert(!doc.querySelector('.channel-preview').textContent.includes('private-topic'));
+      doc.querySelector('[data-action="cancel-channel"]').click();
+      doc.querySelector('[data-action="close-channel-preview"]').click();
+      doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="test-channel"]`).click();
+      await waitUI(()=>doc.querySelector(`[data-channel-id="${saved.id}"]`).textContent.includes('Test queued'));
+      await nativeFetch('/__test/deliver',{method:'POST'});doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="channel-test-status"]`).click();
+      await waitUI(()=>doc.querySelector(`[data-channel-id="${saved.id}"]`).textContent.includes('Test accepted by endpoint'));
+      doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="edit-channel"]`).click();
+      assert(!doc.querySelector('#channel-type'));equal(doc.querySelector('#channel-endpoint').value,'');assert(doc.querySelector('#channel-endpoint').disabled);
+      equal(doc.querySelector('#channel-auth_action').value,'keep');
+      editControl(doc,win,'#channel-name',`${name} renamed`);
+      await api.updateChannel(saved.id,{auth_type:'none',auth_action:'clear'},saved.edit_version);
+      doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));await waitUI(()=>doc.querySelector('[data-action="reconcile-channel"]'));
+      assert(doc.querySelector('#channel-form').textContent.includes('Authentication: none.'));
+      doc.querySelector('#channel-conflict-confirm').click();doc.querySelector('[data-action="reconcile-channel"]').click();
+      doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));await waitUI(()=>!doc.querySelector('#channel-form'));
+      equal((await api.listChannels()).items.find(item=>item.id===saved.id).auth_type,'none');
+      equal((await api.listChannels()).items.find(item=>item.id===saved.id).destination_version,saved.destination_version);
+      doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="edit-channel"]`).click();editControl(doc,win,'#channel-endpoint_action','clear');
+      doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));await waitUI(()=>!doc.querySelector('#channel-form'));
+      assert(doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="test-channel"]`).disabled);
+      doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="edit-channel"]`).click();editControl(doc,win,'#channel-endpoint_action','replace');
+      editControl(doc,win,'#channel-endpoint',`https://notify.example/${type}-replacement-topic`);editControl(doc,win,'#channel-auth_type','bearer');editControl(doc,win,'#channel-auth_action','clear');
+      equal(doc.querySelector('#channel-auth_type').value,'none');
+      doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));await waitUI(()=>!doc.querySelector('#channel-form'));
+      const repaired=(await api.listChannels()).items.find(item=>item.id===saved.id);assert(repaired.usable&&!repaired.auth_configured);assert(repaired.destination_version>saved.destination_version);
+    }
+  }finally{frame.remove();for(const saved of created){const current=(await api.listChannels()).items.find(item=>item.id===saved.id);if(current)await api.deleteChannel(current.id,current.edit_version);}}
+});
+await test('explicit legacy import and mixed job selection preserve independent endpoint acceptance and saved rename',async()=>{
   const frame=document.createElement('iframe');frame.src='/#settings';document.body.append(frame);let saved;
   try{
     await waitUI(()=>frame.contentDocument?.querySelector('[data-action="import-telegram"]'));
@@ -625,21 +679,25 @@ await test('explicit legacy import is idempotent and job multiselect survives sa
     const first=(await api.listChannels()).items.find(item=>item.name==='Telegram1');assert(first);
     const replay=await api.importLegacyChannel(crypto.randomUUID());equal(replay.id,first.id);
     const second=await api.createChannel({name:'Parallel Telegram',enabled:true,token_action:'replace',chat_action:'replace',bot_token:'34567:synthetic_parallel_channel_token_only',chat_id:'-100000003'},crypto.randomUUID());
+    const extra=[];
+    for(const [type,name] of [['ntfy','ntfy One'],['ntfy','ntfy Two'],['webhook','Generic hook']])extra.push(await api.createChannel({type,name,endpoint_action:'replace',endpoint:`https://notify.example/${name.replaceAll(' ','-')}`,auth_type:'none',auth_action:'clear'},crypto.randomUUID()));
     win.location.hash='#jobs';await waitUI(()=>doc.querySelector(`[name="notification_channel_ids"][value="${second.id}"]`));
     editControl(doc,win,'#job-name','Native routed job');editControl(doc,win,'#target-0',fixtureBooking);
     doc.querySelector('[name="telegram_enabled"]').click();doc.querySelector(`[name="notification_channel_ids"][value="${first.id}"]`).click();doc.querySelector(`[name="notification_channel_ids"][value="${second.id}"]`).click();
+    for(const channel of extra)doc.querySelector(`[name="notification_channel_ids"][value="${channel.id}"]`).click();
     doc.querySelector('#job-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
     await waitUI(()=>[...doc.querySelectorAll('#job-list h2')].some(node=>node.textContent==='Native routed job'));
-    saved=(await api.listJobs()).find(item=>item.name==='Native routed job');equal([...saved.notification_channel_ids].sort(),[first.id,second.id].sort());
+    saved=(await api.listJobs()).find(item=>item.name==='Native routed job');equal([...saved.notification_channel_ids].sort(),[first.id,second.id,...extra.map(channel=>channel.id)].sort());
     await nativeFetch('/__test/checks',{method:'POST'});
-    await nativeFetch('/__test/deliver',{method:'POST'});await nativeFetch('/__test/deliver',{method:'POST'});
+    for(let index=0;index<5;index++)await nativeFetch('/__test/deliver',{method:'POST'});
     doc.dispatchEvent(new win.Event('visibilitychange'));
-    await waitUI(()=>{const text=doc.querySelector(`[data-job-id="${saved.id}"]`)?.textContent;return text?.includes('Telegram1: sent') && text.includes('Parallel Telegram: sent');});
+    await waitUI(()=>{const text=doc.querySelector(`[data-job-id="${saved.id}"]`)?.textContent;return text?.includes('Telegram1: sent') && text.includes('Parallel Telegram: sent') && extra.every(channel=>text.includes(`${channel.name}: accepted by endpoint`));});
     await api.updateChannel(second.id,{name:'Renamed parallel',token_action:'keep',chat_action:'keep'},second.edit_version);
     doc.dispatchEvent(new win.Event('visibilitychange'));await waitUI(()=>doc.querySelector(`[data-job-id="${saved.id}"]`).textContent.includes('Renamed parallel'));
     doc.querySelector(`[data-job-id="${saved.id}"] [data-action="edit"]`).click();
     assert(doc.querySelector(`[name="notification_channel_ids"][value="${second.id}"]`).checked);
     await api.deleteChannel(second.id,(await api.listChannels()).items.find(item=>item.id===second.id).edit_version);
+    for(const channel of extra)await api.deleteChannel(channel.id,channel.edit_version);
   }finally{frame.remove();if(saved?.id)await remove(saved.id);}
 });
 document.querySelector('#results').textContent = lines.join('\n');

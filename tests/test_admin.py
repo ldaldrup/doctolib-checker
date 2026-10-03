@@ -38,11 +38,11 @@ def test_backup_restore_preserves_data_and_uses_offline_health(tmp_path, monkeyp
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "private-fixture-chat")
     monkeypatch.setattr("requests.sessions.Session.request", lambda *a, **k: pytest.fail("network used"))
     monkeypatch.setattr("app.notifications.send_telegram_alert", lambda *a, **k: pytest.fail("send used"))
-    assert admin.backup(source, archive)["schema_version"] == 8
+    assert admin.backup(source, archive)["schema_version"] == 9
     original = archive.read_bytes()
     work = tmp_path / "verify"
     assert admin.verify(archive, work) == {
-        "status": "verified", "backup_schema_version": 8, "restored_schema_version": 8,
+        "status": "verified", "backup_schema_version": 9, "restored_schema_version": 9,
         "integrity": "ok", "foreign_keys": "ok", "health": "ok",
     }
     assert rows(work / "restored.sqlite3") == expected
@@ -50,7 +50,7 @@ def test_backup_restore_preserves_data_and_uses_offline_health(tmp_path, monkeyp
     assert archive.read_bytes() == original
     with zipfile.ZipFile(archive) as bundle:
         manifest = json.loads(bundle.read("manifest.json"))
-    assert manifest["schema_version"] == 8
+    assert manifest["schema_version"] == 9
     assert "private-fixture" not in json.dumps(manifest)
     assert manifest["created_at"].endswith("+00:00")
     for path in (archive, work / "checker.sqlite3", work / "restored.sqlite3"):
@@ -182,7 +182,7 @@ def test_legacy_archive_stays_immutable_while_copy_migrates(tmp_path, version):
     work = tmp_path / "legacy-verify"
     report = admin.verify(archive, work)
     assert report["backup_schema_version"] == version
-    assert report["restored_schema_version"] == 8 and report["health"] == "ok"
+    assert report["restored_schema_version"] == 9 and report["health"] == "ok"
     assert archive.read_bytes() == before
     with sqlite3.connect(work / "checker.sqlite3") as conn:
         assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == version

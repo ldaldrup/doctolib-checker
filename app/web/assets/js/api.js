@@ -140,7 +140,7 @@ export function createJobPayload(draft, settings) {
   if (Object.hasOwn(draft, "notification_channel_ids")) {
     if (!Array.isArray(draft.notification_channel_ids) || draft.notification_channel_ids.some(id => typeof id !== "string" || !id)) invalid("notification_channel_ids", "Choose saved notification channels.");
     payload.notification_channel_ids = [...new Set(draft.notification_channel_ids)];
-  } else if (payload.telegram_enabled && !settings.telegram_configured) invalid("telegram_enabled", "Telegram is not configured on the server.");
+  } else if (payload.telegram_enabled && !settings.telegram_configured) invalid("telegram_enabled", "No usable notification channel is configured.");
   if (payload.date_mode === "custom") {
     payload.earliest_date = date(draft.earliest_date, "earliest_date");
     payload.latest_date = date(draft.latest_date, "latest_date");

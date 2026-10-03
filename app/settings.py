@@ -1,6 +1,9 @@
 """Runtime settings shared by the API and worker processes."""
 
 import os
+import ipaddress
+import json
+import re
 from dataclasses import dataclass
 
 
@@ -11,15 +14,10 @@ class Settings:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_enabled: bool = False
+    webhook_allowlist: tuple = ()
     # Metadata requests keep using requests and this configurable header.
     # Availability requests use the selected curl_cffi browser profile instead.
     user_agent: str = "DoctolibChecker/2.0"
-    # Future ideas only; no tunnel, proxy, alternate UserAgent, or
-    # RequestApplication selector is enabled by these notes/settings.
-    # Tunneling: consider routing egress through a separately managed host.
-    # Proxy: consider an explicitly configured HTTPS/SOCKS proxy.
-    # UserAgent: any override must match the selected transport profile.
-    # RequestApplication: consider separating client/session policy by endpoint.
     doctolib_profile: str = "safari2601"
     doctolib_page_days: int = 15
     default_timezone: str = "Europe/Berlin"
@@ -47,6 +45,7 @@ class Settings:
         if not 1 <= page_days <= 15:
             raise ValueError("DOCTOLIB_PAGE_DAYS must be between 1 and 15")
         return cls(
+            webhook_allowlist=_webhook_allowlist(os.getenv("WEBHOOK_PRIVATE_ALLOWLIST", "[]")),
             notification_secret_key=secret_key,
             database_path=os.getenv("DATABASE_PATH", "./data/checker.sqlite3"),
             telegram_bot_token=token,
@@ -69,3 +68,33 @@ class Settings:
                 0.5, float(os.getenv("WORKER_TICK_SECONDS", "2"))
             ),
         )
+
+
+def _webhook_allowlist(value):
+    """Exact operator exceptions; never allow a private network or wildcard."""
+    try:
+        entries = json.loads(value)
+        if not isinstance(entries, list) or len(entries) > 100:
+            raise ValueError
+        allowed = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"host", "port", "addresses"}:
+                raise ValueError
+            host, port, addresses = entry["host"], entry["port"], entry["addresses"]
+            if (not isinstance(host, str) or not host or len(host) > 253
+                    or any(char in host for char in "/@*[]\\ \t\n\r")
+                    or type(port) is not int or not 1 <= port <= 65535
+                    or not isinstance(addresses, list) or not 1 <= len(addresses) <= 32):
+                raise ValueError
+            host = host.encode("idna").decode("ascii").lower().rstrip(".")
+            try:
+                host = str(ipaddress.ip_address(host))
+            except ValueError:
+                if not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                           for label in host.split(".")):
+                    raise ValueError
+            for address in addresses:
+                allowed.append((host, port, str(ipaddress.ip_address(address))))
+        return tuple(allowed)
+    except (ValueError, TypeError, UnicodeError):
+        raise ValueError("WEBHOOK_PRIVATE_ALLOWLIST must contain exact host, port and IP addresses") from None

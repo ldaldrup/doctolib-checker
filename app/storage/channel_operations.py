@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS notification_channels (
  enabled INTEGER NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,edit_version INTEGER NOT NULL DEFAULT 1,
  destination_version INTEGER NOT NULL DEFAULT 1,credential_version INTEGER NOT NULL DEFAULT 1,
  token_ciphertext TEXT,chat_ciphertext TEXT,destination_identity TEXT,
+ endpoint_ciphertext TEXT,auth_type TEXT NOT NULL DEFAULT 'none',
+ auth_token_ciphertext TEXT,auth_username_ciphertext TEXT,auth_password_ciphertext TEXT,
+ ntfy_priority INTEGER NOT NULL DEFAULT 3,
  created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS channel_mutations (
  key TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,channel_id TEXT REFERENCES notification_channels(id),
@@ -23,6 +26,23 @@ CREATE TABLE IF NOT EXISTS channel_tests (
  attempt_started_at TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,error_code TEXT,
  created_at TEXT NOT NULL,updated_at TEXT NOT NULL,expires_at TEXT NOT NULL);
 """
+
+SECRET_COLUMNS = ('token_ciphertext','chat_ciphertext','endpoint_ciphertext','auth_token_ciphertext','auth_username_ciphertext','auth_password_ciphertext')
+COMPLETE_SQL = """((c.type='telegram' AND c.token_ciphertext IS NOT NULL AND c.chat_ciphertext IS NOT NULL)
+ OR (c.type IN ('ntfy','webhook') AND c.endpoint_ciphertext IS NOT NULL AND
+ (c.auth_type='none' OR (c.auth_type='bearer' AND c.auth_token_ciphertext IS NOT NULL)
+ OR (c.auth_type='basic' AND c.auth_username_ciphertext IS NOT NULL AND c.auth_password_ciphertext IS NOT NULL))))"""
+
+
+def channel_secret_columns(row):
+    if row['type'] == 'telegram':
+        return ('token_ciphertext','chat_ciphertext')
+    return ('endpoint_ciphertext',) + {'none': (), 'bearer': ('auth_token_ciphertext',),
+        'basic': ('auth_username_ciphertext','auth_password_ciphertext')}[row['auth_type']]
+
+
+def channel_complete(row):
+    return all(row[column] for column in channel_secret_columns(row))
 
 
 def now_text():
@@ -42,7 +62,10 @@ class ChannelOperations:
         item['deleted'] = bool(item['deleted'])
         item['bot_token_set'] = bool(item['token_ciphertext'])
         item['chat_id_set'] = bool(item['chat_ciphertext'])
-        item['credential_configured'] = item['bot_token_set'] and item['chat_id_set']
+        item['endpoint_set'] = bool(item['endpoint_ciphertext'])
+        item['auth_configured'] = item['type'] != 'telegram' and item['auth_type'] != 'none' and all(
+            item[column] for column in channel_secret_columns(item) if column != 'endpoint_ciphertext')
+        item['credential_configured'] = channel_complete(item)
         item['usable'] = item['enabled'] and not item['deleted'] and item['credential_configured']
         item['bot_token_masked'] = '••••' if item['bot_token_set'] else None
         item['chat_id_masked'] = '••••' if item['chat_id_set'] else None
@@ -51,7 +74,7 @@ class ChannelOperations:
         item['affected_jobs'] = [dict(job) for job in conn.execute(
             "SELECT j.id,j.name FROM jobs j JOIN job_channels jc ON jc.job_id=j.id WHERE jc.channel_config_id=? AND j.status!='deleted'",(item['id'],))]
         if not private:
-            for key in ('token_ciphertext','chat_ciphertext','destination_identity'):
+            for key in (*SECRET_COLUMNS,'destination_identity'):
                 item.pop(key)
         return item
 
@@ -90,8 +113,10 @@ class ChannelOperations:
             if not values:
                 raise ConflictError('idempotency_operation_expired')
             channel_id = str(uuid.uuid4())
-            conn.execute('''INSERT INTO notification_channels(id,name,enabled,token_ciphertext,chat_ciphertext,destination_identity,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?)''',(channel_id,values['name'],int(values['enabled']),values.get('token_ciphertext'),values.get('chat_ciphertext'),values.get('destination_identity'),now,now))
+            columns = ('type','name','enabled',*SECRET_COLUMNS,'destination_identity','auth_type','ntfy_priority')
+            defaults = {'type':'telegram','auth_type':'none','ntfy_priority':3}
+            stored = [values.get(column,defaults.get(column)) for column in columns]
+            conn.execute('INSERT INTO notification_channels(id,'+','.join(columns)+',created_at,updated_at) VALUES('+','.join('?' for _ in range(len(columns)+3))+')',(channel_id,*stored,now,now))
             conn.execute('INSERT INTO channel_mutations VALUES(?,?,?,?,?)',(key,fingerprint,channel_id,now,expiry()))
             if legacy:
                 conn.execute('INSERT INTO notification_onboarding VALUES(1,?)',(channel_id,))
@@ -112,7 +137,7 @@ class ChannelOperations:
             if delete:
                 values.update(deleted=1,enabled=0)
             destination_changed = 'destination_identity' in values and values['destination_identity'] != before['destination_identity']
-            credentials_changed = any(key in values and values[key] != before[key] for key in ('token_ciphertext','chat_ciphertext'))
+            credentials_changed = any(key in values and values[key] != before[key] for key in (*SECRET_COLUMNS,'auth_type','ntfy_priority'))
             changes = {key:value for key,value in values.items() if value != before[key]}
             if changes:
                 changes.update(edit_version=before['edit_version']+1,updated_at=now_text())
@@ -123,7 +148,7 @@ class ChannelOperations:
                 conn.execute('UPDATE notification_channels SET '+','.join(key+'=?' for key in changes)+' WHERE id=?',(*changes.values(),channel_id))
             after = conn.execute('SELECT * FROM notification_channels WHERE id=?',(channel_id,)).fetchone()
             self._channel_changed(conn,dict(before),dict(after),recover_failed=recover_failed)
-            if destination_changed or not after['enabled'] or after['deleted'] or not after['token_ciphertext'] or not after['chat_ciphertext']:
+            if destination_changed or not after['enabled'] or after['deleted'] or not channel_complete(after):
                 conn.execute("UPDATE channel_tests SET status='cancelled',error_code='channel_changed',updated_at=? WHERE channel_config_id=? AND status IN ('queued','running') AND attempt_started_at IS NULL",(now_text(),channel_id))
             public = self._channel(conn,after)
             if delete:
@@ -153,7 +178,7 @@ class ChannelOperations:
                 raise NotFoundError('channel_not_found')
             if channel['edit_version'] != expected_version:
                 raise VersionConflictError(channel['edit_version'])
-            if not channel['enabled'] or not channel['token_ciphertext'] or not channel['chat_ciphertext']:
+            if not channel['enabled'] or not channel_complete(channel):
                 raise ConflictError('channel_unusable')
             if validate_usable is not None:
                 validate_usable(dict(channel))
@@ -192,10 +217,10 @@ class ChannelOperations:
             conn.execute(f'PRAGMA busy_timeout={int(min(10,max(0,wait))*1000)}')
             conn.execute('BEGIN IMMEDIATE')
             now = now_text()
-            row = conn.execute("SELECT t.*,c.enabled,c.deleted,c.token_ciphertext,c.chat_ciphertext,c.destination_version AS current_destination,c.credential_version AS current_credential FROM channel_tests t JOIN notification_channels c ON c.id=t.channel_config_id WHERE t.id=?",(test_id,)).fetchone()
+            row = conn.execute("SELECT t.*,c.enabled,c.deleted,"+COMPLETE_SQL+" AS complete,c.destination_version AS current_destination,c.credential_version AS current_credential FROM channel_tests t JOIN notification_channels c ON c.id=t.channel_config_id WHERE t.id=?",(test_id,)).fetchone()
             if row is None or row['status']!='running' or row['owner_token']!=owner_token or row['claim_until']<=now:
                 return False
-            if not row['enabled'] or row['deleted'] or not row['token_ciphertext'] or not row['chat_ciphertext'] or row['destination_version']!=row['current_destination'] or row['credential_version']!=row['current_credential']:
+            if not row['enabled'] or row['deleted'] or not row['complete'] or row['destination_version']!=row['current_destination'] or row['credential_version']!=row['current_credential']:
                 conn.execute("UPDATE channel_tests SET status='cancelled',error_code='channel_changed',updated_at=? WHERE id=?",(now,test_id))
                 return False
             conn.execute('UPDATE channel_tests SET attempt_started_at=?,attempt_count=attempt_count+1,updated_at=? WHERE id=? AND attempt_started_at IS NULL',(now,now,test_id))

@@ -7,7 +7,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from app.doctolib import DoctolibClient
-from app.storage.channel_operations import ChannelOperations
+from app.storage.channel_operations import ChannelOperations, channel_complete, COMPLETE_SQL
 
 
 def utc_now():
@@ -143,9 +143,9 @@ class Repository(ChannelOperations):
             for channel in conn.execute("""SELECT c.* FROM notification_channels c JOIN job_channels jc
                     ON jc.channel_config_id=c.id WHERE jc.job_id=? ORDER BY c.name,c.id""", (item['id'],)):
                 latest = conn.execute("SELECT status,delivery_state,error_summary,claim_owner_token FROM alerts WHERE job_id=? AND channel_config_id=? ORDER BY rowid DESC LIMIT 1", (item['id'],channel['id'])).fetchone()
-                item['notification_channels'].append({'id':channel['id'],'name':channel['name'],
+                item['notification_channels'].append({'id':channel['id'],'name':channel['name'],'type':channel['type'],
                     'enabled':bool(channel['enabled']) and not channel['deleted'],
-                    'usable':bool(channel['enabled'] and not channel['deleted'] and channel['token_ciphertext'] and channel['chat_ciphertext']),
+                    'usable':bool(channel['enabled'] and not channel['deleted'] and channel_complete(channel)),
                     'delivery_status':('in_flight' if latest['claim_owner_token'] else latest['status']) if latest else None,
                     'error_code':latest['error_summary'] if latest else None})
         for key in ("telehealth", "telegram_enabled"):
@@ -673,10 +673,10 @@ class Repository(ChannelOperations):
     def _observe_event(conn, job, target, result_id, dedupe, revision):
         if conn.execute("SELECT 1 FROM availability_events WHERE dedupe_key=?", (dedupe,)).fetchone():
             return
-        channels = [dict(row) for row in conn.execute("""SELECT c.id,c.name,c.destination_version,c.credential_version
+        channels = [dict(row) for row in conn.execute("""SELECT c.id,c.type,c.name,c.destination_version,c.credential_version
             FROM job_channels jc JOIN notification_channels c ON c.id=jc.channel_config_id
             WHERE jc.job_id=? AND c.enabled=1 AND c.deleted=0
-            AND c.token_ciphertext IS NOT NULL AND c.chat_ciphertext IS NOT NULL""", (job['id'],))] if job['telegram_enabled'] else []
+            AND """+COMPLETE_SQL, (job['id'],))] if job['telegram_enabled'] else []
         event_id, now = new_id(), precise_iso()
         conn.execute("""INSERT INTO availability_events
             (id,job_id,target_id,result_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)
@@ -686,7 +686,7 @@ class Repository(ChannelOperations):
                 (id,job_id,target_id,result_id,channel,event_type,dedupe_key,status,created_at,next_attempt_at,
                  search_revision,event_id,channel_config_id,destination_version,credential_version,channel_name)
                 VALUES(?,?,?,?,?,'slot_found',?,'pending',?,?,?,?,?,?,?,?)""",
-                (new_id(),job['id'],target['id'],result_id,'telegram',dedupe+':channel:'+channel['id']+':destination:'+str(channel['destination_version']),
+                (new_id(),job['id'],target['id'],result_id,channel['type'],dedupe+':channel:'+channel['id']+':destination:'+str(channel['destination_version']),
                  now,now,revision,event_id,channel['id'],channel['destination_version'],channel['credential_version'],channel['name']))
 
     def create_alert(self, job, target, result_id, earliest_slot, *, owner_token=None):
@@ -703,7 +703,7 @@ class Repository(ChannelOperations):
     def _channel_changed(self, conn, before, after, recover_failed=False):
         changed_destination = before['destination_version'] != after['destination_version']
         disabled = not after['enabled'] or after['deleted']
-        incomplete = not after['token_ciphertext'] or not after['chat_ciphertext']
+        incomplete = not channel_complete(after)
         if changed_destination or disabled or incomplete:
             reason = 'destination_changed' if changed_destination else ('channel_deleted' if after['deleted'] else ('channel_disabled' if disabled else 'channel_incomplete'))
             conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary=?
@@ -726,10 +726,10 @@ class Repository(ChannelOperations):
             r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
             j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
             j.interval_seconds,j.status_version AS current_status_version, cr.status_version AS run_status_version,
-            cr.paused_manual,cr.intent_id,t.active AS target_active,s.last_status,s.last_earliest_slot,
+            cr.paused_manual,cr.intent_id,cr.job_name,cr.triggered_by,c.type AS channel_type,t.active AS target_active,s.last_status,s.last_earliest_slot,
             c.enabled AS channel_enabled,c.deleted AS channel_deleted,c.destination_version AS current_destination_version,
             c.credential_version AS current_credential_version,
-            (c.token_ciphertext IS NOT NULL AND c.chat_ciphertext IS NOT NULL) AS channel_complete,
+            """+COMPLETE_SQL+""" AS channel_complete,
             EXISTS(SELECT 1 FROM job_channels jc WHERE jc.job_id=a.job_id AND jc.channel_config_id=a.channel_config_id) AS channel_selected
             FROM alerts a JOIN check_results r ON r.id=a.result_id JOIN check_runs cr ON cr.id=r.run_id
             JOIN jobs j ON j.id=a.job_id LEFT JOIN targets t ON t.id=a.target_id
@@ -1150,7 +1150,7 @@ class Repository(ChannelOperations):
         with self.database.connection() as conn:
             return [self._public_alert(row) for row in conn.execute(
                 """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
-                r.booking_url,j.name AS job_name,j.time_zone
+                j.name AS job_name,j.time_zone
                 FROM alerts a
                 LEFT JOIN check_results r ON r.id=a.result_id
                 LEFT JOIN jobs j ON j.id=a.job_id

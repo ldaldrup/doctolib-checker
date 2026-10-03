@@ -1,12 +1,12 @@
 """SQLite-owned, serial delivery turns independent of availability polling."""
 
-from app.notifications import DeliveryOutcome, send_telegram_alert
+from app.notifications import DeliveryOutcome
 from app.notification_secrets import SecretUnavailable
-from app.services.channel_tests import channel_settings, run_test_once
+from app.services.channel_tests import channel_settings, run_test_once, send_configured
 
 
 class DeliveryService:
-    def __init__(self, repository, settings, sender=send_telegram_alert):
+    def __init__(self, repository, settings, sender=None):
         self.repository = repository
         self.settings = settings
         self.sender = sender
@@ -42,8 +42,8 @@ class DeliveryService:
             return started
 
         try:
-            if self.sender is send_telegram_alert:
-                outcome = self.sender(configured, claimed, before_send=before_send)
+            if self.sender is None:
+                outcome = send_configured(self.settings, configured, claimed, before_send)
             else:
                 payload = self.repository.begin_alert_attempt(claimed["id"], token)
                 if payload is None:
@@ -52,12 +52,12 @@ class DeliveryService:
                 outcome = self.sender(configured, payload)
             if not isinstance(outcome, DeliveryOutcome):
                 outcome = DeliveryOutcome("uncertain" if started else "retry",
-                                          "telegram_invalid_sender_outcome", attempted=started)
+                                          "notification_invalid_sender_outcome", attempted=started)
         except Exception:
             # Permission persisted before transport means provider acceptance is
             # possible. Preparation failures before permission are retryable.
             outcome = DeliveryOutcome("uncertain" if started else "retry",
-                                      "telegram_delivery_error", attempted=started)
+                                      "notification_delivery_error", attempted=started)
         finish = (self.repository.finish_delivery if outcome.attempted
                   else self.repository.finish_unstarted_delivery)
         finish(claimed["id"], token, outcome.category,

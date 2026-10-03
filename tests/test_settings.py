@@ -1,4 +1,5 @@
 from app.settings import Settings
+import pytest
 
 
 def test_settings_use_local_api_bind_and_enforce_minimums_by_default(monkeypatch):
@@ -37,3 +38,14 @@ def test_settings_validate_transport_profile_and_page_size(monkeypatch):
         assert "between 1 and 15" in str(exc)
     else:
         raise AssertionError("oversized page size was accepted")
+
+
+def test_webhook_exceptions_are_exact_operator_addresses(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_PRIVATE_ALLOWLIST", '[{"host":"ntfy.example","port":8443,"addresses":["10.0.0.2","fd00::2"]}]')
+    assert Settings.from_env().webhook_allowlist == (("ntfy.example",8443,"10.0.0.2"),("ntfy.example",8443,"fd00::2"))
+    for value in ('{}','[{"host":"*","port":443,"addresses":["10.0.0.2"]}]',
+                  '[{"host":"ntfy.example","port":true,"addresses":["10.0.0.2"]}]',
+                  '[{"host":"ntfy.example","port":443,"addresses":["10.0.0.0/8"]}]'):
+        monkeypatch.setenv("WEBHOOK_PRIVATE_ALLOWLIST", value)
+        with pytest.raises(ValueError, match="WEBHOOK_PRIVATE_ALLOWLIST"):
+            Settings.from_env()
