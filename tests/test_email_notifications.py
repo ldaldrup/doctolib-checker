@@ -66,6 +66,60 @@ def test_two_email_recipients_and_telegram_deliver_independently(routed, monkeyp
     assert all(alert['status'] == 'sent' and alert['attempt_count'] == 1 for alert in repo.alerts())
 
 
+def test_email_failures_do_not_retry_sent_sibling_channels(routed, monkeypatch):
+    _, repo, settings, secrets, job, telegram, _, observe = routed
+    _smtp(repo, secrets)
+    first = _email(repo, secrets, 'Email1', 'one@example.org')
+    second = _email(repo, secrets, 'Email2', 'two@example.org')
+    repo.update_job(job['id'], {'notification_channel_ids': [telegram['id'], first['id'], second['id']]})
+    observe()
+
+    attempts = {'one@example.org': 0, 'two@example.org': 0, 'telegram': 0}
+
+    def email_sender(_settings, configured, _alert, before_send):
+        assert before_send(remaining_seconds=15)
+        recipient = configured['recipient']
+        attempts[recipient] += 1
+        if recipient == 'one@example.org' and attempts[recipient] == 1:
+            return DeliveryOutcome('retry', 'smtp_rcpt_temporary')
+        if recipient == 'two@example.org':
+            return DeliveryOutcome('action_required', 'smtp_rcpt_rejected')
+        return DeliveryOutcome('sent')
+
+    def telegram_sender(_configured, _alert, before_send):
+        assert before_send(remaining_seconds=15)
+        attempts['telegram'] += 1
+        return DeliveryOutcome('sent')
+
+    monkeypatch.setattr('app.services.email_delivery.send_email_alert', email_sender)
+    monkeypatch.setattr('app.services.channel_tests.send_telegram_alert', telegram_sender)
+    delivery = DeliveryService(repo, settings)
+
+    for _ in range(3):
+        assert delivery.run_once()
+
+    alerts = repo.alerts()
+    first_alert = next(alert for alert in alerts if alert['channel_config_id'] == first['id'])
+    second_alert = next(alert for alert in alerts if alert['channel_config_id'] == second['id'])
+    telegram_alert = next(alert for alert in alerts if alert['channel_config_id'] == telegram['id'])
+    assert (first_alert['delivery_state'], first_alert['attempt_count']) == ('retry', 1)
+    assert (second_alert['delivery_state'], second_alert['attempt_count']) == ('action_required', 1)
+    assert (telegram_alert['status'], telegram_alert['attempt_count']) == ('sent', 1)
+
+    with repo.database.connection() as conn:
+        conn.execute('UPDATE alerts SET next_attempt_at=created_at WHERE id=?', (first_alert['id'],))
+    assert delivery.run_once()
+
+    assert attempts == {'one@example.org': 2, 'two@example.org': 1, 'telegram': 1}
+    alerts = repo.alerts()
+    first_alert = next(alert for alert in alerts if alert['channel_config_id'] == first['id'])
+    second_alert = next(alert for alert in alerts if alert['channel_config_id'] == second['id'])
+    telegram_alert = next(alert for alert in alerts if alert['channel_config_id'] == telegram['id'])
+    assert (first_alert['status'], first_alert['attempt_count']) == ('sent', 2)
+    assert (second_alert['delivery_state'], second_alert['attempt_count']) == ('action_required', 1)
+    assert (telegram_alert['status'], telegram_alert['attempt_count']) == ('sent', 1)
+
+
 def test_smtp_identity_change_fences_claim_before_data_permission(routed):
     _, repo, _, secrets, job, _, _, observe = routed
     _smtp(repo, secrets)

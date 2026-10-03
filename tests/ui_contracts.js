@@ -354,7 +354,7 @@ await test('settings autosave preserves edits during writes, skips invalid value
     await waitUntil(() => frame.contentDocument?.querySelector('#request-spacing'));
     const doc = frame.contentDocument, win = frame.contentWindow, input = doc.querySelector('#request-spacing');
     assert(!doc.querySelector('#settings-save-status'), 'Persistent save label remains');
-    assert(!doc.querySelector('[data-action="discard-settings"]') && !doc.querySelector('[type="submit"]'), 'Manual settings buttons remain');
+    assert(!doc.querySelector('[data-action="discard-settings"]') && !doc.querySelector('#settings-form [type="submit"]'), 'Manual settings buttons remain');
     const fetch = win.fetch.bind(win); let writes = 0, fail = false;
     win.fetch = async (url, options) => {
       if (options?.method === 'PUT') {
@@ -704,7 +704,8 @@ await test('Settings saves masked SMTP transport and email recipient, previews t
   const frame=document.createElement('iframe');frame.src='/#settings';document.body.append(frame);let email,createdJob;
   try {
     await waitUI(()=>frame.contentDocument?.querySelector('#smtp-form'));
-    const doc=frame.contentDocument,win=frame.contentWindow;win.confirm=()=>true;
+    const doc=frame.contentDocument,win=frame.contentWindow,confirmations=[];let approveSmtpChange=true,smtpWrites=0;
+    win.confirm=message=>{confirmations.push({message,writes:smtpWrites});return approveSmtpChange;};
     editControl(doc,win,'#smtp-host','smtp.example');
     editControl(doc,win,'#smtp-sender_email-action','replace');editControl(doc,win,'#smtp-sender_email','sender@example.org');
     editControl(doc,win,'#smtp-username-action','replace');editControl(doc,win,'#smtp-username','synthetic_user');
@@ -753,7 +754,24 @@ await test('Settings saves masked SMTP transport and email recipient, previews t
     doc.querySelector('#job-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
     await waitUI(()=>[...doc.querySelectorAll('#job-list h2')].some(node=>node.textContent==='Email route'));
     createdJob=(await api.listJobs()).find(item=>item.name==='Email route');equal(createdJob.notification_channel_ids,[email.id]);
+    await nativeFetch('/__test/checks',{method:'POST'});
+    const queued=(await (await nativeFetch('/api/v1/alerts?limit=100')).json()).find(alert=>alert.job_name==='Email route' && alert.status==='pending');
+    assert(queued,'fixture check should queue an email delivery for the route');
     win.location.hash='#settings';await waitUI(()=>doc.querySelector(`[data-channel-id="${email.id}"] [data-action="edit-channel"]`));
+    editControl(doc,win,'#smtp-host','smtp-renamed.example');
+    const originalFetch=win.fetch.bind(win);
+    win.fetch=async(input,init)=>{if(String(input).endsWith('/api/v1/settings/smtp') && init?.method==='PUT')smtpWrites++;return originalFetch(input,init);};
+    approveSmtpChange=false;
+    doc.querySelector('#smtp-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>confirmations.length===1);
+    assert(confirmations[0].message.includes('1 unsent email delivery') && confirmations[0].message.includes('Email route (1)'),'SMTP identity change should name its pending delivery');
+    equal(confirmations[0].writes,0,'confirmation must precede the settings write');equal(smtpWrites,0,'declining must not write SMTP settings');
+    equal((await api.getSmtp()).host,saved.host,'declining must preserve the saved SMTP host');
+    approveSmtpChange=true;
+    doc.querySelector('#smtp-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>doc.querySelector('#smtp-host')?.value==='smtp-renamed.example');
+    equal(confirmations.length,2);equal(confirmations[1].writes,0);equal(smtpWrites,1);
+    win.fetch=originalFetch;
     doc.querySelector(`[data-channel-id="${email.id}"] [data-action="edit-channel"]`).click();equal(doc.querySelector('#channel-recipient').value,'');
     editControl(doc,win,'#channel-recipient_action','clear');
     doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));

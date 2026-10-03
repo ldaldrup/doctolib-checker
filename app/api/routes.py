@@ -274,6 +274,20 @@ def create_router():
     def get_smtp_settings(request: Request):
         return smtp_public(request)
 
+    @router.post('/api/v1/settings/smtp/impact')
+    def preview_smtp_settings(body: SmtpTransportUpdateRequest, request: Request):
+        repository = request.app.state.repository
+        existing = repository.get_smtp_transport(private=True)
+        if existing is None:
+            raise HTTPException(503,detail={'code':'smtp_transport_unavailable'})
+        if existing['edit_version'] != body.expected_version:
+            raise version_conflict(VersionConflictError(existing['edit_version']))
+        values = smtp_values(request,body.model_dump(),existing)
+        destination_changed = (values['destination_identity'] != existing['destination_identity']
+            or bool(values['enabled']) != bool(existing['enabled']))
+        deliveries = repository.pending_smtp_deliveries() if destination_changed else []
+        return {'pending_email_deliveries':deliveries}
+
     @router.put('/api/v1/settings/smtp')
     def put_smtp_settings(body: SmtpTransportUpdateRequest, request: Request):
         repository = request.app.state.repository

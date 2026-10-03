@@ -130,6 +130,16 @@ class ChannelOperations:
         with self.database.connection() as conn:
             return self._smtp(conn.execute('SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone(),private)
 
+    def pending_smtp_deliveries(self):
+        """Return pending email deliveries that an SMTP destination change cancels."""
+        with self.database.connection() as conn:
+            rows = conn.execute("""SELECT j.id AS job_id,j.name AS job_name,COUNT(*) AS count
+                FROM alerts a JOIN notification_channels c ON c.id=a.channel_config_id
+                JOIN jobs j ON j.id=a.job_id
+                WHERE c.type='email' AND c.deleted=0 AND a.status IN ('pending','failed')
+                GROUP BY j.id,j.name ORDER BY j.name COLLATE NOCASE,j.id""").fetchall()
+            return [dict(row) for row in rows]
+
     def update_smtp_transport(self, values, expected_version, recover_failed=False):
         from app.storage.repositories import NotFoundError, VersionConflictError
         with self.database.connection() as conn:

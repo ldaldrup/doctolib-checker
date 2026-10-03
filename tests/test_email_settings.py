@@ -115,6 +115,40 @@ def test_smtp_identity_change_cancels_unsent_email_and_saved_test(tmp_path):
     assert tuple(row) == ('cancelled','destination_changed')
 
 
+def test_smtp_impact_reports_only_pending_deliveries_for_real_identity_changes(tmp_path):
+    client, repository, _ = setup(tmp_path)
+    configured = configure_smtp(client)
+    channel = make_email(client).json()
+    job = repository.create_job({
+        'name':'SMTP impact route','interval_seconds':300,'date_mode':'first_available','horizon_days':15,
+        'time_zone':'UTC','insurance_sector':'public','telehealth':False,'telegram_enabled':False,
+        'notification_channel_ids':[channel['id']],
+    },[{'booking_url':'https://www.doctolib.de/test/booking/availabilities?placeId=1&motiveIds%5B%5D=2',
+        'country':'de','profile_slug':'test','practice_id':'1','motive_id':'2','agenda_ids_str':'3',
+        'practice_name':'Practice','practitioner_name':'Doctor'}])
+    with repository.database.connection() as conn:
+        conn.execute("""INSERT INTO alerts(id,job_id,channel,event_type,dedupe_key,status,created_at,
+            channel_config_id,destination_version,credential_version,channel_name)
+            VALUES('pending-email',?,'email','slot_found','smtp-impact-pending','pending',?,?,?,?,?)""",
+            (job['id'],'2030-01-01T00:00:00+00:00',channel['id'],channel['destination_version'],
+             channel['credential_version'],channel['name']))
+
+    same_identity = client.post('/api/v1/settings/smtp/impact',json=smtp_body(configured['edit_version'],
+        sender_email='sender@example.com',username_action='keep',username=None,
+        password_action='keep',password=None))
+    assert same_identity.status_code == 200, same_identity.text
+    assert same_identity.json() == {'pending_email_deliveries':[]}
+    changed = client.post('/api/v1/settings/smtp/impact',json=smtp_body(configured['edit_version'],
+        host='smtp-new.example.com',sender_email_action='keep',sender_email=None,
+        username_action='keep',username=None,password_action='keep',password=None))
+    assert changed.status_code == 200, changed.text
+    assert changed.json() == {'pending_email_deliveries':[{'job_id':job['id'],'job_name':'SMTP impact route','count':1}]}
+    assert 'sender@example.com' not in changed.text and 'smtp-fixture-password' not in changed.text
+    assert repository.get_smtp_transport()['edit_version'] == configured['edit_version']
+    with repository.database.connection() as conn:
+        assert conn.execute("SELECT status FROM alerts WHERE id='pending-email'").fetchone()[0] == 'pending'
+
+
 def test_smtp_rejects_plaintext_and_header_injection(tmp_path):
     client, _, _ = setup(tmp_path)
     assert client.put('/api/v1/settings/smtp',json=smtp_body(

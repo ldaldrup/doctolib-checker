@@ -1,10 +1,10 @@
 # Doctolib Checker
 
-Check Doctolib appointment availability and get notified when a search matches. The checker never books appointments.
+Checks appointment availability and sends alerts. It never books appointments.
 
-## Run
+## Web app
 
-Requires Python 3.10+.
+Requires Python 3.10+:
 
 ```bash
 python -m venv .venv
@@ -12,50 +12,36 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Open three terminals, activate `.venv` in each, then run one process per terminal:
-
-- `python -m app.api.main` — web app and API
-- `python -m app.worker.main` — appointment checks
-- `python -m app.dispatcher` — notifications
-
-Open <http://127.0.0.1:8000> and create a search in **Jobs**. All processes must use the same database and app version. The default database is `./data/checker.sqlite3`; set `DATABASE_PATH` to change it.
-
-## Notifications
-
-Add Telegram, ntfy, HTTPS webhook or email destinations in **Settings**, test them, then select them on a job. Email uses one shared SMTP transport and one recipient per named channel. A successful test means the service accepted the message; it does not confirm delivery to a device or inbox.
-
-Set the same `NOTIFICATION_SECRET_KEY` in the API, worker and dispatcher environments. Generate one with:
+Run these in separate terminals, using the same code and database:
 
 ```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -m app.api.main       # UI and API
+python -m app.worker.main    # checks
+python -m app.dispatcher     # alerts
 ```
 
-Back up the key separately; saved credentials cannot be read without it. The app does not load `.env` files. Legacy Telegram environment credentials require an explicit import in Settings.
+Open <http://127.0.0.1:8000>. The default database is `./data/checker.sqlite3`; set `DATABASE_PATH` in each process to change it. Generate a Fernet key with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` and set the same `NOTIFICATION_SECRET_KEY` in all three processes before startup. `.env` is not loaded automatically; see [.env.example](.env.example).
 
-Webhooks require HTTPS. SMTP requires verified TLS on port 587 (STARTTLS) or 465 (implicit TLS). Private destinations and other SMTP ports require an exact `WEBHOOK_PRIVATE_ALLOWLIST` entry; see [.env.example](.env.example).
+## Searches and alerts
 
-## Searches
+Enter a full HTTPS Doctolib `/booking/availabilities` URL. Configure and test Telegram, ntfy, HTTPS webhook or email channels in **Settings**, then select them per job. Email uses one SMTP transport and one recipient per named channel. A successful test means the provider accepted the message.
 
-Use the full HTTPS `/booking/availabilities` URL, including its query string, practice ID and motive ID. Supported hosts are `doctolib.de` and `doctolib.fr`, including `www`.
+Webhooks require HTTPS. SMTP uses STARTTLS on 587 or implicit TLS on 465. Private destinations and nonstandard HTTPS/SMTP ports need an exact `WEBHOOK_PRIVATE_ALLOWLIST` entry. Checks run at least 5 minutes apart, with 3 seconds between Doctolib requests. **Check now** and search edits allow one extra check per job per minute, including while paused; a manual check can notify and leaves the job paused.
 
-Scheduled checks run no faster than every 300 seconds, with at least 3 seconds between Doctolib requests. **Check now** and edits to active search conditions allow one extra check per job per 60 seconds. A manual check can run on a paused job, notify its selected channels and leave it paused.
+## Legacy CLI
 
-## CLI
-
-The CLI uses a separate `config.json`. Copy `config.json.example` to `config.json` and add your booking URL and Telegram credentials, then run:
+The CLI uses a separate `config.json`. Copy `config.json.example`, add your Doctolib URL and optional Telegram credentials, then run:
 
 ```bash
-python checker.py
+cp config.json.example config.json
 python checker.py --once --dry-run
 ```
 
-`python checker.py` checks continuously. `--once` checks one cycle; `--dry-run` suppresses notifications but still contacts Doctolib. Keep `config.json` private.
+Dry run suppresses alerts but still contacts Doctolib. Keep `config.json` private.
 
-## Backups and access
+## Security and backup
 
-The app has no built-in authentication. Protect the UI and API with an authenticated reverse proxy before exposing them.
-
-Back up the database and `NOTIFICATION_SECRET_KEY` before upgrading. Backups exclude the key, and migrations may prevent an older app version from opening the database.
+The web app has no authentication and binds to localhost; put it behind an authenticated reverse proxy before exposing it. `.env.example` sets `API_HOST=0.0.0.0` for containers. Back up the database and notification key separately:
 
 ```bash
 python -m app.admin backup --source ./data/checker.sqlite3 --destination ./backup.zip
@@ -64,4 +50,4 @@ python -m app.admin verify --archive ./backup.zip --work-directory ./restore-che
 
 ## Development
 
-Keep development on the shared `feat/improvements` branch. Merge completed work into `master`; do not create additional branches.
+Use the shared `feat/improvements` branch. Merge completed work into local `master`; create no other branches.
