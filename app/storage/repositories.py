@@ -90,6 +90,29 @@ class Repository(ChannelOperations):
     def __init__(self, database, minimum_poll_interval_seconds=300):
         self.database = database
         self.minimum_poll_interval_seconds = minimum_poll_interval_seconds
+        self._notification_secrets = None
+        self._notification_allowlist = ()
+
+    def configure_notification_routing(self, settings):
+        """Apply this worker's key and SMTP egress policy to event routing."""
+        from app.notification_secrets import NotificationSecrets
+        self._notification_secrets = NotificationSecrets(settings.notification_secret_key)
+        self._notification_allowlist = settings.webhook_allowlist
+
+    def _email_channel_usable(self, conn, channel):
+        if self._notification_secrets is None:
+            return False
+        from app.services.email_delivery import mailbox, smtp_transport_usable
+        from app.notification_secrets import SecretUnavailable
+        transport = self._smtp(conn.execute(
+            'SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone(),private=True)
+        if not smtp_transport_usable(transport,self._notification_secrets,self._notification_allowlist):
+            return False
+        try:
+            mailbox(self._notification_secrets.decrypt(channel['email_recipient_ciphertext']))
+        except (SecretUnavailable,ValueError,TypeError):
+            return False
+        return True
 
     def configure_minimum(self, minimum_poll_interval_seconds):
         """Apply a raised server floor to persisted settings and existing jobs."""
@@ -669,14 +692,15 @@ class Repository(ChannelOperations):
         conn.executemany("INSERT INTO job_channels(job_id,channel_config_id) VALUES(?,?)",
                          [(job_id, channel_id) for channel_id in channel_ids])
 
-    @staticmethod
-    def _observe_event(conn, job, target, result_id, dedupe, revision):
+    def _observe_event(self, conn, job, target, result_id, dedupe, revision):
         if conn.execute("SELECT 1 FROM availability_events WHERE dedupe_key=?", (dedupe,)).fetchone():
             return
-        channels = [dict(row) for row in conn.execute("""SELECT c.id,c.type,c.name,c.destination_version,c.credential_version
+        channels = [dict(row) for row in conn.execute("""SELECT c.*
             FROM job_channels jc JOIN notification_channels c ON c.id=jc.channel_config_id
             WHERE jc.job_id=? AND c.enabled=1 AND c.deleted=0
             AND """+COMPLETE_SQL, (job['id'],))] if job['telegram_enabled'] else []
+        channels = [channel for channel in channels if channel['type'] != 'email' or
+                    self._email_channel_usable(conn,channel)]
         event_id, now = new_id(), precise_iso()
         conn.execute("""INSERT INTO availability_events
             (id,job_id,target_id,result_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)

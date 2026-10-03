@@ -24,6 +24,7 @@ class CheckService:
         self.doctolib = doctolib
         self.settings = settings
         self.notifier = notifier
+        self.repository.configure_notification_routing(settings)
 
     def _meta(self, target):
         return BookingMeta(

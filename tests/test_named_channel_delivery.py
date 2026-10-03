@@ -21,6 +21,7 @@ def routed(tmp_path):
     key = Fernet.generate_key().decode()
     secrets = NotificationSecrets(key)
     settings = Settings(notification_secret_key=key)
+    repo.configure_notification_routing(settings)
     def channel(name, chat):
         return repo.create_channel(dict(name=name, enabled=True,
             token_ciphertext=secrets.encrypt('123:test-token'),

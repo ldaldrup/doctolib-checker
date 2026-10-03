@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class Database:
@@ -20,7 +20,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+                if len(versions) != 1 or versions[0][0] not in range(1, 11):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" + CHANNEL_SCHEMA +
                 """
@@ -320,9 +320,19 @@ class Database:
                         if column.split()[0] not in channel_columns:
                             conn.execute('ALTER TABLE notification_channels ADD COLUMN '+column)
                     current_version = 9
+                if current_version == 9:
+                    channel_columns = {row[1] for row in conn.execute('PRAGMA table_info(notification_channels)')}
+                    if 'email_recipient_ciphertext' not in channel_columns:
+                        conn.execute('ALTER TABLE notification_channels ADD COLUMN email_recipient_ciphertext TEXT')
+                    current_version = 10
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
             conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            from app.storage.channel_operations import now_text
+            now = now_text()
+            conn.execute("""INSERT OR IGNORE INTO smtp_transport(singleton_id,enabled,port,tls_mode,edit_version,
+                destination_version,credential_version,created_at,updated_at)
+                VALUES(1,0,587,'starttls',1,1,1,?,?)""", (now,now))
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_event_destination ON alerts(event_id,channel_config_id,destination_version)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_results_known_run_target ON check_results(run_id,target_id) WHERE snapshot_known=1")
         with self.connection() as conn:

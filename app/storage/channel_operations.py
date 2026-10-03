@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS notification_channels (
  enabled INTEGER NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,edit_version INTEGER NOT NULL DEFAULT 1,
  destination_version INTEGER NOT NULL DEFAULT 1,credential_version INTEGER NOT NULL DEFAULT 1,
  token_ciphertext TEXT,chat_ciphertext TEXT,destination_identity TEXT,
+ email_recipient_ciphertext TEXT,
  endpoint_ciphertext TEXT,auth_type TEXT NOT NULL DEFAULT 'none',
  auth_token_ciphertext TEXT,auth_username_ciphertext TEXT,auth_password_ciphertext TEXT,
  ntfy_priority INTEGER NOT NULL DEFAULT 3,
@@ -25,10 +26,21 @@ CREATE TABLE IF NOT EXISTS channel_tests (
  credential_version INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',owner_token TEXT,claim_until TEXT,
  attempt_started_at TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,error_code TEXT,
  created_at TEXT NOT NULL,updated_at TEXT NOT NULL,expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS smtp_transport (
+ singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),enabled INTEGER NOT NULL DEFAULT 0,
+ host TEXT,port INTEGER NOT NULL DEFAULT 587,tls_mode TEXT NOT NULL DEFAULT 'starttls',
+ sender_name TEXT,sender_email_ciphertext TEXT,username_ciphertext TEXT,password_ciphertext TEXT,
+ destination_identity TEXT,edit_version INTEGER NOT NULL DEFAULT 1,
+ destination_version INTEGER NOT NULL DEFAULT 1,credential_version INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 """
 
-SECRET_COLUMNS = ('token_ciphertext','chat_ciphertext','endpoint_ciphertext','auth_token_ciphertext','auth_username_ciphertext','auth_password_ciphertext')
+SECRET_COLUMNS = ('token_ciphertext','chat_ciphertext','email_recipient_ciphertext','endpoint_ciphertext','auth_token_ciphertext','auth_username_ciphertext','auth_password_ciphertext')
 COMPLETE_SQL = """((c.type='telegram' AND c.token_ciphertext IS NOT NULL AND c.chat_ciphertext IS NOT NULL)
+ OR (c.type='email' AND c.email_recipient_ciphertext IS NOT NULL AND EXISTS(SELECT 1 FROM smtp_transport s
+ WHERE s.singleton_id=1 AND s.enabled=1 AND s.host IS NOT NULL AND s.sender_email_ciphertext IS NOT NULL
+ AND ((s.username_ciphertext IS NULL AND s.password_ciphertext IS NULL) OR
+ (s.username_ciphertext IS NOT NULL AND s.password_ciphertext IS NOT NULL))))
  OR (c.type IN ('ntfy','webhook') AND c.endpoint_ciphertext IS NOT NULL AND
  (c.auth_type='none' OR (c.auth_type='bearer' AND c.auth_token_ciphertext IS NOT NULL)
  OR (c.auth_type='basic' AND c.auth_username_ciphertext IS NOT NULL AND c.auth_password_ciphertext IS NOT NULL))))"""
@@ -37,6 +49,8 @@ COMPLETE_SQL = """((c.type='telegram' AND c.token_ciphertext IS NOT NULL AND c.c
 def channel_secret_columns(row):
     if row['type'] == 'telegram':
         return ('token_ciphertext','chat_ciphertext')
+    if row['type'] == 'email':
+        return ('email_recipient_ciphertext',)
     return ('endpoint_ciphertext',) + {'none': (), 'bearer': ('auth_token_ciphertext',),
         'basic': ('auth_username_ciphertext','auth_password_ciphertext')}[row['auth_type']]
 
@@ -62,11 +76,16 @@ class ChannelOperations:
         item['deleted'] = bool(item['deleted'])
         item['bot_token_set'] = bool(item['token_ciphertext'])
         item['chat_id_set'] = bool(item['chat_ciphertext'])
+        item['recipient_set'] = bool(item['email_recipient_ciphertext'])
         item['endpoint_set'] = bool(item['endpoint_ciphertext'])
-        item['auth_configured'] = item['type'] != 'telegram' and item['auth_type'] != 'none' and all(
+        item['auth_configured'] = item['type'] in ('ntfy','webhook') and item['auth_type'] != 'none' and all(
             item[column] for column in channel_secret_columns(item) if column != 'endpoint_ciphertext')
         item['credential_configured'] = channel_complete(item)
         item['usable'] = item['enabled'] and not item['deleted'] and item['credential_configured']
+        if item['type'] == 'email':
+            transport = self._smtp(conn.execute('SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone())
+            item['smtp_configured'] = bool(transport and transport['configured'])
+            item['usable'] = item['usable'] and bool(transport and transport['usable'])
         item['bot_token_masked'] = '••••' if item['bot_token_set'] else None
         item['chat_id_masked'] = '••••' if item['chat_id_set'] else None
         latest = conn.execute("SELECT * FROM channel_tests WHERE channel_config_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (item['id'],)).fetchone()
@@ -86,6 +105,68 @@ class ChannelOperations:
     def get_channel(self, channel_id, private=False):
         with self.database.connection() as conn:
             return self._channel(conn,conn.execute('SELECT * FROM notification_channels WHERE id=?',(channel_id,)).fetchone(),private)
+
+    @staticmethod
+    def _smtp(row, private=False):
+        if row is None:
+            return None
+        item = dict(row)
+        item['enabled'] = bool(item['enabled'])
+        item['sender_email_set'] = bool(item['sender_email_ciphertext'])
+        item['username_set'] = bool(item['username_ciphertext'])
+        item['password_set'] = bool(item['password_ciphertext'])
+        item['configured'] = bool(item['host'] and item['sender_email_set'] and
+            (item['username_set'] == item['password_set']))
+        item['usable'] = item['enabled'] and item['configured']
+        item['sender_email_masked'] = '••••' if item['sender_email_set'] else None
+        item['username_masked'] = '••••' if item['username_set'] else None
+        item['password_masked'] = '••••' if item['password_set'] else None
+        if not private:
+            for key in ('sender_email_ciphertext','username_ciphertext','password_ciphertext','destination_identity'):
+                item.pop(key)
+        return item
+
+    def get_smtp_transport(self, private=False):
+        with self.database.connection() as conn:
+            return self._smtp(conn.execute('SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone(),private)
+
+    def update_smtp_transport(self, values, expected_version, recover_failed=False):
+        from app.storage.repositories import NotFoundError, VersionConflictError
+        with self.database.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            before = conn.execute('SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone()
+            if before is None:
+                raise NotFoundError('smtp_transport_not_found')
+            if before['edit_version'] != expected_version:
+                raise VersionConflictError(before['edit_version'])
+            values = dict(values)
+            destination_changed = (values.get('destination_identity',before['destination_identity']) != before['destination_identity']
+                or ('enabled' in values and bool(values['enabled']) != bool(before['enabled'])))
+            credentials_changed = any(key in values and values[key] != before[key]
+                for key in ('username_ciphertext','password_ciphertext'))
+            changes = {key:value for key,value in values.items() if value != before[key]}
+            if changes:
+                changes.update(edit_version=before['edit_version']+1,updated_at=now_text())
+                if destination_changed:
+                    changes['destination_version'] = before['destination_version']+1
+                if credentials_changed:
+                    changes['credential_version'] = before['credential_version']+1
+                conn.execute('UPDATE smtp_transport SET '+','.join(key+'=?' for key in changes)+' WHERE singleton_id=1',tuple(changes.values()))
+            after = conn.execute('SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone()
+            if destination_changed or credentials_changed:
+                for row in conn.execute("SELECT * FROM notification_channels WHERE type='email' AND deleted=0").fetchall():
+                    old = dict(row)
+                    updated = dict(old)
+                    if destination_changed:
+                        updated['destination_version'] += 1
+                    if credentials_changed:
+                        updated['credential_version'] += 1
+                    conn.execute('UPDATE notification_channels SET destination_version=?,credential_version=? WHERE id=?',
+                        (updated['destination_version'],updated['credential_version'],row['id']))
+                    self._channel_changed(conn,old,updated,recover_failed=recover_failed)
+                    conn.execute("UPDATE channel_tests SET status='cancelled',error_code='channel_changed',updated_at=? WHERE channel_config_id=? AND status IN ('queued','running') AND attempt_started_at IS NULL",
+                        (now_text(),row['id']))
+            return self._smtp(after)
 
     def legacy_imported(self):
         with self.database.connection() as conn:
@@ -173,12 +254,12 @@ class ChannelOperations:
                 if prior['fingerprint'] != fingerprint:
                     raise ConflictError('idempotency_conflict')
                 return self._test(prior)
-            channel = conn.execute('SELECT * FROM notification_channels WHERE id=? AND deleted=0',(channel_id,)).fetchone()
+            channel = conn.execute('SELECT c.*,'+COMPLETE_SQL+' AS complete FROM notification_channels c WHERE c.id=? AND c.deleted=0',(channel_id,)).fetchone()
             if channel is None:
                 raise NotFoundError('channel_not_found')
             if channel['edit_version'] != expected_version:
                 raise VersionConflictError(channel['edit_version'])
-            if not channel['enabled'] or not channel_complete(channel):
+            if not channel['enabled'] or not channel['complete']:
                 raise ConflictError('channel_unusable')
             if validate_usable is not None:
                 validate_usable(dict(channel))

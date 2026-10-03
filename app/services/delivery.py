@@ -28,7 +28,9 @@ class DeliveryService:
             if (channel is None or channel['destination_version'] != claimed['destination_version']
                     or channel['credential_version'] != claimed['credential_version']):
                 raise SecretUnavailable('notification_channel_changed')
-            configured = channel_settings(self.settings, channel)
+            smtp_transport = (self.repository.get_smtp_transport(private=True)
+                              if channel['type'] == 'email' else None)
+            configured = channel_settings(self.settings, channel, smtp_transport)
         except SecretUnavailable as exc:
             self.repository.finish_unstarted_delivery(claimed['id'], token,
                 'retry' if str(exc)=='notification_channel_changed' else 'action_required', error_code=str(exc))

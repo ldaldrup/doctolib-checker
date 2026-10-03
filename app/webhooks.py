@@ -9,7 +9,8 @@ import ssl
 from urllib.parse import urlsplit, urlunsplit
 
 from app.notifications import (DeliveryOutcome, SEND_BUDGET_SECONDS,
-    CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)
+    CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES,
+    send_bounded_attempt)
 
 MAX_PAYLOAD_BYTES = 16384
 PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in
@@ -198,69 +199,10 @@ def _attempt(channel, alert, allowlist, before_send=None, resolver=socket.getadd
             connection.close()
 
 
-def _child(pipe, channel, alert, allowlist):
-    import os
-    import threading
-    watchdog = threading.Timer(SEND_BUDGET_SECONDS, lambda: os._exit(70))
-    watchdog.daemon = True
-    watchdog.start()
-    def permission(**kwargs):
-        pipe.send('ready')
-        return pipe.recv() is True
-    try:
-        pipe.send(_attempt(channel, alert, allowlist, before_send=permission))
-    finally:
-        watchdog.cancel()
-        pipe.close()
-
-
 def send_webhook_alert(settings, channel, alert, before_send=None, *, resolver=None, connection_factory=None):
     """One bounded attempt; injected transports are reserved for offline checks."""
     allowlist = getattr(settings, 'webhook_allowlist', ())
     if resolver is not None or connection_factory is not None:
         return _attempt(channel, alert, allowlist, before_send, resolver or socket.getaddrinfo,
                         connection_factory or PinnedHTTPSConnection)
-    import multiprocessing
-    import time
-    parent = child = process = None
-    permitted = False
-    deadline = time.monotonic() + SEND_BUDGET_SECONDS
-    try:
-        context = multiprocessing.get_context('spawn')
-        parent, child = context.Pipe()
-        process = context.Process(target=_child, args=(child, channel, alert, allowlist), daemon=True)
-        process.start()
-        child.close()
-        if parent.poll(max(0, deadline - time.monotonic())):
-            result = parent.recv()
-            if isinstance(result, DeliveryOutcome):
-                return result
-            if result == 'ready':
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or (before_send is not None and not before_send(remaining_seconds=remaining)):
-                    return DeliveryOutcome('retry', 'alert_no_longer_eligible', attempted=False)
-                permitted = True
-                if time.monotonic() < deadline:
-                    parent.send(True)
-                    if parent.poll(max(0, deadline - time.monotonic())):
-                        result = parent.recv()
-                        if isinstance(result, DeliveryOutcome):
-                            return result
-        return DeliveryOutcome('uncertain' if permitted else 'retry', 'webhook_attempt_deadline' if permitted else 'webhook_preparation_deadline', attempted=permitted)
-    except Exception:
-        return DeliveryOutcome('uncertain' if permitted else 'retry', 'webhook_transport_failure', attempted=permitted)
-    finally:
-        if child is not None:
-            child.close()
-        if parent is not None:
-            parent.close()
-        if process is not None and process.pid is not None:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=1)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=1)
-                if process.is_alive():
-                    raise RuntimeError('webhook_transport_cleanup_failed')
-            process.close()
+    return send_bounded_attempt(_attempt, (channel, alert, allowlist), before_send, 'webhook')

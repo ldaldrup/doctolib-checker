@@ -98,7 +98,7 @@ class SettingsUpdateRequest(VersionedRequest):
 
 
 class ChannelCreateRequest(StrictRequest):
-    type: Literal['telegram','ntfy','webhook'] = 'telegram'
+    type: Literal['telegram','ntfy','webhook','email'] = 'telegram'
     name: str = Field(min_length=1,max_length=120)
     enabled: bool = True
     token_action: Literal['replace','clear'] = 'replace'
@@ -113,6 +113,8 @@ class ChannelCreateRequest(StrictRequest):
     auth_username: Optional[str] = Field(default=None,max_length=200)
     auth_password: Optional[str] = Field(default=None,max_length=2000)
     ntfy_priority: StrictInt = Field(default=3,ge=1,le=5)
+    recipient_action: Literal['replace','clear'] = 'replace'
+    recipient: Optional[str] = Field(default=None,max_length=254)
 
 
 class ChannelUpdateRequest(VersionedRequest):
@@ -130,6 +132,8 @@ class ChannelUpdateRequest(VersionedRequest):
     auth_username: Optional[str] = Field(default=None,max_length=200)
     auth_password: Optional[str] = Field(default=None,max_length=2000)
     ntfy_priority: Optional[StrictInt] = Field(default=None,ge=1,le=5)
+    recipient_action: Literal['keep','replace','clear'] = 'keep'
+    recipient: Optional[str] = Field(default=None,max_length=254)
     recover_failed: bool = False
 
     @model_validator(mode='after')
@@ -141,3 +145,27 @@ class ChannelUpdateRequest(VersionedRequest):
 
 class ChannelDeleteRequest(VersionedRequest):
     confirmed: Literal[True]
+
+
+class SmtpTransportUpdateRequest(VersionedRequest):
+    enabled: bool
+    host: str = Field(default='', max_length=253)
+    port: StrictInt = Field(default=587, ge=1, le=65535)
+    tls_mode: Literal['starttls','implicit_tls'] = 'starttls'
+    sender_name: str = Field(default='', max_length=120)
+    sender_email_action: Literal['keep','replace','clear'] = 'keep'
+    sender_email: Optional[str] = Field(default=None, max_length=254)
+    username_action: Literal['keep','replace','clear'] = 'keep'
+    username: Optional[str] = Field(default=None, max_length=200)
+    password_action: Literal['keep','replace','clear'] = 'keep'
+    password: Optional[str] = Field(default=None, max_length=2000)
+    recover_failed: bool = False
+
+    @model_validator(mode='after')
+    def actions_match_values(self):
+        for action, value in ((self.sender_email_action, self.sender_email),
+                              (self.username_action, self.username),
+                              (self.password_action, self.password)):
+            if (action == 'replace') != (value is not None):
+                raise ValueError('Secret action and value must agree')
+        return self

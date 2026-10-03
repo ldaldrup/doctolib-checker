@@ -8,9 +8,10 @@ import re
 from fastapi import APIRouter, HTTPException, Query, Request, Response, Header, Body, status
 from requests import RequestException
 
-from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, StrictRequest
+from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest
 from app.notification_secrets import SecretUnavailable
-from app.services.channel_tests import notification_preview
+from app.services.channel_tests import notification_preview, synthetic_alert
+from app.services.email_delivery import email_preview, mailbox, smtp_transport_usable, validate_smtp_host
 from app.storage.channel_operations import channel_secret_columns
 from app.webhooks import validate_endpoint
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
@@ -49,7 +50,7 @@ def create_router():
         result["dispatcher_alive"] = bool(dispatcher and utc_now() - datetime.fromisoformat(
             dispatcher["last_seen_at"].replace("Z", "+00:00")
         ) <= timedelta(seconds=90))
-        result["telegram_configured"] = any(channel_public(request, item)["usable"] for item in request.app.state.repository.list_channels()["items"])
+        result["telegram_configured"] = any(item['type']=='telegram' and channel_public(request, item)["usable"] for item in request.app.state.repository.list_channels()["items"])
         return result
 
     @router.get("/api/v1/jobs")
@@ -247,7 +248,7 @@ def create_router():
         return {"edit_version": values["edit_version"], "default_interval_seconds": values["default_interval_seconds"],
                 "request_spacing_seconds": values["request_spacing_seconds"],
                 "minimum_poll_interval_seconds": settings.minimum_poll_interval_seconds,
-                "telegram_configured": any(channel_public(request,item)["usable"] for item in request.app.state.repository.list_channels()["items"]),
+                "telegram_configured": any(item['type']=='telegram' and channel_public(request,item)["usable"] for item in request.app.state.repository.list_channels()["items"]),
                 **notification_boundary(request),
                 "time_zone": settings.default_timezone}
 
@@ -265,9 +266,29 @@ def create_router():
         return {"edit_version": saved["edit_version"], "default_interval_seconds": saved["default_interval_seconds"],
                 "request_spacing_seconds": saved["request_spacing_seconds"],
                 "minimum_poll_interval_seconds": settings.minimum_poll_interval_seconds,
-                "telegram_configured": any(channel_public(request,item)["usable"] for item in request.app.state.repository.list_channels()["items"]),
+                "telegram_configured": any(item['type']=='telegram' and channel_public(request,item)["usable"] for item in request.app.state.repository.list_channels()["items"]),
                 **notification_boundary(request),
                 "time_zone": settings.default_timezone}
+
+    @router.get('/api/v1/settings/smtp')
+    def get_smtp_settings(request: Request):
+        return smtp_public(request)
+
+    @router.put('/api/v1/settings/smtp')
+    def put_smtp_settings(body: SmtpTransportUpdateRequest, request: Request):
+        repository = request.app.state.repository
+        existing = repository.get_smtp_transport(private=True)
+        if existing is None:
+            raise HTTPException(503,detail={'code':'smtp_transport_unavailable'})
+        values = smtp_values(request,body.model_dump(),existing)
+        try:
+            repository.update_smtp_transport(values,body.expected_version,
+                recover_failed=body.recover_failed)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
+        except NotFoundError:
+            raise HTTPException(503,detail={'code':'smtp_transport_unavailable'})
+        return smtp_public(request)
 
     @router.get('/api/v1/channels')
     def channels(request: Request):
@@ -359,6 +380,8 @@ def create_router():
         channel = request.app.state.repository.get_channel(channel_id)
         if channel is None or channel['deleted']:
             raise HTTPException(404,detail='channel_not_found')
+        if channel['type'] == 'email':
+            return email_preview(synthetic_alert())
         return notification_preview(channel)
 
     @router.post('/api/v1/channels/{channel_id}/tests',status_code=202)
@@ -371,6 +394,10 @@ def create_router():
                 secrets = request.app.state.notification_secrets
                 for column in channel_secret_columns(channel):
                     secrets.decrypt(channel[column])
+                if channel['type'] == 'email':
+                    mailbox(secrets.decrypt(channel['email_recipient_ciphertext']))
+                    if not smtp_public(request)['usable']:
+                        raise HTTPException(409,detail={'code':'smtp_transport_unusable'})
             except SecretUnavailable:
                 raise HTTPException(409,detail={'code':'channel_unusable'})
         try:
@@ -429,6 +456,91 @@ def fingerprint(values):
     return hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
+def smtp_public(request):
+    repository = request.app.state.repository
+    result = repository.get_smtp_transport()
+    raw = repository.get_smtp_transport(private=True)
+    if result is None or raw is None:
+        raise HTTPException(503,detail={'code':'smtp_transport_unavailable'})
+    result['usable'] = result['usable'] and smtp_transport_usable(
+        raw,request.app.state.notification_secrets,request.app.state.settings.webhook_allowlist)
+    return result
+
+
+def smtp_values(request,supplied,existing):
+    secrets = request.app.state.notification_secrets
+    host = supplied['host'].strip()
+    port = supplied['port']
+    tls_mode = supplied['tls_mode']
+    transport_address_changed = (host != existing['host'] or port != existing['port'] or
+        tls_mode != existing['tls_mode'])
+    if host and (supplied['enabled'] or transport_address_changed):
+        try:
+            host = validate_smtp_host(host,port,tls_mode,request.app.state.settings.webhook_allowlist)
+        except ValueError:
+            raise HTTPException(422,detail={'code':'smtp_invalid_transport'}) from None
+    sender_name = supplied['sender_name'].strip()
+    if len(sender_name) > 120 or any(ord(char) < 32 or ord(char) == 127 for char in sender_name):
+        raise HTTPException(422,detail={'code':'smtp_invalid_sender'})
+
+    identity_changed = (host != existing['host'] or port != existing['port'] or
+        tls_mode != existing['tls_mode'] or sender_name != (existing['sender_name'] or '') or
+        supplied['sender_email_action'] != 'keep')
+    need_plaintext = bool(supplied['enabled'])
+    plaintext, encrypted = {}, {}
+    for field,column,label in (
+        ('sender_email','sender_email_ciphertext','sender_email'),
+        ('username','username_ciphertext','username'),
+        ('password','password_ciphertext','password'),
+    ):
+        action = supplied[label+'_action']
+        value = supplied[label]
+        if action == 'replace':
+            if not secrets.available:
+                raise HTTPException(503,detail={'code':'notification_secret_key_unavailable'})
+            if label == 'sender_email':
+                try:
+                    value = mailbox(value.strip())
+                except ValueError:
+                    raise HTTPException(422,detail={'code':'smtp_invalid_sender'}) from None
+            elif (not value or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                raise HTTPException(422,detail={'code':'smtp_invalid_auth'})
+            plaintext[label] = value
+            encrypted[column] = secrets.encrypt(value)
+        elif action == 'clear':
+            encrypted[column] = None
+            plaintext[label] = None
+        else:
+            encrypted[column] = existing[column]
+            required_for_identity = label == 'sender_email' and identity_changed and supplied['sender_email_action'] == 'keep'
+            if existing[column] and (need_plaintext or required_for_identity):
+                try:
+                    plaintext[label] = secrets.decrypt(existing[column])
+                except SecretUnavailable as exc:
+                    raise HTTPException(503,detail={'code':str(exc)}) from None
+            else:
+                plaintext[label] = None
+    if bool(encrypted['username_ciphertext']) != bool(encrypted['password_ciphertext']):
+        raise HTTPException(422,detail={'code':'smtp_auth_pair_required'})
+
+    identity = existing['destination_identity']
+    if identity_changed:
+        identity = None
+    if identity_changed and host and plaintext['sender_email']:
+        identity = secrets.identity(json.dumps(
+            [host,port,tls_mode,sender_name,plaintext['sender_email']],
+            ensure_ascii=True,separators=(',',':')))
+    if supplied['enabled'] and (not host or not identity or
+            bool(encrypted['username_ciphertext']) != bool(encrypted['password_ciphertext'])):
+        raise HTTPException(422,detail={'code':'smtp_configuration_incomplete'})
+    if supplied['recover_failed'] and identity != existing['destination_identity']:
+        raise HTTPException(422,detail={'code':'recovery_requires_same_destination'})
+    return {
+        'enabled':int(supplied['enabled']),'host':host or None,'port':port,'tls_mode':tls_mode,
+        'sender_name':sender_name or None,'destination_identity':identity,**encrypted,
+    }
+
+
 def notification_boundary(request):
     settings = request.app.state.settings
     return {'notification_secret_configured':request.app.state.notification_secrets.available,
@@ -443,9 +555,13 @@ def channel_public(request,channel):
         secrets = request.app.state.notification_secrets
         for column in channel_secret_columns(raw):
             secrets.decrypt(raw[column])
-        if raw['type'] != 'telegram' and raw['endpoint_ciphertext']:
+        if raw['type'] in ('ntfy','webhook') and raw['endpoint_ciphertext']:
             _,host = validate_endpoint(secrets.decrypt(raw['endpoint_ciphertext']),raw['type'],request.app.state.settings.webhook_allowlist)
             public['endpoint_host'] = host[:253]
+        elif raw['type'] == 'email':
+            mailbox(secrets.decrypt(raw['email_recipient_ciphertext']))
+            public['smtp_usable'] = smtp_public(request)['usable']
+            public['usable'] = public['usable'] and public['smtp_usable']
     except SecretUnavailable:
         public['usable'] = False
     except ValueError:
@@ -454,21 +570,67 @@ def channel_public(request,channel):
     return public
 
 
+def email_values(request,supplied,existing,values):
+    secrets = request.app.state.notification_secrets
+    unsupported = ('bot_token','chat_id','endpoint','auth_token','auth_username','auth_password')
+    if any(supplied.get(field) is not None for field in unsupported):
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    for field,expected in (('token_action','keep' if existing else 'replace'),
+                           ('chat_action','keep' if existing else 'replace'),
+                           ('endpoint_action','keep' if existing else 'replace'),
+                           ('auth_action','keep')):
+        if supplied.get(field,expected) != expected:
+            raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    if supplied.get('auth_type','none') != 'none' or supplied.get('ntfy_priority',3) != 3:
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    action = supplied.get('recipient_action','keep' if existing else 'replace')
+    address = supplied.get('recipient')
+    if action == 'keep':
+        if address is not None:
+            raise HTTPException(422,detail={'code':'credential_action_required'})
+        if supplied.get('recover_failed') and existing:
+            values['destination_identity'] = existing['destination_identity']
+        return values
+    if address is not None and action == 'clear':
+        raise HTTPException(422,detail={'code':'credential_action_required'})
+    if action == 'clear':
+        if not existing:
+            raise HTTPException(422,detail={'code':'email_recipient_required'})
+        values.update(email_recipient_ciphertext=None,destination_identity=None)
+    else:
+        if not secrets.available:
+            raise HTTPException(503,detail={'code':'notification_secret_key_unavailable'})
+        try:
+            address = mailbox((address or '').strip())
+        except ValueError:
+            raise HTTPException(422,detail={'code':'smtp_invalid_recipient'}) from None
+        values.update(email_recipient_ciphertext=secrets.encrypt(address),
+            destination_identity=secrets.identity('email:'+address))
+    if supplied.get('recover_failed') and (not existing or
+            values['destination_identity'] != existing['destination_identity']):
+        raise HTTPException(422,detail={'code':'recovery_requires_same_destination'})
+    return values
+
+
 def credential_values(request,supplied,existing=None):
     secrets = request.app.state.notification_secrets
     values = {key:supplied[key] for key in ('name','enabled') if key in supplied}
     if 'name' in values:
         values['name'] = values['name'].strip()
-        if not values['name']:
+        if not values['name'] or any(ord(char) < 32 or ord(char) == 127 for char in values['name']):
             raise HTTPException(422,detail={'code':'invalid_channel_name'})
     kind = existing['type'] if existing else supplied.get('type','telegram')
     if not existing:
         values['type'] = kind
+    if kind == 'email':
+        return email_values(request,supplied,existing,values)
     if kind != 'telegram':
         return endpoint_values(request,supplied,existing,values,kind)
-    if any(supplied.get(field) is not None for field in ('endpoint','auth_token','auth_username','auth_password')) or supplied.get('auth_type','none') != 'none':
+    if any(supplied.get(field) is not None for field in ('endpoint','auth_token','auth_username','auth_password','recipient')) or supplied.get('auth_type','none') != 'none':
         raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
-    if supplied.get('endpoint_action','keep' if existing else 'replace') != ('keep' if existing else 'replace') or supplied.get('auth_action','keep') != 'keep' or supplied.get('ntfy_priority',3) != 3:
+    if (supplied.get('endpoint_action','keep' if existing else 'replace') != ('keep' if existing else 'replace') or
+            supplied.get('recipient_action','keep' if existing else 'replace') != ('keep' if existing else 'replace') or
+            supplied.get('auth_action','keep') != 'keep' or supplied.get('ntfy_priority',3) != 3):
         raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
     plaintext = {}
     changed = False
@@ -514,8 +676,11 @@ def job_public(request,job):
             secrets = request.app.state.notification_secrets
             for column in channel_secret_columns(raw):
                 secrets.decrypt(raw[column])
-            if raw['type'] != 'telegram':
+            if raw['type'] in ('ntfy','webhook'):
                 validate_endpoint(secrets.decrypt(raw['endpoint_ciphertext']),raw['type'],request.app.state.settings.webhook_allowlist)
+            elif raw['type'] == 'email':
+                mailbox(secrets.decrypt(raw['email_recipient_ciphertext']))
+                channel['usable'] = channel['usable'] and smtp_public(request)['usable']
         except (SecretUnavailable, ValueError):
             channel['usable'] = False
     return job
@@ -523,9 +688,11 @@ def job_public(request,job):
 
 def endpoint_values(request,supplied,existing,values,kind):
     secrets = request.app.state.notification_secrets
-    if any(supplied.get(field) is not None for field in ('bot_token','chat_id')):
+    if any(supplied.get(field) is not None for field in ('bot_token','chat_id','recipient')):
         raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
     if any(supplied.get(field,'keep' if existing else 'replace') != ('keep' if existing else 'replace') for field in ('token_action','chat_action')):
+        raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
+    if supplied.get('recipient_action','keep' if existing else 'replace') != ('keep' if existing else 'replace'):
         raise HTTPException(422,detail={'code':'unsupported_channel_fields'})
     if kind == 'ntfy':
         if 'ntfy_priority' in supplied:

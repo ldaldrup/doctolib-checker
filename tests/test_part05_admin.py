@@ -25,7 +25,7 @@ def test_restored_create_replays_without_metadata_and_preserves_settings_version
     archive=tmp_path/'create.zip'
     admin.backup(Path(settings.database_path),archive)
     work=tmp_path/'verify'
-    assert admin.verify(archive,work)['restored_schema_version']==9
+    assert admin.verify(archive,work)['restored_schema_version']==10
     restored=Repository(Database(str(work/'restored.sqlite3')))
     doctolib.resolve=lambda _url: pytest.fail('metadata on completed replay')
     with TestClient(create_app(replace(settings,database_path=restored.database.path),restored,doctolib)) as app:

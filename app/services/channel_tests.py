@@ -14,8 +14,21 @@ def synthetic_alert():
             'checked_at':'2030-01-02T09:00:00+00:00'}
 
 
-def channel_settings(settings, channel):
+def channel_settings(settings, channel, smtp_transport=None):
     secrets = NotificationSecrets(settings.notification_secret_key)
+    if channel['type'] == 'email':
+        if (not smtp_transport or not smtp_transport['enabled'] or
+                not smtp_transport['configured']):
+            raise SecretUnavailable('smtp_transport_unavailable')
+        return {'type':'email', 'id':channel['id'],
+            'recipient':secrets.decrypt(channel['email_recipient_ciphertext']),
+            'transport':{
+                'host':smtp_transport['host'], 'port':smtp_transport['port'],
+                'tls_mode':smtp_transport['tls_mode'], 'sender_name':smtp_transport['sender_name'] or '',
+                'sender_email':secrets.decrypt(smtp_transport['sender_email_ciphertext']),
+                'username':secrets.decrypt(smtp_transport['username_ciphertext']) if smtp_transport['username_ciphertext'] else '',
+                'password':secrets.decrypt(smtp_transport['password_ciphertext']) if smtp_transport['password_ciphertext'] else '',
+            }}
     if channel['type'] != 'telegram':
         configured = {key:channel[key] for key in ('type','auth_type','ntfy_priority')}
         configured['endpoint'] = secrets.decrypt(channel['endpoint_ciphertext'])
@@ -30,6 +43,9 @@ def channel_settings(settings, channel):
 
 def send_configured(settings, configured, alert, before_send):
     if isinstance(configured, dict):
+        if configured['type'] == 'email':
+            from app.services.email_delivery import send_email_alert
+            return send_email_alert(settings, configured, alert, before_send=before_send)
         from app.webhooks import send_webhook_alert
         return send_webhook_alert(settings, configured, alert, before_send=before_send)
     return send_telegram_alert(configured, alert, before_send=before_send)
@@ -38,6 +54,9 @@ def send_configured(settings, configured, alert, before_send):
 def notification_preview(channel):
     if channel['type'] == 'telegram':
         return {'html':format_slot_alert(synthetic_alert())}
+    if channel['type'] == 'email':
+        from app.services.email_delivery import email_preview
+        return email_preview(synthetic_alert())
     from app.webhooks import webhook_payload
     return {'json':webhook_payload({'type':channel['type'],'endpoint':'https://example.org/example',
                                   'ntfy_priority':channel['ntfy_priority']}, synthetic_alert())}
@@ -59,7 +78,9 @@ def run_test_once(repository,settings,sender=None):
                 channel['credential_version'] != test['credential_version']):
             repository.begin_channel_test_attempt(test['id'],test['owner_token'])
             return True
-        configured = channel_settings(settings,channel)
+        smtp_transport = (repository.get_smtp_transport(private=True)
+                          if channel['type'] == 'email' else None)
+        configured = channel_settings(settings,channel,smtp_transport)
         alert = {**synthetic_alert(), 'event_id':test['id']}
         if sender is None:
             outcome = send_configured(settings,configured,alert,before_send)

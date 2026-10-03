@@ -1,4 +1,4 @@
-"""Schema-8 recovery keeps routing evidence and requires the external key."""
+"""Backup rehearsal retains encrypted channels and delivery history."""
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
@@ -25,7 +25,7 @@ def test_schema8_restore_preserves_encrypted_destination_and_event_routing(tmp_p
     admin.backup(Path(settings.database_path), archive)
     work = tmp_path / 'restore'
     report = admin.verify(archive, work)
-    assert report['backup_schema_version'] == report['restored_schema_version'] == 9
+    assert report['backup_schema_version'] == report['restored_schema_version'] == 10
     restored = Repository(Database(str(work / 'restored.sqlite3')))
     copied = restored.get_channel(channel['id'], private=True)
     assert copied == original
@@ -54,7 +54,7 @@ def test_schema7_backup_migrates_without_replaying_current_episode(tmp_path):
     archive = tmp_path / 'legacy.zip'
     assert admin.backup(Path(settings.database_path), archive)['schema_version'] == 7
     work = tmp_path / 'migrated'
-    assert admin.verify(archive, work)['restored_schema_version'] == 9
+    assert admin.verify(archive, work)['restored_schema_version'] == 10
     restored = Repository(Database(str(work / 'restored.sqlite3')))
     historical = restored.alerts()[0]
     assert historical['id'] == original['id']
@@ -66,9 +66,27 @@ def test_schema7_backup_migrates_without_replaying_current_episode(tmp_path):
         assert conn.execute('SELECT COUNT(*) FROM job_channels').fetchone()[0] == 0
 
 
-def test_schema8_backup_refuses_missing_test_attempt_fence(tmp_path):
+def test_schema10_backup_refuses_missing_test_attempt_fence(tmp_path):
     _, repository, settings, _ = setup_backend(tmp_path)
     with sqlite3.connect(settings.database_path) as conn:
         conn.execute('ALTER TABLE channel_tests DROP COLUMN claim_until')
     with pytest.raises(admin.AdminError, match='incomplete_checker_schema'):
         admin.backup(Path(settings.database_path), tmp_path / 'invalid.zip')
+
+
+def test_schema9_restore_adds_email_recipient_and_empty_smtp_transport(tmp_path):
+    source = Database(str(tmp_path / 'schema9.sqlite3'))
+    source.initialize()
+    with source.connection() as conn:
+        conn.execute('ALTER TABLE notification_channels DROP COLUMN email_recipient_ciphertext')
+        conn.execute('DROP TABLE smtp_transport')
+        conn.execute('UPDATE schema_version SET version=9')
+    archive = tmp_path / 'schema9.zip'
+    assert admin.backup(Path(source.path), archive)['schema_version'] == 9
+    work = tmp_path / 'schema9-restore'
+    assert admin.verify(archive, work)['restored_schema_version'] == 10
+    with sqlite3.connect(work / 'restored.sqlite3') as conn:
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(notification_channels)')}
+        assert 'email_recipient_ciphertext' in columns
+        transport = conn.execute('SELECT enabled,port,tls_mode FROM smtp_transport WHERE singleton_id=1').fetchone()
+        assert transport == (0,587,'starttls')

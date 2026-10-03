@@ -194,7 +194,7 @@ def test_real_tls_verifies_original_hostname_and_sni_without_resolving_again(tmp
     assert seen == ['receiver.example', 'wrong.example']
 
 
-def _hanging_child(pipe, channel, alert, allowlist):
+def _hanging_child(pipe, attempt, args, prefix):
     import time
     pipe.send('ready')
     pipe.recv()
@@ -204,11 +204,11 @@ def _hanging_child(pipe, channel, alert, allowlist):
 def test_production_parent_bounds_lost_acknowledgement_and_denied_permission(monkeypatch):
     import multiprocessing
     import time
-    import app.webhooks as webhooks
+    import app.notifications as notifications
     context = multiprocessing.get_context('fork')
     monkeypatch.setattr(multiprocessing, 'get_context', lambda name: context)
-    monkeypatch.setattr(webhooks, '_child', _hanging_child)
-    monkeypatch.setattr(webhooks, 'SEND_BUDGET_SECONDS', 0.1)
+    monkeypatch.setattr(notifications, '_bounded_attempt_child', _hanging_child)
+    monkeypatch.setattr(notifications, 'SEND_BUDGET_SECONDS', 0.1)
     start = time.monotonic()
     channel = {'type': 'webhook', 'endpoint': 'https://receiver.example/'}
     result = send_webhook_alert(SimpleNamespace(), channel, {}, before_send=lambda **kw: True)
@@ -229,12 +229,12 @@ def test_spawn_child_rejects_invalid_endpoint_before_permission():
 def test_child_watchdog_bounds_transport_without_parent(monkeypatch):
     import multiprocessing
     import time
-    import app.webhooks as webhooks
-    monkeypatch.setattr(webhooks, 'SEND_BUDGET_SECONDS', 0.1)
-    monkeypatch.setattr(webhooks, '_attempt', lambda *args, **kwargs: time.sleep(10))
+    import app.notifications as notifications
+    monkeypatch.setattr(notifications, 'SEND_BUDGET_SECONDS', 0.1)
     context = multiprocessing.get_context('fork')
     parent, child = context.Pipe()
-    process = context.Process(target=webhooks._child, args=(child, {}, {}, ()))
+    process = context.Process(target=notifications._bounded_attempt_child,
+                              args=(child, lambda *args, **kwargs: time.sleep(10), (), 'webhook'))
     try:
         process.start()
         child.close()

@@ -77,6 +77,8 @@ const page = ({limit = 100, offset = 0, status} = {}) => {
 };
 
 export const api = {
+  getSmtp: () => request('/settings/smtp'),
+  updateSmtp: (values, version) => request('/settings/smtp', {method: 'PUT', body: {...values, expected_version: version}}),
   listChannels: options => request("/channels", options),
   createChannel: (values, key) => request("/channels", {method: "POST", body: values, headers: {"Idempotency-Key": key}}),
   updateChannel: (id, values, version) => request(`/channels/${identifier(id)}`, {method: "PATCH", body: {...values, expected_version: version}}),

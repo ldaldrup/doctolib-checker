@@ -68,6 +68,13 @@
 .form-error { margin: 0; color: var(--color-danger); font-size: 12px; font-weight: 600; }
 
 .settings-sections { display: grid; gap: 20px; }
+.settings-panels { display: grid; gap: 24px; }
+#smtp-settings .panel-header { justify-content: flex-start; gap: 12px; }
+#smtp-settings .panel-header > svg { width: 20px; height: 20px; flex-shrink: 0; color: var(--color-primary); }
+#smtp-settings .panel-header h2 { font-weight: 500; }
+#smtp-settings > p, #smtp-settings > .channel-form { margin: 16px 20px; }
+.smtp-connection { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(180px, 2fr); gap: 12px; }
+.channel-form .select { width: auto; min-width: 160px; max-width: 100%; justify-self: start; }
 .settings-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 20px; min-height: 72px; padding: 14px 20px; border-bottom: 1px solid var(--color-border); }
 .settings-row:last-child { border-bottom: 0; }
 .settings-row h3 { margin: 0 0 2px; font-size: 13px; }
@@ -129,6 +136,7 @@
   .settings-interval .choice-row { min-width: 0; }
 }
 @media (max-width: 480px) {
+  .smtp-connection { grid-template-columns: 1fr; }
   .settings-control { flex-wrap: wrap; }
   .settings-interval .choice-row { gap: 3px; }
   .settings-interval .choice { padding-inline: 3px; }

@@ -142,6 +142,86 @@ READ_TIMEOUT_SECONDS = 7.0
 MAX_RESPONSE_BYTES = 65536
 
 
+def _bounded_attempt_child(pipe, attempt, args, prefix):
+    import os
+    import threading
+
+    watchdog = threading.Timer(SEND_BUDGET_SECONDS, lambda: os._exit(70))
+    watchdog.daemon = True
+    watchdog.start()
+    permitted = False
+
+    def permission(**kwargs):
+        nonlocal permitted
+        pipe.send("ready")
+        permitted = pipe.recv() is True
+        return permitted
+
+    try:
+        try:
+            pipe.send(attempt(*args, before_send=permission))
+        except BaseException:
+            pipe.send(DeliveryOutcome("uncertain" if permitted else "retry",
+                                      f"{prefix}_transport_failure", attempted=permitted))
+    finally:
+        watchdog.cancel()
+        pipe.close()
+
+
+def send_bounded_attempt(attempt, args, before_send, prefix):
+    """Run one prepared send with a hard deadline and persisted send gate."""
+    import multiprocessing
+    import time
+
+    parent = child = process = None
+    permitted = False
+    deadline = time.monotonic() + SEND_BUDGET_SECONDS
+    try:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(target=_bounded_attempt_child,
+                                  args=(child, attempt, args, prefix), daemon=True)
+        process.start()
+        child.close()
+        if parent.poll(max(0, deadline - time.monotonic())):
+            result = parent.recv()
+            if isinstance(result, DeliveryOutcome):
+                return result
+            if result == "ready":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (before_send is not None and
+                        not before_send(remaining_seconds=remaining)):
+                    return DeliveryOutcome("retry", "alert_no_longer_eligible", attempted=False)
+                permitted = True
+                if time.monotonic() < deadline:
+                    parent.send(True)
+                    if parent.poll(max(0, deadline - time.monotonic())):
+                        result = parent.recv()
+                        if isinstance(result, DeliveryOutcome):
+                            return result
+        return DeliveryOutcome("uncertain" if permitted else "retry",
+                               f"{prefix}_{'attempt' if permitted else 'preparation'}_deadline",
+                               attempted=permitted)
+    except Exception:
+        return DeliveryOutcome("uncertain" if permitted else "retry",
+                               f"{prefix}_transport_failure", attempted=permitted)
+    finally:
+        if child is not None:
+            child.close()
+        if parent is not None:
+            parent.close()
+        if process is not None and process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+                if process.is_alive():
+                    raise RuntimeError(f"{prefix}_transport_cleanup_failed")
+            process.close()
+
+
 def _retry_after(response, body):
     value = body.get("parameters", {}).get("retry_after") if isinstance(body, dict) else None
     if value is None:
