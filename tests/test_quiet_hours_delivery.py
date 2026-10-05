@@ -200,6 +200,22 @@ def test_quiet_release_preserves_delivery_retry_backoff(tmp_path, clock):
     assert sender.sent == []
 
     clock[0] = retry_at
+    oldest = repository.dashboard_status()["oldest_ready_delivery_at"]
+    assert oldest == alert["created_at"]
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE alerts SET delivery_epoch_at='2026-10-04T21:39:00+00:00' WHERE id=?", (alert["id"],))
+    assert repository.dashboard_status()["oldest_ready_delivery_at"] is None
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE alerts SET delivery_epoch_at=? WHERE id=?", (retry_at.isoformat(), alert["id"]))
+    assert repository.dashboard_status()["oldest_ready_delivery_at"] == alert["created_at"]
+    with repository.database.connection() as conn:
+        conn.execute("""UPDATE alerts SET claim_owner_token='stale',claim_until='2026-10-05T21:39:00+00:00',
+            attempt_started_at='2026-10-05T21:38:00+00:00' WHERE id=?""", (alert["id"],))
+    assert repository.dashboard_status()["oldest_ready_delivery_at"] is None
+    with repository.database.connection() as conn:
+        conn.execute("""UPDATE alerts SET claim_owner_token=NULL,claim_until=NULL,attempt_started_at=NULL
+            WHERE id=?""", (alert["id"],))
+    assert repository.dashboard_status()["oldest_ready_delivery_at"] == alert["created_at"]
     assert delivery.run_once() is True
     assert len(sender.sent) == 1
 

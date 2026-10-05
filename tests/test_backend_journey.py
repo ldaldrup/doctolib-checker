@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.app import create_app
-from app.doctolib import DoctolibClient
+from app.doctolib import DoctolibClient, DoctolibHTTPError
 from app.models import AvailabilityResult
 from app.services.checks import CheckService
 from app.services.delivery import DeliveryService
@@ -457,6 +457,100 @@ def test_run_history_paginates_runs_and_keeps_all_target_results_together(tmp_pa
     assert newest[0]["id"] != older[0]["id"]
 
 
+def test_activity_api_reports_safe_partial_run_and_destination_acceptance(tmp_path):
+    client, repository, settings, _doctolib = setup_backend(tmp_path)
+
+    class DiagnosticDoctolib(FixtureDoctolib):
+        def check(self, booking_url, search, meta=None, now=None):
+            if "source=forbidden" in booking_url:
+                raise DoctolibHTTPError(403)
+            if "source=throttled" in booking_url:
+                raise DoctolibHTTPError(429, datetime.now(timezone.utc) + timedelta(minutes=2))
+            if "source=timeout" in booking_url:
+                raise requests.Timeout("https://private.example/raw-token/timeout")
+            if "source=unknown" in booking_url:
+                raise requests.HTTPError("https://private.example/raw-token/unknown")
+            if "source=malformed" in booking_url:
+                return AvailabilityResult(status="error", slot_count=0, earliest_slot=None,
+                    count_complete=False, error_code="invalid_availability_response",
+                    error_message="https://private.example/raw-token/body",
+                    error_category="malformed_response")
+            return super().check(booking_url, search, meta=meta, now=now)
+
+    doctolib = DiagnosticDoctolib()
+    client.app.state.doctolib = doctolib
+    job_response = client.post("/api/v1/jobs", json={
+            "name": "Activity diagnostics", "target_urls": [
+            URL + "&source=available", URL + "&source=forbidden", URL + "&source=throttled",
+            URL + "&source=timeout", URL + "&source=malformed", URL + "&source=unknown"],
+        "interval_seconds": 300, "telegram_enabled": True,
+    })
+    assert job_response.status_code == 201, job_response.text
+    job = job_response.json()
+    notifier = FakeNotifier()
+    Journey(repository, doctolib, settings, notifier=notifier).run_due()
+
+    response = client.get(f"/api/v1/activity?job_id={job['id']}")
+    assert response.status_code == 200
+    payload = response.json()
+    run = payload["items"][0]
+    assert run["outcome"] == "partial_error"
+    assert run["history_state"] == "current"
+    assert run["coverage_complete"] and run["target_total"] == 6
+    assert [item["error_category"] for item in run["results"]] == [
+        None, "upstream_rejected", "throttled", "timeout", "malformed_response", "unknown"]
+    assert run["results"][2]["upstream_status"] == 429
+    assert run["results"][2]["retry_at"]
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE check_runs SET requested_at=NULL WHERE id=?", (run["id"],))
+    run = client.get(f"/api/v1/activity?job_id={job['id']}").json()["items"][0]
+    assert run["requested_at"] is None
+    delivery = run["results"][0]["deliveries"][0]
+    assert delivery["status"] == "sent"
+    assert delivery["originating_run_id"] == run["id"]
+    assert "accepted_at" in delivery and "booking_url" not in delivery
+    assert len(notifier.sent) == 1
+    assert "private.example" not in response.text
+    assert "raw-token" not in response.text
+    assert "booking_url" not in response.text and "search_snapshot" not in response.text
+
+    detail = client.get(f"/api/v1/activity?job_id={job['id']}&run_id={run['id']}")
+    assert detail.status_code == 200 and detail.json()["items"][0]["id"] == run["id"]
+    assert client.get("/api/v1/activity?limit=101").status_code == 422
+    Database(str(tmp_path / "checker.sqlite3")).initialize()
+    assert client.get("/api/v1/activity?run_id=missing").status_code == 404
+
+
+def test_activity_delivery_stays_on_origin_run_across_pages(tmp_path):
+    client, repository, settings, doctolib = setup_backend(tmp_path)
+    job = create_job(client)
+    checker = CheckService(repository, doctolib, settings)
+    checker.run_due()
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE jobs SET next_check_at='2000-01-01T00:00:00+00:00',last_started_at='2000-01-01T00:00:00+00:00',last_finished_at='2000-01-01T00:00:00+00:00' WHERE id=?", (job['id'],))
+    checker.run_due()
+
+    first_page = client.get(f"/api/v1/activity?job_id={job['id']}&limit=1").json()
+    latest = first_page['items'][0]
+    assert first_page['has_more'] and first_page['next_before_run_id'] == latest['id']
+    cursor = first_page['next_before_run_id']
+    older_page = client.get(f"/api/v1/activity?job_id={job['id']}&limit=1&before_run_id={cursor}").json()
+    assert len(older_page['items']) == 1
+    origin = older_page['items'][0]
+    assert latest['id'] != origin['id']
+    assert not [delivery for result in latest['results'] for delivery in result['deliveries']]
+    deliveries = [delivery for result in origin['results'] for delivery in result['deliveries']]
+    assert len(deliveries) == 1
+    assert deliveries[0]['originating_run_id'] == origin['id']
+    assert deliveries[0]['confirmation_run_id'] == latest['id']
+    with repository.database.connection() as conn:
+        conn.execute("UPDATE jobs SET next_check_at='2000-01-01T00:00:00+00:00',last_started_at='2000-01-01T00:00:00+00:00',last_finished_at='2000-01-01T00:00:00+00:00' WHERE id=?", (job['id'],))
+    checker.run_due()
+    older_page = client.get(f"/api/v1/activity?job_id={job['id']}&limit=1&before_run_id={cursor}").json()
+    assert len(older_page['items']) == 1
+    assert older_page['items'][0]['id'] == origin['id']
+
+
 def test_run_with_no_results_is_visible_in_history(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path, status="no_availability")
     job = create_job(client)
@@ -620,7 +714,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 12
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -928,7 +1022,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 12
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {

@@ -45,7 +45,8 @@ async function request(path, {method = "GET", body, signal, headers = {}, timeou
     if (response.type === "opaqueredirect" || [301, 302, 303, 307, 308, 401, 403].includes(response.status)) {
       throw new ApiError("Your session has expired. Sign in again to continue.", {kind: "auth", status: response.status, ambiguous: mutation});
     }
-    const json = /\bapplication\/(?:[\w.-]+\+)?json\b/i.test(response.headers.get("content-type") || "");
+    const contentType = response.headers.get("content-type") || "";
+    const json = /\bapplication\/(?:[\w.-]+\+)?json\b/i.test(contentType);
     if (!response.ok) {
       let data = null;
       if (json) { try { data = await response.json(); } catch { /* A malformed error body still has a useful HTTP status. */ } }
@@ -53,7 +54,12 @@ async function request(path, {method = "GET", body, signal, headers = {}, timeou
       error.ambiguous = mutation && response.status >= 500;
       throw error;
     }
-    if (!json) throw new ApiError("The server did not return API data. Reload or sign in again.", {kind: "protocol", status: response.status, ambiguous: mutation});
+    if (!json) {
+      const authPage = /\b(?:text\/html|application\/xhtml\+xml)\b/i.test(contentType);
+      throw new ApiError(authPage ? "The server returned a sign-in page. Sign in again to continue."
+        : "The server did not return API data. Reload or sign in again.",
+      {kind: authPage ? "auth" : "protocol", status: response.status, ambiguous: mutation});
+    }
     try { return await response.json(); }
     catch { throw new ApiError("The server returned unreadable API data.", {kind: "protocol", status: response.status, ambiguous: mutation}); }
   } catch (error) {
@@ -95,6 +101,14 @@ export const api = {
   listJobs: (options = {}) => request(`/jobs?${page(options)}`, {signal: options.signal}),
   getJob: (id, options) => request(`/jobs/${identifier(id)}`, options),
   getChecks: (id, options = {}) => request(`/jobs/${identifier(id)}/checks?${page({...options, limit: options.limit ?? 10})}`, {signal: options.signal}),
+  getActivity: ({jobId, runId, limit = 25, offset = 0, beforeRunId} = {}) => {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0) throw new ApiError("Invalid page bounds.", {kind: "validation"});
+    const query = new URLSearchParams({limit: String(limit), offset: String(offset)});
+    if (jobId) query.set("job_id", jobId);
+    if (runId) query.set("run_id", runId);
+    if (beforeRunId) query.set("before_run_id", beforeRunId);
+    return request(`/activity?${query}`);
+  },
   validateTarget: (booking_url, options = {}) => request("/targets/validate", {signal: options.signal, method: "POST", body: {booking_url}, timeout: 120_000}),
   createJob: (values, options = {}) => {
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(options.idempotencyKey || "")) throw new ApiError("A saved creation request key is required.", {kind: "validation"});

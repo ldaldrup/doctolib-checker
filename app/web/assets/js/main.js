@@ -6,25 +6,31 @@ import { api, createJobPayload, updateJobPayload, settingsPayload } from "./api.
 import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
 import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata, savedJobFeedback, updateConflictFields, sameDraftValue } from "./pages/jobs.js";
 import { renderSettings, settingWarning } from "./pages/settings.js";
+import { renderActivity, shouldRefreshActivity } from "./pages/activity.js";
 
 const app = document.querySelector("#app"), toast = document.querySelector("#toast"), dialog = document.querySelector("#confirm-dialog");
 const state = {
   jobs: null, settings: null, status: null,
-  load: Object.fromEntries(["jobs", "settings", "status"].map(key => [key, {phase: "loading", error: null}])),
+  load: Object.fromEntries(["jobs", "settings", "status", "activity"].map(key => [key, {phase: "loading", error: null}])),
   views: new Map(), histories: new Map(), targetMetadata: new Map(),
+  activity: {jobId: null, runId: null, items: [], nextOffset: 0, nextBeforeRunId: null, hasMore: false, phase: "loading", error: null},
   formDraft: null, editingId: null, original: null, pendingJobs: new Set(),
   checkSubmitting: new Set(), checkErrors: new Map(),
   jobSubmitting: false, settingsSubmitting: false, jobError: null, settingsError: null,
   settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false, settingsConflict: null, jobConflict: null, jobConflictBlocked: false, createAttempt: null,
   query: "", filter: "all", intervalFilter: "all", uncertainCreate: null, quietPreview: null
 };
-let toastTimer, refreshTimer, refreshPromise, refreshAgain = false, refreshSettingsAgain = false, failures = 0, observer, deleteFocus;
-let historyActive = 0, settingsGeneration = 0, historyEpoch = 0;
+let toastTimer, refreshTimer, refreshPromise, refreshAgain = false, refreshSettingsAgain = false, refreshActivityAgain = false, failures = 0, observer, deleteFocus;
+let historyActive = 0, settingsGeneration = 0, historyEpoch = 0, activityGeneration = 0;
 let quietPreviewTimer;
 const historyQueue = [], historyQueued = new Set(), searchSignatures = new Map(), invalidations = new Map();
 const channels = channelController(state, {render, announce, refreshJobs: () => refresh(true), onLoad: patchJobChannels});
 const smtp = smtpController(state, {render, announce, refreshJobs: () => refresh(true)});
-const route = () => location.hash === "#settings" ? "settings" : "jobs";
+const route = () => location.hash === "#settings" ? "settings" : location.hash.startsWith("#activity") ? "activity" : "jobs";
+const activityFilter = () => {
+  const query = new URLSearchParams(location.hash.split("?", 2)[1] || "");
+  return {jobId: query.get("job") || null, runId: query.get("run") || null};
+};
 const message = error => error?.message || "The request failed.";
 const settingsValues = settings => ({default_interval_seconds: settings.default_interval_seconds, request_spacing_seconds: settings.request_spacing_seconds, message_content: structuredClone(settings.message_content || defaultContent())});
 
@@ -49,17 +55,19 @@ function render() {
   const focused = document.activeElement;
   const focusId = focused?.id, start = focused?.selectionStart, end = focused?.selectionEnd;
   const scroll = window.scrollY;
-  app.innerHTML = route() === "jobs" ? renderJobs(state) : renderSettings(state);
+  app.innerHTML = route() === "jobs" ? renderJobs(state) : route() === "activity" ? renderActivity(state) : renderSettings(state);
   document.querySelectorAll("[data-nav]").forEach(link => {
     if (link.dataset.nav === route()) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
   });
-  document.title = `${route() === "jobs" ? "Jobs" : "Settings"} · DoctolibChecker`;
+  document.title = `${route() === "jobs" ? "Jobs" : route() === "activity" ? "Activity" : "Settings"} · DoctolibChecker`;
   workerStatus(); observeCards();
   if (focusId) {
-    const next = document.getElementById(focusId); next?.focus({preventScroll: true});
-    if (start !== null && start !== undefined && next?.setSelectionRange) { try { next.setSelectionRange(start, end); } catch {} }
-  }
-  if (!focusId) restoreControl(control);
+    const next = document.getElementById(focusId);
+    if (next) {
+      next.focus({preventScroll: true});
+      if (start !== null && start !== undefined && next.setSelectionRange) { try { next.setSelectionRange(start, end); } catch {} }
+    } else if (route() === "activity") document.getElementById("activity-heading")?.focus({preventScroll: true});
+  } else if (!restoreControl(control) && route() === "activity") document.getElementById("activity-heading")?.focus({preventScroll: true});
   window.scrollTo({top: scroll, behavior: "instant"});
   syncQuietHoursPreview();
 }
@@ -68,7 +76,7 @@ function workerStatus() {
   if (delivery) { const next = renderDeliveryNotice(state); if (delivery.innerHTML !== next) delivery.innerHTML = next; }
   const element = document.querySelector("#worker-status"); if (!element) return;
   const load = state.load.status;
-  const auth = Object.values(state.load).some(value => value.error?.kind === "auth") || state.jobError?.kind === "auth" || state.settingsError?.kind === "auth";
+  const auth = Object.values(state.load).some(value => value.error?.kind === "auth") || state.jobError?.kind === "auth" || state.settingsError?.kind === "auth" || state.activity.error?.kind === "auth";
   const signIn = document.getElementById("sign-in"); if (signIn) signIn.hidden = !auth;
   element.classList.toggle("worker-unknown", load.phase !== "loaded" || !state.status?.worker_alive);
   element.textContent = load.phase === "loading" && !state.status ? "Worker status loading…"
@@ -190,6 +198,36 @@ async function loadStatus() {
   try { state.status = await api.getStatus(); state.load.status = {phase: "loaded", error: null}; }
   catch (error) { state.load.status = {phase: state.status ? "stale" : "error", error}; }
   patchJobs();
+  if (route() === "activity") render();
+}
+async function loadActivity(reset = true) {
+  if (route() !== "activity") return;
+  const {jobId, runId} = activityFilter();
+  const prior = state.activity, same = prior.jobId === jobId && prior.runId === runId;
+  if (!reset && (!same || !prior.hasMore || prior.loadingMore)) return;
+  if (!same) reset = true;
+  const generation = ++activityGeneration;
+  const priorItems = same ? prior.items : [];
+  const beforeRunId = reset ? null : prior.nextBeforeRunId;
+  const offset = reset || beforeRunId ? 0 : prior.nextOffset;
+  state.activity = {...(same ? prior : {}), jobId, runId, items: priorItems,
+    phase: priorItems.length ? "stale" : "loading", error: null, loadingMore: !reset};
+  state.load.activity = {phase: state.activity.phase, error: null};
+  render();
+  try {
+    const page = await api.getActivity({jobId, runId, limit: runId ? 1 : 25, offset, beforeRunId});
+    if (generation !== activityGeneration || route() !== "activity") return;
+    const items = reset ? page.items : [...priorItems, ...page.items];
+    state.activity = {jobId, runId, items, nextOffset: page.next_offset ?? items.length,
+      nextBeforeRunId: page.next_before_run_id ?? null,
+      hasMore: Boolean(page.has_more), phase: "loaded", error: null, loadingMore: false};
+    state.load.activity = {phase: "loaded", error: null};
+  } catch (error) {
+    if (generation !== activityGeneration || route() !== "activity") return;
+    state.activity = {...state.activity, phase: priorItems.length ? "stale" : "error", error, loadingMore: false};
+    state.load.activity = {phase: state.activity.phase, error};
+  }
+  render();
 }
 async function loadSettings() {
   if (state.settingsSubmitting) return;
@@ -223,14 +261,24 @@ function scheduleRefresh() {
   if (document.hidden) return;
   refreshTimer = setTimeout(() => refresh(), Math.min(120000, 15000 * 2 ** failures));
 }
-function refresh(includeSettings = false) {
-  if (refreshPromise) { refreshAgain = true; refreshSettingsAgain ||= includeSettings; return refreshPromise; }
+function refresh(includeSettings = false, forceActivity = false) {
+  if (refreshPromise) {
+    refreshAgain = true;
+    refreshSettingsAgain ||= includeSettings;
+    refreshActivityAgain ||= forceActivity;
+    return refreshPromise;
+  }
   refreshPromise = (async () => {
-    let settings = includeSettings || route() === "settings";
+    let settings = includeSettings || route() === "settings", forceActivityRefresh = forceActivity;
     try {
       do {
         refreshAgain = false;
-        await Promise.all([loadJobs(), loadStatus(), channels.load(), ...(settings ? [loadSettings(), smtp.load()] : [])]);
+        const force = forceActivityRefresh || refreshActivityAgain;
+        forceActivityRefresh = false;
+        refreshActivityAgain = false;
+        const filter = activityFilter();
+        const activityChanged = state.activity.jobId !== filter.jobId || state.activity.runId !== filter.runId;
+        await Promise.all([loadJobs(), loadStatus(), channels.load(), ...(route() === "activity" && shouldRefreshActivity(state.activity, force, activityChanged) ? [loadActivity(true)] : []), ...(settings ? [loadSettings(), smtp.load()] : [])]);
         failures = [state.load.jobs, state.load.status].some(load => ["error", "stale"].includes(load.phase)) ? Math.min(failures + 1, 2) : 0;
         if (settings) showSettingsRead();
         settings = refreshSettingsAgain; refreshSettingsAgain = false;
@@ -434,6 +482,8 @@ document.addEventListener("click", async event => {
   if (control.closest("#channel-settings")) { await channels.click(control); return; }
   if (control.closest('#smtp-settings')) { await smtp.click(control); return; }
   const action = control.dataset.action, job = state.jobs?.find(value => value.id === control.closest("[data-job-id]")?.dataset.jobId);
+  if (action === "activity-more") { loadActivity(false); return; }
+  if (action === "activity-retry") { refresh(false, true); return; }
   if (["retry", "refresh"].includes(action)) { refresh(true); return; }
   if (action === "sign-in") { location.assign(location.href); return; }
   if (action === "filter") { state.filter = control.dataset.filter; patchJobs(); refresh(); return; }
@@ -570,11 +620,12 @@ dialog.addEventListener("close", () => {
 window.addEventListener("hashchange", async () => {
   clearTimeout(refreshTimer); render(); app.focus({preventScroll: true});
   if (route() === "settings") { await refresh(true); }
+  else if (route() === "activity") { refresh(); }
   else { pumpHistory(); refresh(); }
 });
 document.addEventListener("visibilitychange", () => {
   clearTimeout(refreshTimer);
-  if (!document.hidden) { if (route() === "jobs") { pumpHistory(); refresh(); } else refresh(true); }
+  if (!document.hidden) { if (route() === "jobs") { pumpHistory(); refresh(); } else refresh(route() === "settings"); }
 });
 render();
 refresh(true);

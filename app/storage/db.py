@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class Database:
@@ -20,7 +20,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in range(1, 13):
+                if len(versions) != 1 or versions[0][0] not in range(1, SCHEMA_VERSION + 1):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" + CHANNEL_SCHEMA +
                 """
@@ -100,6 +100,7 @@ class Database:
                     id TEXT PRIMARY KEY,
                     job_id TEXT REFERENCES jobs(id),
                     job_name TEXT NOT NULL,
+                    requested_at TEXT,
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     outcome TEXT NOT NULL CHECK (outcome IN ('running', 'completed', 'partial_error', 'error', 'interrupted')),
@@ -329,6 +330,8 @@ class Database:
                     current_version = 11
                 if current_version == 11:
                     current_version = 12
+                if current_version == 12:
+                    current_version = 13
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
             # Additive content contracts preserve existing events and queued work.
@@ -338,12 +341,15 @@ class Database:
                          'quiet_hours_enabled INTEGER NOT NULL DEFAULT 0', "quiet_hours_start TEXT NOT NULL DEFAULT '22:00'", "quiet_hours_end TEXT NOT NULL DEFAULT '07:00'"),
                 'alerts': ('message_content TEXT', 'event_snapshot TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1',
                            "quiet_state TEXT NOT NULL DEFAULT 'released'", 'quiet_until TEXT'),
+                'check_results': ('error_category TEXT', 'upstream_status INTEGER', 'retry_at TEXT'),
+                'check_runs': ('requested_at TEXT',),
                 'channel_tests': ('message_content TEXT', 'ntfy_priority INTEGER'),
             }.items():
                 present = {row[1] for row in conn.execute('PRAGMA table_info('+table+')')}
                 for column in columns:
                     if column.split()[0] not in present:
                         conn.execute('ALTER TABLE '+table+' ADD COLUMN '+column)
+            conn.execute("UPDATE check_results SET error_category='unknown' WHERE status='error' AND error_category IS NULL")
             import json
             default_content = json.dumps({'preset':'standard','fields':['practitioner','practice','earliest_appointment','booking_link'],'silent':False})
             conn.execute('UPDATE channel_tests SET message_content=? WHERE message_content IS NULL', (default_content,))

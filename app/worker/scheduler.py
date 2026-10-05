@@ -40,5 +40,6 @@ def run_forever(settings=None, check_service=None):
     repository.interrupt_stale_runs()
     logging.info("Doctolib availability worker started")
     while True:
+        repository.touch_worker()
         check_service.run_due()
         time.sleep(settings.check_interval_seconds)

@@ -37,8 +37,15 @@ def create_router():
 
     @router.get("/api/v1/status")
     def status_view(request: Request):
-        result = request.app.state.repository.dashboard_status()
+        try:
+            result = request.app.state.repository.dashboard_status()
+        except Exception:
+            return {"api_alive": True, "database_ready": False, "api_checked_at": iso(utc_now()),
+                    "worker": None, "dispatcher": None, "worker_alive": False,
+                    "dispatcher_alive": False, "delivery_backlog": {}, "overdue_jobs": None,
+                    "oldest_ready_delivery_at": None, "last_completed_run": None}
         result["api_alive"] = True
+        result["database_ready"] = True
         result["api_checked_at"] = iso(utc_now())
         heartbeat = result.get("worker")
         if heartbeat:
@@ -259,6 +266,21 @@ def create_router():
         if request.app.state.repository.get_job(job_id, include_deleted=True) is None:
             raise HTTPException(status_code=404, detail="job_not_found")
         return request.app.state.repository.checks(job_id, limit, offset)
+
+    @router.get("/api/v1/activity")
+    def activity(request: Request, job_id: str = Query(default=None, min_length=1, max_length=128),
+                 run_id: str = Query(default=None, min_length=1, max_length=128),
+                 limit: int = Query(default=25, ge=1, le=100), offset: int = Query(default=0, ge=0),
+                 before_run_id: str = Query(default=None, min_length=1, max_length=128)):
+        if job_id and request.app.state.repository.get_job(job_id, include_deleted=True) is None:
+            raise HTTPException(status_code=404, detail="job_not_found")
+        if run_id:
+            run = request.app.state.repository.activity(job_id=job_id, run_id=run_id, limit=1)
+            if not run["items"]:
+                raise HTTPException(status_code=404, detail="run_not_found")
+            return run
+        return request.app.state.repository.activity(job_id=job_id, limit=limit, offset=offset,
+                                                     before_run_id=before_run_id)
 
     @router.get("/api/v1/alerts")
     def alerts(request: Request, limit: int = Query(default=50, ge=1, le=100),

@@ -24,7 +24,7 @@ MANIFEST_MEMBER = "manifest.json"
 FORMAT_VERSION = 1
 # Structure checks for the formats this release can rehearse. Future migrations
 # must extend these requirements before advertising a new restore format.
-SUPPORTED_SCHEMAS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+SUPPORTED_SCHEMAS = set(range(1, SCHEMA_VERSION + 1))
 REQUIRED_COLUMNS = {
     "settings": "singleton_id default_interval_seconds request_spacing_seconds updated_at",
     "jobs": "id name status interval_seconds date_mode horizon_days earliest_date latest_date "
@@ -55,10 +55,6 @@ def _readonly(path):
 def _inspect(path):
     with closing(_readonly(path)) as conn:
         try:
-            if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-                raise AdminError("database_integrity_failed")
-            if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                raise AdminError("database_foreign_keys_failed")
             rows = conn.execute("SELECT version FROM schema_version").fetchall()
             if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
                 raise AdminError("invalid_schema_version")
@@ -105,11 +101,18 @@ def _inspect(path):
                 if version >= 12:
                     requirements["jobs"] += " quiet_hours_enabled quiet_hours_start quiet_hours_end"
                     requirements["alerts"] += " quiet_state quiet_until"
+                if version >= 13:
+                    requirements["check_runs"] += " requested_at"
+                    requirements["check_results"] += " error_category upstream_status retry_at"
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 for table, fields in requirements.items():
                     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                     if table not in tables or not set(fields.split()) <= columns:
                         raise AdminError("incomplete_checker_schema")
+            if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise AdminError("database_integrity_failed")
+            if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise AdminError("database_foreign_keys_failed")
         except sqlite3.Error:
             raise AdminError("invalid_checker_database") from None
     return version

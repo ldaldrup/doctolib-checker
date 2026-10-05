@@ -32,6 +32,9 @@ class AvailabilityResult:
     count_complete: bool = True
     error_code: Optional[str] = None
     error_message: Optional[str] = None
+    error_category: Optional[str] = None
+    upstream_status: Optional[int] = None
+    retry_at: Optional[datetime] = None
 
 
 @dataclass

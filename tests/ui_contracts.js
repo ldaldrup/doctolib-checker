@@ -6,6 +6,7 @@ import { deriveJobView, historyKey, safeBookingUrl } from '/assets/js/job-view.j
 
 import { settingWarning } from '/assets/js/pages/settings.js';
 import { jobStatus, checkedAgo, renderJobList, compactDuration, nextCheck, nextCheckTitle, checkIntentFeedback, savedJobFeedback } from '/assets/js/pages/jobs.js';
+import {renderActivity, shouldRefreshActivity} from '/assets/js/pages/activity.js';
 
 const lines = [];
 const assert = (condition, message = 'Assertion failed') => { if (!condition) throw new Error(message); };
@@ -152,6 +153,44 @@ await test('empty running or interrupted checks do not revive contradicted older
     assert(view.state !== 'no_availability');
   }
 });
+await test('Activity distinguishes complete negative evidence, partial errors and destination acceptance safely', () => {
+  assert(shouldRefreshActivity({items: []}) && shouldRefreshActivity({items: Array(25)}));
+  assert(!shouldRefreshActivity({items: Array(25), loadingMore: true}) && shouldRefreshActivity({items: Array(25), loadingMore: true}, true));
+  assert(shouldRefreshActivity({items: Array(26)}, false, true));
+  assert(!shouldRefreshActivity({items: Array(26)}) && shouldRefreshActivity({items: Array(26)}, true));
+  const run = {id: 'run-1', job_id: 'j', job_name: '<Clinic>', time_zone: 'Europe/Berlin', outcome: 'completed', triggered_by: 'schedule',
+    requested_at: t(1), started_at: t(2), finished_at: t(3), search_revision: 4, current_search_revision: 4,
+    history_state: 'current', snapshot_known: true, target_total: 1, target_completed: 1, coverage_complete: true,
+    results: [{id: 'result-1', target_id: 'a', practitioner_name: 'Dr A', practice_name: 'Clinic', status: 'available',
+      slot_count: 2, earliest_slot: '2026-10-03T09:00:00Z', count_complete: true, published: true, search_revision: 4,
+      booking_url: 'https://private.example/path?token=raw', deliveries: [{channel_name: 'Telegram', channel_type: 'telegram',
+        status: 'sent', delivery_state: 'ready', attempts: 1, accepted_at: t(4), originating_run_id: 'run-1',
+        confirmation_run_id: 'run-2'}]}]};
+  const state = {jobs: [job], activity: {items: [run], jobId: 'j', phase: 'loaded', hasMore: true},
+    load: {status: {phase: 'loaded'}, activity: {phase: 'loaded'}}, status: {database_ready: true, worker_alive: true,
+      dispatcher_alive: false, last_completed_run: null, overdue_jobs: 0, delivery_backlog: {ready: 0, retry: 0, action_required: 0, uncertain: 1}, oldest_ready_delivery_at: null}};
+  let html = renderActivity(state);
+  assert(html.includes('Dr A') && html.includes('Accepted by Telegram API') && html.includes('Last completed check: None recorded'));
+  assert(html.includes('data-action="activity-retry"') && html.includes('Refresh activity'));
+  assert(html.includes('Confirmed by run run-2') && html.includes('&lt;Clinic&gt;'));
+  assert(!html.includes('private.example') && !html.includes('token=raw') && html.includes('Load more'));
+  assert(!html.includes('No appointments found across all'));
+  state.activity.error = {kind: 'auth', message: 'Sign in again'};
+  html = renderActivity(state);
+  assert(html.includes('data-action="sign-in"'));
+  state.activity.error = null;
+  const interrupted = {...run, outcome: 'interrupted', snapshot_known: true,
+    targets: [{id: 'a', practitioner_name: 'Dr A'}, {id: 'b', practitioner_name: 'Dr B'}], results: []};
+  state.activity.items = [interrupted]; html = renderActivity(state);
+  assert(html.includes('Dr A') && html.includes('Dr B') && html.includes('No result was recorded for this target'));
+  state.activity.items = [run]; state.activity.hasMore = true; state.activity.loadingMore = true; html = renderActivity(state);
+  assert(html.includes('id="activity-load-more"') && html.includes('aria-disabled="true"') && !html.includes('id="activity-load-more" class="button button-secondary" type="button" data-action="activity-more" disabled'));
+  const negative = {...run, results: [{...run.results[0], status: 'no_availability', earliest_slot: null, deliveries: []}]};
+  state.activity.items = [negative]; html = renderActivity(state);
+  assert(html.includes('No appointments found across all 1 targets'));
+  negative.history_state = 'superseded'; html = renderActivity(state);
+  assert(!html.includes('No appointments found across all'));
+});
 await test('cosmetic edits retain proven revision evidence', () => {
   const edited = {...job, updated_at: t(15), edit_version: 2, status: 'paused', name: 'Renamed', interval_seconds: 600};
   const view = deriveJobView(edited, [run('completed', [result('a', 'available'), result('b', 'no_availability')])]);
@@ -222,8 +261,19 @@ await test('redirect/auth, HTTP errors, JSON validation fields and protocol fail
   globalThis.fetch = async () => new Response('<html>Unavailable</html>', {status:502, headers:{'Content-Type':'text/html'}});
   await rejects(() => api.getStatus(), 'upstream');
   globalThis.fetch = async () => ({type: 'opaqueredirect', status: 0}); await rejects(() => api.getStatus(), 'auth');
-  globalThis.fetch = async () => new Response('<html>Sign in</html>', {headers: {'Content-Type': 'text/html'}}); await rejects(() => api.getStatus(), 'protocol');
+  globalThis.fetch = async () => new Response('<html>Sign in</html>', {headers: {'Content-Type': 'text/html'}}); await rejects(() => api.getStatus(), 'auth');
   globalThis.fetch = async () => new Response('{broken', {headers: {'Content-Type': 'application/json'}}); await rejects(() => api.getStatus(), 'protocol');
+});
+await test('Activity pagination sends a stable run cursor', async () => {
+  let requested;
+  globalThis.fetch = async input => {
+    requested = new URL(String(input), 'https://checker.example');
+    return new Response(JSON.stringify({items: [], has_more: false}), {headers: {'Content-Type': 'application/json'}});
+  };
+  await api.getActivity({jobId: 'job-1', limit: 25, beforeRunId: 'run-1'});
+  equal(requested.searchParams.get('job_id'), 'job-1');
+  equal(requested.searchParams.get('before_run_id'), 'run-1');
+  equal(requested.searchParams.get('limit'), '25');
 });
 await test('timeout and cancellation are distinct, with uncertain mutation outcome and no retry', async () => {
   const nativeTimer = globalThis.setTimeout;

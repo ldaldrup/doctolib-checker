@@ -1,11 +1,11 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import requests
 
-from app.doctolib import BookingUrlError, DoctolibClient, fetch_slot_total, get_booking_metadata, parse_booking_url
+from app.doctolib import BookingUrlError, DoctolibClient, DoctolibHTTPError, fetch_slot_total, get_booking_metadata, parse_booking_url
 from app.models import BookingMeta
 
 
@@ -111,6 +111,25 @@ def test_each_retry_passes_through_shared_request_gate(monkeypatch):
     assert response.json() == {"data": {}}
     assert len(session.calls) == 2
     assert len(gate_calls) == 2
+
+
+def test_http_failures_keep_only_safe_status_and_retry_time(monkeypatch):
+    monkeypatch.setattr("app.doctolib.time_module.sleep", lambda _seconds: None)
+    before = datetime.now(timezone.utc)
+    session = FakeSession([Response({"provider": "private body"}, status=429, headers={"Retry-After": "30"}) for _ in range(4)])
+    client = DoctolibClient(session=session)
+    with pytest.raises(DoctolibHTTPError) as caught:
+        client._get("https://www.doctolib.de/private-path?token=secret")
+    assert caught.value.status_code == 429
+    assert caught.value.retry_at.tzinfo is not None
+    assert timedelta(seconds=28) <= caught.value.retry_at - before <= timedelta(seconds=31)
+    assert "secret" not in str(caught.value) and "private body" not in str(caught.value)
+    assert len(session.calls) == 4
+
+    rejected = FakeSession([Response({}, status=403)])
+    with pytest.raises(DoctolibHTTPError) as caught:
+        DoctolibClient(session=rejected)._get("https://www.doctolib.de/test")
+    assert caught.value.status_code == 403 and len(rejected.calls) == 1
 
 
 def test_redirects_are_allowlisted_and_pass_through_shared_request_gate():
@@ -349,6 +368,59 @@ def test_duplicate_availability_slots_are_counted_once():
 
     assert result.status == "available"
     assert result.slot_count == 1
+
+
+def test_string_encoded_slot_times_are_valid_availability_evidence():
+    client = DoctolibClient(session=FakeSession([{
+        "total": 1, "availabilities": [{"date": "2026-10-01", "slots": ["2026-10-01T10:00:00+02:00"]}]
+    }]))
+    result = client.check(
+        BOOKING_URL,
+        {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+         "time_zone": "Europe/Berlin"},
+        meta=_test_meta(),
+        now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+    assert result.status == "available" and result.count_complete
+    assert result.earliest_slot == datetime(2026, 10, 1, 8, tzinfo=timezone.utc)
+
+
+def test_invalid_total_cannot_become_complete_negative_evidence():
+    responses = [
+        {"availabilities": []},
+        {"total": 0.5, "availabilities": []},
+        {"total": True, "availabilities": []},
+        {"total": "0", "availabilities": []},
+    ]
+    for payload in responses:
+        result = DoctolibClient(session=FakeSession([payload])).check(
+            BOOKING_URL,
+            {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+             "time_zone": "Europe/Berlin"},
+            meta=_test_meta(),
+            now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        )
+        assert result.status == "error" and not result.count_complete
+        assert result.error_category == "malformed_response"
+
+
+def test_invalid_total_cannot_become_complete_negative_evidence():
+    responses = [
+        {"availabilities": []},
+        {"total": 0.5, "availabilities": []},
+        {"total": True, "availabilities": []},
+        {"total": "0", "availabilities": []},
+    ]
+    for payload in responses:
+        result = DoctolibClient(session=FakeSession([payload])).check(
+            BOOKING_URL,
+            {"date_mode": "custom", "earliest_date": "2026-10-01", "latest_date": "2026-10-01",
+             "time_zone": "Europe/Berlin"},
+            meta=_test_meta(),
+            now=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        )
+        assert result.status == "error" and not result.count_complete
+        assert result.error_category == "malformed_response"
 
 
 def test_malformed_slot_is_an_error_instead_of_a_midnight_appointment():

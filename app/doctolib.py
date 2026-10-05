@@ -2,6 +2,7 @@
 
 import urllib.parse
 import time as time_module
+from email.utils import parsedate_to_datetime
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -30,6 +31,40 @@ class BookingUrlError(ValueError):
 
 class MetadataResolutionError(ValueError):
     """Doctolib metadata did not identify a usable booking target."""
+
+
+class DoctolibHTTPError(requests.RequestException):
+    """Safe HTTP failure details for activity history."""
+
+    def __init__(self, status_code, retry_at=None):
+        super().__init__("Doctolib returned an HTTP error")
+        self.status_code = status_code
+        self.retry_at = retry_at
+
+
+def _retry_at(headers):
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        seconds = int(value)
+        if seconds < 0:
+            return None
+        return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return retry_at.astimezone(timezone.utc)
+
+
+def _availability_error(category, code, message):
+    return AvailabilityResult(status="error", slot_count=0, earliest_slot=None,
+                             count_complete=False, error_code=code,
+                             error_message=message, error_category=category)
 
 
 def get_session():
@@ -193,8 +228,10 @@ class DoctolibClient:
                     continue
 
                 if response.status_code in retryable_statuses and attempt < 3:
-                    last_error = requests.HTTPError("Retryable Doctolib response")
+                    last_error = None
                     break
+                if response.status_code >= 400:
+                    raise DoctolibHTTPError(response.status_code, _retry_at(response.headers))
                 response.raise_for_status()
                 return response
             if attempt < 3:
@@ -206,9 +243,15 @@ class DoctolibClient:
         origin = "https://" + parts["host"]
         info_url = origin + "/online_booking/api/slot_selection_funnel/v1/info.json"
         response = self._get(info_url, params={"profile_slug": parts["profile_slug"]}, timeout=10)
-        payload = response.json()
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            raise MetadataResolutionError("Doctolib returned invalid booking metadata") from None
         data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict):
+        if (not isinstance(data, dict) or
+                not isinstance(data.get("profile", {}), dict) or
+                not isinstance(data.get("practitioners", []), list) or
+                not isinstance(data.get("agendas", []), list)):
             raise MetadataResolutionError("Doctolib returned invalid booking metadata")
         profile = data.get("profile", {})
         practice_name = profile.get("name_with_title") or profile.get("name") or parts["profile_slug"]
@@ -364,21 +407,34 @@ class DoctolibClient:
                 timeout=15,
                 availability=True,
             )
-            data = response.json()
-            total = int(data.get("total", 0) or 0)
+            try:
+                data = response.json()
+            except (TypeError, ValueError):
+                return _availability_error("malformed_response", "invalid_availability_response",
+                                           "Doctolib returned invalid availability data.")
+            if not isinstance(data, dict) or not isinstance(data.get("availabilities"), list):
+                return _availability_error("malformed_response", "invalid_availability_response",
+                                           "Doctolib returned invalid availability data.")
+            total = data.get("total")
+            if type(total) is not int or total < 0:
+                return _availability_error("malformed_response", "invalid_availability_response",
+                                           "Doctolib returned invalid availability data.")
             returned_count = 0
             page_slots = {}
             for day_info in data.get("availabilities", []) or []:
+                if not isinstance(day_info, dict) or not isinstance(day_info.get("slots", []), list):
+                    return _availability_error("malformed_response", "invalid_availability_response",
+                                               "Doctolib returned invalid availability data.")
                 day_text = str(day_info.get("date", ""))
                 for slot_data in day_info.get("slots", []) or []:
+                    if not isinstance(slot_data, (dict, str)):
+                        return _availability_error("malformed_response", "invalid_availability_response",
+                                                   "Doctolib returned invalid availability data.")
                     returned_count += 1
                     starts_at = self._slot_datetime(day_text, slot_data, zone)
                     if starts_at is None:
-                        return AvailabilityResult(
-                            status="error", slot_count=0, earliest_slot=None, count_complete=False,
-                            error_code="invalid_availability_response",
-                            error_message="Doctolib returned a slot without a valid start time; retrying later.",
-                        )
+                        return _availability_error("malformed_response", "invalid_availability_response",
+                                                   "Doctolib returned a slot without a valid start time.")
                     local_day = starts_at.astimezone(zone).date()
                     if starts_at > current and page_start <= local_day <= page_end:
                         page_slots[starts_at] = Slot(starts_at=starts_at)
@@ -387,11 +443,8 @@ class DoctolibClient:
             if not page_slots and next_slot:
                 fallback = self._slot_datetime(str(next_slot)[:10], next_slot, zone)
                 if fallback is None:
-                    return AvailabilityResult(
-                        status="error", slot_count=0, earliest_slot=None, count_complete=False,
-                        error_code="invalid_availability_response",
-                        error_message="Doctolib returned a slot without a valid start time; retrying later.",
-                    )
+                    return _availability_error("malformed_response", "invalid_availability_response",
+                                               "Doctolib returned a slot without a valid start time.")
                 fallback_day = fallback.astimezone(zone).date()
                 if fallback > current and page_start <= fallback_day <= page_end:
                     page_slots[fallback] = Slot(starts_at=fallback)
@@ -399,14 +452,8 @@ class DoctolibClient:
 
             # Never report a partial count or trigger an alert when any page is truncated.
             if returned_count < total:
-                return AvailabilityResult(
-                    status="error",
-                    slot_count=0,
-                    earliest_slot=None,
-                    count_complete=False,
-                    error_code="incomplete_availability_response",
-                    error_message="Doctolib returned only part of the availability list; retrying later.",
-                )
+                return _availability_error("incomplete_response", "incomplete_availability_response",
+                                           "Doctolib returned only part of the availability list.")
             all_slots.update(page_slots)
             page_start = page_end + timedelta(days=1)
 

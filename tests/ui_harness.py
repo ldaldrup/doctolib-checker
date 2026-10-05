@@ -101,7 +101,7 @@ def create_harness(directory):
         return HTMLResponse('''<!doctype html><html lang="en"><title>Responsive UI checks</title>
 <style>body{margin:8px;font:14px system-ui}iframe{display:block;border:1px solid #999;margin-top:8px}</style>
 <label>Width <select id="width"><option>1280</option><option>1092</option><option>768</option><option>390</option></select></label>
-<label>Page <select id="page"><option value="jobs">Jobs</option><option value="settings">Settings</option></select></label>
+<label>Page <select id="page"><option value="jobs">Jobs</option><option value="activity">Activity</option><option value="settings">Settings</option></select></label>
 <iframe title="Connected UI at selected width" width="1280" height="928" src="/#jobs"></iframe>
 <script>const frame=document.querySelector('iframe');
 document.querySelector('#width').onchange=e=>frame.width=e.target.value;

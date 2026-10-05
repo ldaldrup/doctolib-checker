@@ -590,10 +590,11 @@ class Repository(ChannelOperations):
                 trigger = intent['triggered_by'] if intent else 'schedule'
                 paused_manual = int(bool(intent and intent['paused_manual']))
                 intent_id = intent['id'] if intent else None
-                conn.execute("""INSERT INTO check_runs(id,job_id,job_name,started_at,outcome,search_revision,
+                conn.execute("""INSERT INTO check_runs(id,job_id,job_name,requested_at,started_at,outcome,search_revision,
                     search_snapshot,snapshot_known,owner_token,triggered_by,intent_id,paused_manual,status_version)
-                    VALUES(?,?,?,?,'running',?,?,1,?,?,?,?,?)""",
-                    (run_id,row['id'],row['name'],now_text,row['search_revision'],json.dumps(snapshot,sort_keys=True),
+                    VALUES(?,?,?,?,?,'running',?,?,1,?,?,?,?,?)""",
+                    (run_id,row['id'],row['name'],intent['requested_at'] if intent else row['next_check_at'] or now_text,
+                     now_text,row['search_revision'],json.dumps(snapshot,sort_keys=True),
                      owner_token,trigger,intent_id,paused_manual,row['status_version']))
                 if intent:
                     conn.execute("UPDATE check_intents SET status='running',run_id=? WHERE id=? AND status='queued'", (run_id,intent_id))
@@ -680,12 +681,15 @@ class Repository(ChannelOperations):
             conn.execute(
                 """INSERT INTO check_results
                 (id,run_id,job_id,target_id,practitioner_name,practice_name,booking_url,checked_at,status,
-                 slot_count,earliest_slot,count_complete,error_code,error_message,search_revision,snapshot_known,published)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 slot_count,earliest_slot,count_complete,error_code,error_message,error_category,upstream_status,
+                 retry_at,search_revision,snapshot_known,published)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (result_id, run_id, job["id"], target["id"], target["practitioner_name"],
                  target["practice_name"], target["booking_url"], iso(), result.status, result.slot_count,
                  earliest_slot, int(result.count_complete),
-                 result.error_code, result.error_message, run["search_revision"], 1, int(published)),
+                 result.error_code, result.error_message, result.error_category, result.upstream_status,
+                 iso(result.retry_at) if result.retry_at else None,
+                 run["search_revision"], 1, int(published)),
             )
             if published and result.status in ("available", "no_availability"):
                 state = conn.execute(
@@ -726,16 +730,20 @@ class Repository(ChannelOperations):
                     self._observe_event(conn, current, target, result_id, current_key, run['search_revision'])
         return result_id
 
-    def insert_error_result(self, run_id, job, target, error_code, error_message, *, owner_token=None):
+    def insert_error_result(self, run_id, job, target, error_code, error_message, *,
+                            error_category="unknown", upstream_status=None, retry_at=None, owner_token=None):
         class ErrorResult:
             status = "error"
             slot_count = 0
             earliest_slot = None
-            count_complete = True
+            count_complete = False
 
         result = ErrorResult()
         result.error_code = error_code
         result.error_message = error_message
+        result.error_category = error_category
+        result.upstream_status = upstream_status
+        result.retry_at = retry_at
         return self.insert_result(run_id, job, target, result, owner_token=owner_token)
 
     def result_id(self, run_id, target_id):
@@ -1315,17 +1323,70 @@ class Repository(ChannelOperations):
 
     def dashboard_status(self):
         with self.database.connection() as conn:
+            current = utc_now()
+            now = precise_iso(current)
             counts = conn.execute(
                 "SELECT SUM(status='active') active_jobs,SUM(status='paused') paused_jobs FROM jobs WHERE status!='deleted'"
             ).fetchone()
             last_run = conn.execute(
-                "SELECT finished_at,outcome FROM check_runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+                "SELECT id,job_id,job_name,finished_at,outcome FROM check_runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC,rowid DESC LIMIT 1"
             ).fetchone()
             next_check = conn.execute(
                 "SELECT MIN(next_check_at) FROM jobs WHERE status='active'"
             ).fetchone()[0]
+            overdue_jobs = conn.execute("""SELECT COUNT(*) FROM jobs WHERE status='active' AND next_check_at<=?
+                AND (lock_until IS NULL OR lock_until<=?)""", (now, now)).fetchone()[0]
+            candidates = conn.execute("""SELECT a.created_at,a.delivery_epoch_at,a.delivery_epoch_attempts,
+                j.time_zone,j.quiet_hours_enabled,
+                j.quiet_hours_start,j.quiet_hours_end FROM alerts a
+                JOIN jobs j ON j.id=a.job_id
+                JOIN check_results r ON r.id=a.result_id
+                JOIN check_runs cr ON cr.id=r.run_id
+                JOIN targets t ON t.id=a.target_id
+                JOIN target_alert_state s ON s.target_id=a.target_id
+                JOIN notification_channels c ON c.id=a.channel_config_id
+                JOIN job_channels jc ON jc.job_id=a.job_id AND jc.channel_config_id=a.channel_config_id
+                LEFT JOIN check_results latest ON latest.id=(SELECT x.id FROM check_results x
+                    WHERE x.target_id=a.target_id AND x.search_revision=j.search_revision
+                    AND x.snapshot_known=1 AND x.published=1 ORDER BY x.rowid DESC LIMIT 1)
+                WHERE a.status IN ('pending','failed') AND a.delivery_state IN ('ready','retry')
+                    AND a.quiet_state='released'
+                    AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=?)
+                    AND (a.claim_owner_token IS NULL OR a.claim_until<=?)
+                    AND a.attempt_started_at IS NULL
+                    AND (j.status='active' OR (j.status='paused' AND cr.paused_manual=1))
+                    AND j.status_version=cr.status_version AND j.telegram_enabled=1 AND t.active=1
+                    AND c.enabled=1 AND c.deleted=0 AND """+COMPLETE_SQL+"""
+                    AND a.destination_version=c.destination_version
+                    AND r.snapshot_known=1 AND r.published=1
+                    AND a.search_revision=j.search_revision AND r.search_revision=j.search_revision
+                    AND r.earliest_slot IS NOT NULL AND r.earliest_slot>?
+                    AND s.last_status='available' AND s.last_earliest_slot=r.earliest_slot
+                    AND latest.status='available' AND latest.earliest_slot=r.earliest_slot
+                    AND julianday(?)>=julianday(latest.checked_at)
+                    AND (julianday(?) - julianday(latest.checked_at))*86400<=j.interval_seconds
+                ORDER BY a.created_at,a.rowid""", (now, now, now, now, now)).fetchall()
+            oldest_ready = None
+            for row in candidates:
+                if not self._delivery_budget(row, current):
+                    continue
+                if not row['quiet_hours_enabled']:
+                    oldest_ready = row['created_at']
+                    break
+                try:
+                    in_quiet_hours = quiet_window(
+                        current, row['time_zone'], row['quiet_hours_start'], row['quiet_hours_end']) is not None
+                except (KeyError, TypeError, ValueError):
+                    in_quiet_hours = True
+                if not in_quiet_hours:
+                    oldest_ready = row['created_at']
+                    break
+            dispatcher = self.dispatcher_status()
             return {"active_jobs": counts["active_jobs"] or 0, "paused_jobs": counts["paused_jobs"] or 0,
-                    "worker": self.worker_status(), "dispatcher": self.dispatcher_status()["heartbeat"], "delivery_backlog": self.dispatcher_status()["backlog"], "last_completed_run": dict(last_run) if last_run else None,
+                    "worker": self.worker_status(), "dispatcher": dispatcher["heartbeat"],
+                    "delivery_backlog": dispatcher["backlog"], "overdue_jobs": overdue_jobs,
+                    "oldest_ready_delivery_at": oldest_ready,
+                    "last_completed_run": dict(last_run) if last_run else None,
                     "next_check_at": next_check}
 
     def checks(self, job_id, limit=50, offset=0):
@@ -1351,6 +1412,146 @@ class Repository(ChannelOperations):
                 run["search_snapshot"] = json.loads(run["search_snapshot"]) if run["search_snapshot"] else None
                 run["results"] = by_run[run["id"]]
             return runs
+
+    def activity(self, *, job_id=None, run_id=None, limit=25, offset=0, before_run_id=None):
+        with self.database.connection() as conn:
+            conn.execute("BEGIN")
+            filters, args = [], []
+            before = None
+            if before_run_id:
+                before = conn.execute(
+                    "SELECT rowid,started_at FROM check_runs WHERE id=?", (before_run_id,)
+                ).fetchone()
+                if before is None:
+                    return {"items": [], "has_more": False, "next_offset": None,
+                            "next_before_run_id": None}
+            if job_id:
+                filters.append("r.job_id=?")
+                args.append(job_id)
+            if run_id:
+                filters.append("r.id=?")
+                args.append(run_id)
+            if before:
+                filters.append("(r.started_at<? OR (r.started_at=? AND r.rowid<?))")
+                args.extend((before["started_at"], before["started_at"], before["rowid"]))
+            where = "WHERE " + " AND ".join(filters) if filters else ""
+            args.extend((limit + 1, 0 if before else offset))
+            rows = conn.execute(f"""SELECT r.id,r.job_id,r.job_name,r.requested_at,r.started_at,r.finished_at,
+                r.outcome,r.successful_targets,r.failed_targets,r.triggered_by,r.search_revision,r.search_snapshot,
+                r.snapshot_known,r.intent_id,r.paused_manual,ci.requested_at AS intent_requested_at,
+                ci.eligible_at,j.search_revision AS current_search_revision,j.status AS job_status,
+                j.time_zone AS time_zone
+                FROM check_runs r LEFT JOIN check_intents ci ON ci.id=r.intent_id
+                LEFT JOIN jobs j ON j.id=r.job_id {where}
+                ORDER BY r.started_at DESC,r.rowid DESC LIMIT ? OFFSET ?""", args).fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            if not rows:
+                return {"items": [], "has_more": False, "next_offset": None,
+                        "next_before_run_id": None}
+
+            run_ids = [row["id"] for row in rows]
+            job_ids = list({row["job_id"] for row in rows if row["job_id"]})
+            run_marks = ",".join("?" for _ in run_ids)
+            result_rows = conn.execute(f"""SELECT id,run_id,job_id,target_id,practitioner_name,practice_name,
+                checked_at,status,slot_count,earliest_slot,count_complete,error_code,error_category,upstream_status,
+                retry_at,search_revision,published FROM check_results WHERE run_id IN ({run_marks})
+                ORDER BY checked_at,rowid""", run_ids).fetchall()
+            active_targets = set()
+            if job_ids:
+                job_marks = ",".join("?" for _ in job_ids)
+                active_targets = {row["id"] for row in conn.execute(
+                    f"SELECT id FROM targets WHERE active=1 AND job_id IN ({job_marks})", job_ids).fetchall()}
+            deliveries = conn.execute(f"""SELECT a.id,a.event_id,a.target_id,a.channel_name,a.channel,a.status,
+                a.attempt_count,a.created_at,a.sent_at,a.error_summary,a.next_attempt_at,a.delivery_state,
+                a.quiet_state,a.quiet_until,origin.id AS origin_result_id,origin.run_id AS originating_run_id,
+                confirmation.id AS confirmation_result_id,confirmation.run_id AS confirmation_run_id
+                FROM alerts a LEFT JOIN availability_events e ON e.id=a.event_id
+                LEFT JOIN check_results origin ON origin.id=e.result_id
+                LEFT JOIN check_results confirmation ON confirmation.id=a.result_id
+                WHERE origin.run_id IN ({run_marks})
+                ORDER BY a.created_at,a.rowid""", run_ids).fetchall()
+            deliveries_by_result = {}
+            for row in deliveries:
+                result_id = row["origin_result_id"]
+                code = row["error_summary"]
+                if (not isinstance(code, str) or len(code) > 80 or not code.isascii()
+                        or not all(char.isalnum() or char == "_" for char in code)):
+                    code = None
+                delivery = {"id": row["id"], "event_id": row["event_id"],
+                            "channel_name": row["channel_name"] or row["channel"],
+                            "channel_type": row["channel"], "status": row["status"],
+                            "attempts": row["attempt_count"], "created_at": row["created_at"],
+                            "accepted_at": row["sent_at"], "reason_code": code,
+                            "next_eligible_at": (row["quiet_until"] if row["quiet_state"] == "held" else
+                                None if row["quiet_state"] in ("waiting_for_fresh_check", "needs_manual_check", "cancelled") else
+                                row["next_attempt_at"]),
+                            "delivery_state": row["delivery_state"], "quiet_state": row["quiet_state"],
+                            "quiet_until": row["quiet_until"], "originating_run_id": row["originating_run_id"],
+                            "confirmation_run_id": row["confirmation_run_id"]}
+                deliveries_by_result.setdefault(result_id, []).append(delivery)
+
+            results_by_run = {run_id: [] for run_id in run_ids}
+            job_status_by_run = {run["id"]: run["job_status"] for run in rows}
+            for row in result_rows:
+                target_id = row["target_id"]
+                job_status = job_status_by_run[row["run_id"]]
+                category = row["error_category"]
+                if category not in {"upstream_rejected", "throttled", "upstream_error", "timeout", "connectivity",
+                                    "invalid_metadata", "malformed_response", "incomplete_response", "unknown"}:
+                    category = "unknown" if row["status"] == "error" else None
+                code = row["error_code"]
+                if (not isinstance(code, str) or len(code) > 80 or not code.isascii()
+                        or not all(char.isalnum() or char == "_" for char in code)):
+                    code = None
+                upstream_status = row["upstream_status"]
+                if not isinstance(upstream_status, int) or not 100 <= upstream_status <= 599:
+                    upstream_status = None
+                results_by_run[row["run_id"]].append({
+                    "id": row["id"], "target_id": target_id,
+                    "practitioner_name": row["practitioner_name"], "practice_name": row["practice_name"],
+                    "checked_at": row["checked_at"], "status": row["status"],
+                    "slot_count": row["slot_count"], "earliest_slot": row["earliest_slot"],
+                    "count_complete": bool(row["count_complete"]), "error_code": code,
+                    "error_category": category,
+                    "upstream_status": upstream_status, "retry_at": row["retry_at"],
+                    "search_revision": row["search_revision"], "published": bool(row["published"]),
+                    "target_removed": bool(target_id and job_status != "deleted" and target_id not in active_targets),
+                    "deliveries": deliveries_by_result.get(row["id"], []),
+                })
+
+            items = []
+            for row in rows:
+                snapshot = json.loads(row["search_snapshot"]) if row["search_snapshot"] else None
+                targets = snapshot.get("targets", []) if isinstance(snapshot, dict) else []
+                targets = targets if isinstance(targets, list) else []
+                safe_targets = [{key: target.get(key) for key in ("id", "practitioner_name", "practice_name", "motive_name")}
+                                for target in targets if isinstance(target, dict)]
+                results = results_by_run[row["id"]]
+                known = bool(row["snapshot_known"] and isinstance(snapshot, dict) and isinstance(snapshot.get("targets"), list))
+                expected_ids = {target["id"] for target in safe_targets if target.get("id")}
+                covered_ids = {result["target_id"] for result in results if result["target_id"]}
+                same_revision = (row["current_search_revision"] is not None and
+                                 row["current_search_revision"] == row["search_revision"])
+                history_state = ("historical" if row["job_status"] == "deleted" or row["search_revision"] is None
+                                 else "current" if same_revision else "superseded")
+                items.append({
+                    "id": row["id"], "job_id": row["job_id"], "job_name": row["job_name"],
+                    "job_status": row["job_status"], "time_zone": row["time_zone"],
+                    "requested_at": row["requested_at"] or row["intent_requested_at"],
+                    "started_at": row["started_at"], "finished_at": row["finished_at"],
+                    "outcome": row["outcome"], "triggered_by": row["triggered_by"],
+                    "intent_id": row["intent_id"], "intent_eligible_at": row["eligible_at"],
+                    "search_revision": row["search_revision"], "current_search_revision": row["current_search_revision"],
+                    "history_state": history_state, "snapshot_known": known,
+                    "target_total": len(expected_ids) if known else None, "target_completed": len(results),
+                    "target_successful": row["successful_targets"], "target_failed": row["failed_targets"],
+                    "coverage_complete": bool(known and expected_ids == covered_ids),
+                    "paused_manual": bool(row["paused_manual"]), "targets": safe_targets, "results": results,
+                })
+            return {"items": items, "has_more": has_more,
+                    "next_offset": offset + len(items) if has_more else None,
+                    "next_before_run_id": items[-1]["id"] if has_more else None}
 
     def latest_result(self, job_id):
         with self.database.connection() as conn:
