@@ -63,19 +63,28 @@ export function smtpController(state, {render, announce, refreshJobs}) {
       ui.draft.port !== state.smtp.port || ui.draft.tls_mode !== state.smtp.tls_mode ||
       ui.draft.sender_name !== String(state.smtp.sender_name || '') || ui.draft.sender_email_action !== 'keep';
     for (const field of secrets) if (payload[field + '_action'] !== 'replace') delete payload[field];
+    const confirmImpact = deliveries => {
+      const count = (deliveries || []).reduce((sum, item) => sum + item.count, 0);
+      if (!count) return true;
+      const names = deliveries.map(item => `${item.job_name} (${item.count})`);
+      const list = `${names.slice(0, 5).join(', ')}${names.length > 5 ? `, and ${names.length - 5} more jobs` : ''}`;
+      return window.confirm(`This SMTP change will cancel ${count} unsent ${count === 1 ? 'email delivery' : 'email deliveries'} for: ${list}. Continue?`);
+    };
     ui.busy = true; ui.error = null; render();
     try {
+      let impactToken;
       if (destinationChanged) {
         const impact = await api.smtpImpact(payload,state.smtp.edit_version);
-        const deliveries = impact.pending_email_deliveries || [];
-        const count = deliveries.reduce((sum, item) => sum + item.count, 0);
-        if (count) {
-          const names = deliveries.map(item => `${item.job_name} (${item.count})`);
-          const list = `${names.slice(0, 5).join(', ')}${names.length > 5 ? `, and ${names.length - 5} more jobs` : ''}`;
-          if (!window.confirm(`This SMTP change will cancel ${count} unsent ${count === 1 ? 'email delivery' : 'email deliveries'} for: ${list}. Continue?`)) return;
-        }
+        impactToken = impact.impact_token;
+        if (!confirmImpact(impact.pending_email_deliveries)) return;
       }
-      state.smtp = await api.updateSmtp(payload,state.smtp.edit_version); ui.draft = null; announce('SMTP transport saved.'); await refreshJobs();
+      try { state.smtp = await api.updateSmtp(payload,state.smtp.edit_version,impactToken); }
+      catch (error) {
+        if (error.detail?.code !== 'smtp_impact_changed') throw error;
+        if (!confirmImpact(error.detail.pending_email_deliveries)) return;
+        state.smtp = await api.updateSmtp(payload,state.smtp.edit_version,error.detail.impact_token);
+      }
+      ui.draft = null; announce('SMTP transport saved.'); await refreshJobs();
     }
     catch (error) { ui.error = error; if (error.status === 409 || error.ambiguous) { ui.blocked = true; ui.latest = null; await load(); } }
     finally { ui.busy = false; render(); }

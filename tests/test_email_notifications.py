@@ -130,10 +130,11 @@ def test_smtp_identity_change_fences_claim_before_data_permission(routed):
     assert claimed and claimed['channel'] == 'email'
 
     current = repo.get_smtp_transport(private=True)
+    impact_token = repo.smtp_delivery_impact()['impact_token']
     repo.update_smtp_transport({
         'host': 'replacement.example.org',
         'destination_identity': secrets.identity('replacement-smtp-destination'),
-    }, expected_version=current['edit_version'])
+    }, expected_version=current['edit_version'],expected_impact_token=impact_token)
 
     assert repo.begin_alert_attempt(claimed['id'], claimed['owner_token']) is None
     alert = next(item for item in repo.alerts() if item['id'] == claimed['id'])

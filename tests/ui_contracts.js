@@ -768,9 +768,24 @@ await test('Settings saves masked SMTP transport and email recipient, previews t
     equal(confirmations[0].writes,0,'confirmation must precede the settings write');equal(smtpWrites,0,'declining must not write SMTP settings');
     equal((await api.getSmtp()).host,saved.host,'declining must preserve the saved SMTP host');
     approveSmtpChange=true;
+    let injectImpactRace=true;
+    win.fetch=async(input,init)=>{
+      if(String(input).endsWith('/api/v1/settings/smtp') && init?.method==='PUT'){
+        smtpWrites++;
+        if(injectImpactRace){
+          injectImpactRace=false;
+          const body=JSON.parse(init.body);delete body.expected_impact_token;
+          const response=await originalFetch('/api/v1/settings/smtp/impact',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+          const impact=await response.json();
+          return new win.Response(JSON.stringify({detail:{code:'smtp_impact_changed',...impact}}),{status:409,headers:{'Content-Type':'application/json'}});
+        }
+      }
+      return originalFetch(input,init);
+    };
     doc.querySelector('#smtp-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
-    await waitUI(()=>doc.querySelector('#smtp-host')?.value==='smtp-renamed.example');
-    equal(confirmations.length,2);equal(confirmations[1].writes,0);equal(smtpWrites,1);
+    await waitUI(()=>smtpWrites===2 && doc.querySelector('#smtp-form button[type="submit"]')?.textContent==='Save SMTP transport');
+    equal(confirmations.length,2);equal(confirmations[1].writes,1,'changed impact must be reconfirmed after the rejected write');equal(smtpWrites,2);
+    equal((await api.getSmtp()).host,'smtp-renamed.example');
     win.fetch=originalFetch;
     doc.querySelector(`[data-channel-id="${email.id}"] [data-action="edit-channel"]`).click();equal(doc.querySelector('#channel-recipient').value,'');
     editControl(doc,win,'#channel-recipient_action','clear');

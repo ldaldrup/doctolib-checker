@@ -1,4 +1,5 @@
 """Named destination mutations and one-shot saved-configuration tests."""
+import hashlib
 import json
 import math
 import uuid
@@ -67,6 +68,12 @@ def expiry(days=7):
     return (datetime.now(timezone.utc)+timedelta(days=days)).isoformat(timespec='microseconds')
 
 
+class SmtpImpactChangedError(RuntimeError):
+    def __init__(self, impact):
+        super().__init__('smtp_impact_changed')
+        self.impact = impact
+
+
 class ChannelOperations:
     def _channel(self, conn, row, private=False):
         if row is None:
@@ -130,17 +137,26 @@ class ChannelOperations:
         with self.database.connection() as conn:
             return self._smtp(conn.execute('SELECT * FROM smtp_transport WHERE singleton_id=1').fetchone(),private)
 
-    def pending_smtp_deliveries(self):
-        """Return pending email deliveries that an SMTP destination change cancels."""
-        with self.database.connection() as conn:
-            rows = conn.execute("""SELECT j.id AS job_id,j.name AS job_name,COUNT(*) AS count
-                FROM alerts a JOIN notification_channels c ON c.id=a.channel_config_id
-                JOIN jobs j ON j.id=a.job_id
-                WHERE c.type='email' AND c.deleted=0 AND a.status IN ('pending','failed')
-                GROUP BY j.id,j.name ORDER BY j.name COLLATE NOCASE,j.id""").fetchall()
-            return [dict(row) for row in rows]
+    @staticmethod
+    def _smtp_delivery_impact(conn):
+        rows = conn.execute("""SELECT a.id,a.job_id,j.name AS job_name FROM alerts a
+            JOIN notification_channels c ON c.id=a.channel_config_id
+            LEFT JOIN jobs j ON j.id=a.job_id
+            WHERE c.type='email' AND c.deleted=0 AND a.status IN ('pending','failed')
+            ORDER BY j.name COLLATE NOCASE,a.job_id,a.id""").fetchall()
+        jobs = {}
+        for row in rows:
+            key = (row['job_id'],row['job_name'] or 'Unknown job')
+            jobs.setdefault(key,{'job_id':row['job_id'],'job_name':key[1],'count':0})['count'] += 1
+        identifiers = [(row['id'],row['job_id'],row['job_name']) for row in rows]
+        token = hashlib.sha256(json.dumps(identifiers,separators=(',',':')).encode()).hexdigest()
+        return {'impact_token':token,'pending_email_deliveries':list(jobs.values())}
 
-    def update_smtp_transport(self, values, expected_version, recover_failed=False):
+    def smtp_delivery_impact(self):
+        with self.database.connection() as conn:
+            return self._smtp_delivery_impact(conn)
+
+    def update_smtp_transport(self, values, expected_version, recover_failed=False, expected_impact_token=None):
         from app.storage.repositories import NotFoundError, VersionConflictError
         with self.database.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -152,6 +168,10 @@ class ChannelOperations:
             values = dict(values)
             destination_changed = (values.get('destination_identity',before['destination_identity']) != before['destination_identity']
                 or ('enabled' in values and bool(values['enabled']) != bool(before['enabled'])))
+            if destination_changed:
+                impact = self._smtp_delivery_impact(conn)
+                if impact['pending_email_deliveries'] and expected_impact_token != impact['impact_token']:
+                    raise SmtpImpactChangedError(impact)
             credentials_changed = any(key in values and values[key] != before[key]
                 for key in ('username_ciphertext','password_ciphertext'))
             changes = {key:value for key,value in values.items() if value != before[key]}

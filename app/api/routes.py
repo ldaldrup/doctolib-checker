@@ -12,7 +12,7 @@ from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRe
 from app.notification_secrets import SecretUnavailable
 from app.services.channel_tests import notification_preview, synthetic_alert
 from app.services.email_delivery import email_preview, mailbox, smtp_transport_usable, validate_smtp_host
-from app.storage.channel_operations import channel_secret_columns
+from app.storage.channel_operations import SmtpImpactChangedError, channel_secret_columns
 from app.webhooks import validate_endpoint
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
 from app.services.jobs import create_job, resolve_target, update_job
@@ -285,8 +285,10 @@ def create_router():
         values = smtp_values(request,body.model_dump(),existing)
         destination_changed = (values['destination_identity'] != existing['destination_identity']
             or bool(values['enabled']) != bool(existing['enabled']))
-        deliveries = repository.pending_smtp_deliveries() if destination_changed else []
-        return {'pending_email_deliveries':deliveries}
+        impact = repository.smtp_delivery_impact()
+        if not destination_changed:
+            impact['pending_email_deliveries'] = []
+        return impact
 
     @router.put('/api/v1/settings/smtp')
     def put_smtp_settings(body: SmtpTransportUpdateRequest, request: Request):
@@ -297,9 +299,11 @@ def create_router():
         values = smtp_values(request,body.model_dump(),existing)
         try:
             repository.update_smtp_transport(values,body.expected_version,
-                recover_failed=body.recover_failed)
+                recover_failed=body.recover_failed,expected_impact_token=body.expected_impact_token)
         except VersionConflictError as exc:
             raise version_conflict(exc)
+        except SmtpImpactChangedError as exc:
+            raise HTTPException(409,detail={'code':'smtp_impact_changed',**exc.impact})
         except NotFoundError:
             raise HTTPException(503,detail={'code':'smtp_transport_unavailable'})
         return smtp_public(request)

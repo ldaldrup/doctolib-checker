@@ -23,7 +23,7 @@ function responseError(status, body) {
     }
   }
   const fallback = {404: "This record no longer exists.", 409: "The operation conflicts with the current server state.", 422: "Check the supplied values.", 502: "Doctolib could not be reached. Try again later."};
-  const message = detail && typeof detail === "object" && !Array.isArray(detail) ? (detail.message || {version_conflict: "The saved version changed. Review the latest values.", idempotency_conflict: "This saved creation request conflicts with another request.", invalid_job: "The job configuration was rejected. Correct the draft and try again.", doctolib_unavailable: "Doctolib could not be reached. Retry the saved request later."}[detail.code] || fallback[status] || "The request could not be completed.") : typeof detail === "string" ? detail.replaceAll("_", " ")
+  const message = detail && typeof detail === "object" && !Array.isArray(detail) ? (detail.message || {version_conflict: "The saved version changed. Review the latest values.", smtp_impact_changed: "Pending email deliveries changed. Review the confirmation and try again.", idempotency_conflict: "This saved creation request conflicts with another request.", invalid_job: "The job configuration was rejected. Correct the draft and try again.", doctolib_unavailable: "Doctolib could not be reached. Retry the saved request later."}[detail.code] || fallback[status] || "The request could not be completed.") : typeof detail === "string" ? detail.replaceAll("_", " ")
     : Object.values(fields).join("; ") || fallback[status] || `The server returned an error (${status}).`;
   return new ApiError(message, {status, fields, detail, kind: status === 422 ? "validation" : status === 404 ? "missing" : status === 409 ? "conflict" : status === 502 ? "upstream" : "http"});
 }
@@ -79,7 +79,7 @@ const page = ({limit = 100, offset = 0, status} = {}) => {
 export const api = {
   getSmtp: () => request('/settings/smtp'),
   smtpImpact: (values, version) => request('/settings/smtp/impact', {method: 'POST', body: {...values, expected_version: version}}),
-  updateSmtp: (values, version) => request('/settings/smtp', {method: 'PUT', body: {...values, expected_version: version}}),
+  updateSmtp: (values, version, impactToken) => request('/settings/smtp', {method: 'PUT', body: {...values, expected_version: version, ...(impactToken ? {expected_impact_token: impactToken} : {})}}),
   listChannels: options => request("/channels", options),
   createChannel: (values, key) => request("/channels", {method: "POST", body: values, headers: {"Idempotency-Key": key}}),
   updateChannel: (id, values, version) => request(`/channels/${identifier(id)}`, {method: "PATCH", body: {...values, expected_version: version}}),

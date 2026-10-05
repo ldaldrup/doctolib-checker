@@ -148,6 +148,7 @@ class ChannelDeleteRequest(VersionedRequest):
 
 
 class SmtpTransportUpdateRequest(VersionedRequest):
+    expected_impact_token: Optional[str] = Field(default=None, min_length=64, max_length=64, pattern='^[a-f0-9]{64}$')
     enabled: bool
     host: str = Field(default='', max_length=253)
     port: StrictInt = Field(default=587, ge=1, le=65535)
