@@ -85,3 +85,59 @@ def test_saved_test_and_event_reject_same_private_destination_without_send(route
     assert saved['status']=='failed' and saved['attempt_count']==0
     assert alert['delivery_state']=='action_required' and alert['attempt_count']==0
     assert saved['error_code']==alert['error_summary']=='webhook_address_blocked'
+
+
+def test_ntfy_priority_is_saved_for_retries_and_saved_tests(routed):
+    from app.services.channel_tests import run_test_once
+    from app.webhooks import webhook_payload
+    db,repo,settings,secrets,job,_,_,observe = routed
+    channel,_ = repo.create_channel(dict(type='ntfy',name='Topic',enabled=True,
+        endpoint_ciphertext=secrets.encrypt('https://receiver.example/topic'),
+        destination_identity='topic',ntfy_priority=3),'priority','priority')
+    repo.update_job(job['id'],{'notification_channel_ids':[channel['id']]})
+    observe()
+    priorities = []
+    def sender(configured,alert):
+        priorities.append(webhook_payload(configured,alert)['priority'])
+        return DeliveryOutcome('retry','fixture_connect_error') if len(priorities)==1 else DeliveryOutcome('sent')
+    dispatcher = DeliveryService(repo,settings,sender)
+    assert dispatcher.run_once()
+    repo.reserve_channel_test(channel['id'],channel['edit_version'],'priority-test','priority-test')
+    repo.update_channel(channel['id'],{'ntfy_priority':5},channel['edit_version'])
+    with db.connection() as conn:
+        conn.execute("UPDATE alerts SET next_attempt_at=created_at WHERE status='failed'")
+    assert run_test_once(repo,settings,sender)
+    assert dispatcher.run_once()
+    assert priorities == [3,3,3]
+    assert repo.get_channel(channel['id'])['ntfy_priority'] == 5
+
+
+def test_schema10_migration_freezes_ntfy_priority_and_content(routed):
+    from app.services.channel_tests import run_test_once
+    from app.webhooks import webhook_payload
+    db,repo,settings,secrets,job,_,_,observe = routed
+    channel,_ = repo.create_channel(dict(type='ntfy',name='Topic',enabled=True,
+        endpoint_ciphertext=secrets.encrypt('https://receiver.example/topic'),
+        destination_identity='migration-topic',ntfy_priority=4),'migration-priority','migration-priority')
+    repo.update_job(job['id'],{'notification_channel_ids':[channel['id']]})
+    observe()
+    repo.reserve_channel_test(channel['id'],channel['edit_version'],'migration-test','migration-test')
+    with db.connection() as conn:
+        for table, columns in {'settings':['message_content','content_version'],
+                'jobs':['message_content','content_version','policy_version'],
+                'alerts':['message_content','event_snapshot','content_version','policy_version'],
+                'channel_tests':['message_content','ntfy_priority']}.items():
+            for column in columns:
+                conn.execute('ALTER TABLE '+table+' DROP COLUMN '+column)
+        conn.execute('UPDATE schema_version SET version=10')
+    db.initialize()
+    repo.update_channel(channel['id'],{'ntfy_priority':5},channel['edit_version'])
+    repo.update_settings({'message_content':{'preset':'compact','silent':True}},300)
+    snapshots = []
+    def sender(configured,alert):
+        snapshots.append((webhook_payload(configured,alert)['priority'],alert['message_content']))
+        return DeliveryOutcome('sent')
+    assert run_test_once(repo,settings,sender)
+    assert DeliveryService(repo,settings,sender).run_once()
+    assert [priority for priority,_ in snapshots] == [4,4]
+    assert all(content['preset']=='standard' and not content['silent'] for _,content in snapshots)

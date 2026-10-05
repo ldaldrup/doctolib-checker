@@ -1,8 +1,9 @@
 """One-shot, durably owned test sends, separate from availability events."""
 from dataclasses import replace
+import json
 
 from app.notification_secrets import NotificationSecrets, SecretUnavailable
-from app.notifications import DeliveryOutcome, format_slot_alert, send_telegram_alert
+from app.notifications import DeliveryOutcome, send_telegram_alert
 
 
 def synthetic_alert():
@@ -51,15 +52,12 @@ def send_configured(settings, configured, alert, before_send):
     return send_telegram_alert(configured, alert, before_send=before_send)
 
 
-def notification_preview(channel):
-    if channel['type'] == 'telegram':
-        return {'html':format_slot_alert(synthetic_alert())}
-    if channel['type'] == 'email':
-        from app.services.email_delivery import email_preview
-        return email_preview(synthetic_alert())
-    from app.webhooks import webhook_payload
-    return {'json':webhook_payload({'type':channel['type'],'endpoint':'https://example.org/example',
-                                  'ntfy_priority':channel['ntfy_priority']}, synthetic_alert())}
+def notification_preview(channel, content=None):
+    from app.notifications import render_notification
+    alert = synthetic_alert()
+    if channel['type'] == 'ntfy':
+        alert['ntfy_priority'] = channel.get('ntfy_priority', 3)
+    return render_notification(channel['type'], alert, content)
 
 
 def run_test_once(repository,settings,sender=None):
@@ -81,7 +79,9 @@ def run_test_once(repository,settings,sender=None):
         smtp_transport = (repository.get_smtp_transport(private=True)
                           if channel['type'] == 'email' else None)
         configured = channel_settings(settings,channel,smtp_transport)
-        alert = {**synthetic_alert(), 'event_id':test['id']}
+        alert = {**synthetic_alert(), 'event_id':test['id'], 'message_content':json.loads(test['message_content']) if test.get('message_content') else None}
+        if test.get('ntfy_priority') is not None:
+            alert['ntfy_priority'] = test['ntfy_priority']
         if sender is None:
             outcome = send_configured(settings,configured,alert,before_send)
         elif before_send():

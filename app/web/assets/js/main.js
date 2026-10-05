@@ -1,3 +1,4 @@
+import { readContent, defaultContent, previewText } from "./message-content.js";
 import { channelController } from "./pages/channels.js";
 import { smtpController } from './pages/smtp.js';
 import { renderDeliveryNotice } from "./delivery-view.js";
@@ -24,7 +25,7 @@ const channels = channelController(state, {render, announce, refreshJobs: () => 
 const smtp = smtpController(state, {render, announce, refreshJobs: () => refresh(true)});
 const route = () => location.hash === "#settings" ? "settings" : "jobs";
 const message = error => error?.message || "The request failed.";
-const settingsValues = settings => ({default_interval_seconds: settings.default_interval_seconds, request_spacing_seconds: settings.request_spacing_seconds});
+const settingsValues = settings => ({default_interval_seconds: settings.default_interval_seconds, request_spacing_seconds: settings.request_spacing_seconds, message_content: structuredClone(settings.message_content || defaultContent())});
 
 function announce(value) {
   clearTimeout(toastTimer); toast.textContent = value; toast.hidden = false;
@@ -244,11 +245,11 @@ function readDraft(form) {
     date_mode: data.get("date_mode"), horizon_days: form.querySelector("#horizon-days")?.value || state.formDraft?.horizon_days || 15,
     earliest_date: form.querySelector("#earliest-date")?.value || "", latest_date: form.querySelector("#latest-date")?.value || "",
     time_zone: state.original?.time_zone || state.settings.time_zone, insurance_sector: data.get("insurance_sector"),
-    telehealth: data.has("telehealth"), telegram_enabled: data.has("telegram_enabled"), notification_channel_ids: [...data.getAll("notification_channel_ids"), ...(state.formDraft?.notification_channel_ids || []).filter(id => ![...form.querySelectorAll('[name="notification_channel_ids"]')].some(input => input.value === id))]};
+    message_content: data.has("content-inherit") ? null : form.querySelector('[name="job-content-preset"]') ? readContent(form, "job-content") : structuredClone(state.settings.message_content || defaultContent()), telehealth: data.has("telehealth"), telegram_enabled: data.has("telegram_enabled"), notification_channel_ids: [...data.getAll("notification_channel_ids"), ...(state.formDraft?.notification_channel_ids || []).filter(id => ![...form.querySelectorAll('[name="notification_channel_ids"]')].some(input => input.value === id))]};
 }
 function readSettings(form) {
   const data = new FormData(form), interval = data.get("default_interval_choice");
-  return {default_interval_seconds: interval === "custom" ? form.querySelector("#default-interval")?.value : interval, request_spacing_seconds: data.get("request_spacing_seconds")};
+  return {default_interval_seconds: interval === "custom" ? form.querySelector("#default-interval")?.value : interval, request_spacing_seconds: data.get("request_spacing_seconds"), message_content: readContent(form, "settings-content")};
 }
 function showErrors(error, formId, errorId) {
   const form = document.getElementById(formId), output = document.getElementById(errorId); if (!form || !output) return;
@@ -297,7 +298,7 @@ async function submitJob(form, replay = false) {
 }
 let settingsSaveTimer, settingsEditRevision = 0;
 function settingsDiffer(draft, saved) {
-  return Object.keys(settingsValues(saved)).some(key => draft[key] === "" || Number(draft[key]) !== Number(saved[key]));
+  return Object.keys(settingsValues(saved)).some(key => key === "message_content" ? JSON.stringify(draft[key]) !== JSON.stringify(saved[key] || defaultContent()) : draft[key] === "" || Number(draft[key]) !== Number(saved[key]));
 }
 function settingsFeedback() {
   document.getElementById("settings-form")?.setAttribute("aria-busy", String(state.settingsSubmitting));
@@ -310,6 +311,7 @@ function settingsFeedback() {
   });
 }
 function settingsEdited(immediate = false) {
+  state.contentPreview = null; state.contentPreviewError = null;
   state.settingsDraft = readSettings(document.getElementById("settings-form"));
   state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
   if (!state.remoteSettingsChanged) state.settingsError = null; settingsEditRevision++;
@@ -419,6 +421,16 @@ document.addEventListener("click", async event => {
     if (action === "remove-target" && state.formDraft.target_urls.length > 1) state.formDraft.target_urls.splice(Number(control.dataset.index), 1);
     render(); document.getElementById(`target-${action === "add-target" ? state.formDraft.target_urls.length - 1 : Math.max(0, Number(control.dataset.index) - 1)}`)?.focus(); return;
   }
+  if (action === "preview-message-content") {
+    const type = document.getElementById('message-preview-type').value; state.contentPreviewType = type;
+    const content = readContent(document.getElementById('settings-form'), 'settings-content');
+    const previewRevision = settingsEditRevision;
+    state.contentPreviewBusy = true; state.contentPreview = null; state.contentPreviewError = null; render();
+    try { const preview = await api.notificationPreview(type, content); if (settingsEditRevision === previewRevision) state.contentPreview = previewText(preview); }
+    catch (error) { if (settingsEditRevision === previewRevision) { state.contentPreviewError = message(error); state.contentPreview = null; } }
+    finally { state.contentPreviewBusy = false; render(); }
+    return;
+  }
   if (action === "retry-settings") { submitSettings(); return; }
   if (action === "retry-create" && state.uncertainCreate) { submitJob(null, true); return; }
   if (action === "refetch-job-conflict" && state.editingId) {
@@ -496,6 +508,7 @@ document.addEventListener("change", event => {
   if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); refresh(); return; }
   if (event.target.closest("#job-form")) state.formDraft = readDraft(document.getElementById("job-form"));
   if (event.target.closest("#settings-form") && !event.target.name.startsWith("reconcile-")) settingsEdited(event.target.type === "radio");
+  if (["content-inherit", "job-content-preset", "settings-content-preset"].includes(event.target.name)) render();
   const toggle = (wrapperId, custom, inputId) => {
     const wrapper = document.getElementById(wrapperId), input = document.getElementById(inputId);
     if (wrapper) wrapper.hidden = !custom;

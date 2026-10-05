@@ -5,9 +5,10 @@ import json
 from dataclasses import dataclass
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
 
 import requests
 from colorama import Fore, Style
@@ -107,25 +108,149 @@ def send_telegram(config, text, silent=None, effect_id=None, max_attempts=5):
     return False
 
 
-def format_slot_alert(alert):
-    practitioner = escape(str(alert.get("practitioner_name", "Practitioner")))
-    practice = escape(str(alert.get("practice_name", "Practice")))
-    slot_value = str(alert.get("earliest_slot", ""))
+CONTENT_FIELDS = ('job_name', 'practitioner', 'practice', 'earliest_appointment',
+                  'check_time', 'time_zone', 'booking_link')
+STANDARD_FIELDS = ('practitioner', 'practice', 'earliest_appointment', 'booking_link')
+COMPACT_FIELDS = ('practitioner', 'earliest_appointment', 'booking_link')
+
+
+def normalize_content(value=None):
+    """Validate the structured vocabulary and resolve preset fields."""
+    options = {'preset': 'standard', 'silent': False} if value is None else value
+    if (not isinstance(options, dict) or set(options) - {'preset', 'fields', 'silent'} or
+            options.get('preset', 'standard') not in ('standard', 'compact', 'custom') or
+            type(options.get('silent', False)) is not bool):
+        raise ValueError('invalid_message_content')
+    fields = options.get('fields', [])
+    preset = options.get('preset', 'standard')
+    if (not isinstance(fields, list) or any(not isinstance(field, str) or field not in CONTENT_FIELDS for field in fields) or
+            len(set(fields)) != len(fields) or (preset == 'custom' and not fields)):
+        raise ValueError('invalid_message_content')
+    chosen = STANDARD_FIELDS if preset == 'standard' else COMPACT_FIELDS if preset == 'compact' else fields
+    return {'preset': preset, 'fields': list(chosen), 'silent': options.get('silent', False)}
+
+
+def render_notification(channel_type, alert, content=None):
+    """Pure structured renderer shared by previews and saved event deliveries."""
+    options = normalize_content(content if content is not None else alert.get('message_content'))
+    fields, preset, silent = options['fields'], options['preset'], options['silent']
+    if channel_type not in ('telegram', 'ntfy', 'email', 'webhook'):
+        raise ValueError('unsupported_notification_channel')
+    if silent and channel_type not in ('telegram', 'ntfy'):
+        raise ValueError('unsupported_silent_option')
+    if channel_type == 'webhook':
+        return {'schema_version': 1, 'event_id': alert.get('event_id') or 'synthetic-test',
+            'trigger': alert.get('triggered_by') or 'test', 'search_revision': alert.get('search_revision'),
+            'job': {'id': alert.get('job_id'), 'name': alert.get('job_name', '')},
+            'target': {'id': alert.get('target_id'), 'practitioner_name': alert.get('practitioner_name', ''),
+                'practice_name': alert.get('practice_name', '')},
+            'earliest_slot': alert.get('earliest_slot'), 'slot_count': alert.get('slot_count', 1),
+            'checked_at': alert.get('checked_at'), 'time_zone': alert.get('time_zone') or 'UTC',
+            'booking_url': alert.get('booking_url', '')}
+    warnings = []
+
+    def clean(value, fallback='Unavailable'):
+        raw = str(value or fallback)
+        text = ''.join(c for c in raw if ord(c) >= 32 and ord(c) != 127)
+        if text != raw:
+            warnings.append('Control characters removed.')
+        if len(text) > 160:
+            warnings.append('Long fields truncated to 160 characters.')
+            text = text[:159] + '…'
+        return text
+
+    def html(value):
+        # Escape whole characters, never split an HTML entity or tag.
+        if len(escape(value)) > 384:
+            warnings.append('Escaped fields truncated to fit the channel.')
+            while len(escape(value + '…')) > 384:
+                value = value[:-1]
+            value += '…'
+        return escape(value)
+
+    zone = clean(alert.get('time_zone'), 'UTC')
     try:
-        slot_time = datetime.fromisoformat(slot_value.replace("Z", "+00:00"))
-        slot = slot_time.astimezone(ZoneInfo(alert.get("time_zone") or "UTC")).strftime("%Y-%m-%d %H:%M %Z")
+        tz = ZoneInfo(zone)
     except (ValueError, KeyError):
-        slot = slot_value
-    slot = escape(slot)
-    booking_url = escape(str(alert.get("booking_url", "")), quote=True)
-    count = int(alert.get("slot_count", 1))
-    return (
-        f"<b>{count} matching appointment slot(s)</b>\n\n"
-        f"👨‍⚕️ {practitioner}\n"
-        f"🏥 {practice}\n"
-        f"📅 Earliest: <b>{slot}</b>\n\n"
-        f'<a href="{booking_url}">Open booking on Doctolib</a>'
-    )
+        zone, tz = 'UTC', timezone.utc
+        warnings.append('Invalid time zone replaced with UTC.')
+
+    def stamp(value):
+        if not value:
+            return 'Unavailable'
+        try:
+            moment = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+                warnings.append('Timestamp without a time zone treated as UTC.')
+            return moment.astimezone(tz).strftime('%Y-%m-%d %H:%M %Z')
+        except (ValueError, OverflowError):
+            warnings.append('Invalid timestamp shown as unavailable.')
+            return 'Unavailable'
+
+    booking = str(alert.get('booking_url') or '')
+    try:
+        url = urlsplit(booking)
+        if (url.scheme != 'https' or not url.hostname or url.username is not None or
+                url.password is not None or any(ord(c) <= 32 or ord(c) == 127 for c in booking) or
+                '\\' in booking or len(escape(booking, quote=True)) > 1024):
+            booking = ''
+    except ValueError:
+        booking = ''
+    if not booking:
+        warnings.append('Booking link unavailable or unsafe; omitted.')
+    values = {'job_name': clean(alert.get('job_name')),
+        'practitioner': clean(alert.get('practitioner_name'), 'Practitioner'),
+        'practice': clean(alert.get('practice_name'), 'Practice'),
+        'earliest_appointment': stamp(alert.get('earliest_slot')),
+        'check_time': stamp(alert.get('checked_at')), 'time_zone': zone}
+    labels = {'job_name': 'Job', 'practitioner': 'Practitioner', 'practice': 'Practice',
+        'earliest_appointment': 'Earliest', 'check_time': 'Checked', 'time_zone': 'Time zone'}
+    chosen = STANDARD_FIELDS if preset == 'standard' else COMPACT_FIELDS if preset == 'compact' else fields
+    try:
+        count = max(1, min(999999, int(alert.get('slot_count', 1))))
+    except (ValueError, TypeError, OverflowError):
+        count = 1
+    heading = f'{count} matching appointment slot(s)'
+    lines, html_lines = [heading], ['<b>' + heading + '</b>']
+    for field in chosen:
+        if field == 'booking_link':
+            continue
+        value = values[field]
+        if preset == 'standard' and field in ('practitioner', 'practice'):
+            lines.append(value)
+            html_lines.append(('👨‍⚕️ ' if field == 'practitioner' else '🏥 ') + html(value))
+        else:
+            lines.append(labels[field] + ': ' + value)
+            html_lines.append(('📅 ' if field == 'earliest_appointment' else '') + labels[field] + ': ' +
+                ('<b>' + html(value) + '</b>' if field == 'earliest_appointment' else html(value)))
+    link = booking if 'booking_link' in chosen else ''
+    text = '\n'.join(lines) + ('\n\nOpen booking on Doctolib: ' + link if link else '')
+    if channel_type == 'telegram':
+        rendered = (html_lines[0] + '\n\n' + '\n'.join(html_lines[1:])
+                    if preset == 'standard' else '\n'.join(html_lines))
+        if link:
+            rendered += '\n\n<a href="' + escape(link, quote=True) + '">Open booking on Doctolib</a>'
+        return {'text': rendered, 'parse_mode': 'HTML', 'disable_notification': silent,
+                'warnings': list(dict.fromkeys(warnings))}
+    if channel_type == 'ntfy':
+        # Standard preserves the event marker and uses the configured local time.
+        if preset == 'standard':
+            lines = [heading, values['practitioner'], values['practice'],
+                'Earliest: ' + values['earliest_appointment'] + ' (' + zone + ')',
+                'Event: ' + clean(alert.get('event_id'), 'synthetic-test')]
+        return {'title': 'Matching appointment available', 'message': '\n'.join(lines),
+                'click': link, 'silent': silent, 'priority': 1 if silent else alert.get('ntfy_priority', 3),
+                'warnings': list(dict.fromkeys(warnings))}
+    rendered = '<p>' + '</p><p>'.join(escape(line) for line in lines) + '</p>'
+    if link:
+        rendered += '<p><a href="' + escape(link, quote=True) + '">Open booking on Doctolib</a></p>'
+    return {'subject': 'Matching appointment available', 'text': text, 'html': rendered,
+            'warnings': list(dict.fromkeys(warnings))}
+
+
+def format_slot_alert(alert):
+    return render_notification('telegram', alert)['text']
 
 
 @dataclass(frozen=True)
@@ -251,8 +376,10 @@ def _known_presend_failure(exc):
 
 
 def _telegram_payload(settings, alert):
-    return {"chat_id": settings.telegram_chat_id, "text": format_slot_alert(alert),
-            "parse_mode": "HTML", "disable_web_page_preview": True}
+    rendered = render_notification('telegram', alert)
+    return {'chat_id': settings.telegram_chat_id, 'text': rendered['text'],
+            'parse_mode': 'HTML', 'disable_notification': rendered['disable_notification'],
+            'disable_web_page_preview': True}
 
 
 def _telegram_attempt(settings, alert, session, payload=None):

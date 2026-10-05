@@ -1,3 +1,4 @@
+import { contentControls, CONTENT_PRESETS, readContent, previewText } from '/assets/js/message-content.js';
 import { renderChannels } from "/assets/js/pages/channels.js";
 import { deliveryNotice } from "/assets/js/delivery-view.js";
 import { api, ApiError, createJobPayload, updateJobPayload, settingsPayload } from '/assets/js/api.js';
@@ -479,6 +480,7 @@ await test('external settings conflict preserves newer draft and stops retries u
     assert(doc.querySelector('#settings-remote-notice').textContent.includes('Server: 6'));
     doc.querySelector('[name="reconcile-default_interval_seconds"][value="server"]').click();
     doc.querySelector('[name="reconcile-request_spacing_seconds"][value="draft"]').click();
+    doc.querySelector('[name="reconcile-message_content"][value="server"]').click();
     doc.querySelector('[data-action="reconcile-settings"]').click();
     await waitUI(() => writes === 2 && doc.querySelector('[data-setting-warning="request_spacing_seconds"]')?.hidden);
     const reconciled = await api.getSettings(); equal(reconciled.request_spacing_seconds, 5); equal(reconciled.default_interval_seconds, 900);
@@ -758,15 +760,17 @@ await test('Settings saves masked SMTP transport and email recipient, previews t
     const queued=(await (await nativeFetch('/api/v1/alerts?limit=100')).json()).find(alert=>alert.job_name==='Email route' && alert.status==='pending');
     assert(queued,'fixture check should queue an email delivery for the route');
     win.location.hash='#settings';await waitUI(()=>doc.querySelector(`[data-channel-id="${email.id}"] [data-action="edit-channel"]`));
+    confirmations.length=0;
     editControl(doc,win,'#smtp-host','smtp-renamed.example');
-    const originalFetch=win.fetch.bind(win);
+
     win.fetch=async(input,init)=>{if(String(input).endsWith('/api/v1/settings/smtp') && init?.method==='PUT')smtpWrites++;return originalFetch(input,init);};
     approveSmtpChange=false;
     doc.querySelector('#smtp-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
     await waitUI(()=>confirmations.length===1);
-    assert(confirmations[0].message.includes('1 unsent email delivery') && confirmations[0].message.includes('Email route (1)'),'SMTP identity change should name its pending delivery');
+    assert(confirmations[0].message.includes('1 unsent email delivery') && confirmations[0].message.includes('Email route (1)'),`SMTP identity change should name its pending delivery: ${confirmations[0].message}`);
     equal(confirmations[0].writes,0,'confirmation must precede the settings write');equal(smtpWrites,0,'declining must not write SMTP settings');
     equal((await api.getSmtp()).host,saved.host,'declining must preserve the saved SMTP host');
+    confirmations.length=0;
     approveSmtpChange=true;
     let injectImpactRace=true;
     win.fetch=async(input,init)=>{
@@ -793,6 +797,54 @@ await test('Settings saves masked SMTP transport and email recipient, previews t
     await waitUI(()=>!doc.querySelector('#channel-form'));email=(await api.listChannels()).items.find(item=>item.id===email.id);
     assert(!email.usable && !email.recipient_set);
   } finally {frame.remove();if(createdJob)await remove(createdJob.id);if(email)await api.deleteChannel(email.id,email.edit_version);}
+});
+await test('structured content controls keep presets, custom fields and explicit job inheritance', () => {
+  equal(previewText({schema_version:1,event_id:'example'}),JSON.stringify({schema_version:1,event_id:'example'},null,2));
+  equal(previewText({text:'<b>Example &lt;Practitioner&gt;</b>',parse_mode:'HTML',warnings:['Shortened.']}),'Example <Practitioner>\n\nRendering notes: Shortened.');
+  const form=document.createElement('form');
+  form.innerHTML=contentControls({preset:'compact',fields:CONTENT_PRESETS.compact,silent:true},'test-content');
+  equal(readContent(form,'test-content'),{preset:'compact',fields:CONTENT_PRESETS.compact,silent:true});
+  form.querySelector('[name="test-content-preset"]').value='custom';
+  equal(readContent(form,'test-content').fields,CONTENT_PRESETS.compact);
+  form.innerHTML=contentControls({preset:'custom',fields:['practice','booking_link'],silent:false},'test-content');
+  equal(readContent(form,'test-content'),{preset:'custom',fields:['practice','booking_link'],silent:false});
+  const defaults={...settings,message_content:{preset:'compact',fields:CONTENT_PRESETS.compact,silent:false}};
+  equal(createJobPayload({...draft,message_content:null},defaults).message_content,null);
+  const override={preset:'custom',fields:['earliest_appointment'],silent:false};
+  equal(updateJobPayload({...draft,message_content:override},{...job,message_content:null},defaults).message_content,override);
+  equal(updateJobPayload({...draft,message_content:null},{...job,message_content:override},defaults).message_content,null);
+  equal(settingsPayload({...defaults,default_interval_seconds:300,request_spacing_seconds:3,message_content:override},defaults).message_content,override);
+});
+await test('content previews render draft without sending and job override persists after reload',async()=>{
+  const original=await api.getSettings(),frame=document.createElement('iframe');frame.src='/#settings';document.body.append(frame);let saved;
+  try{
+    await waitUI(()=>frame.contentDocument?.querySelector('#settings-content-preset'));
+    const doc=frame.contentDocument,win=frame.contentWindow;let sends=0;
+    const fetch=win.fetch.bind(win);win.fetch=async(input,init)=>{if(String(input).endsWith('/tests'))sends++;return fetch(input,init);};
+    editControl(doc,win,'#settings-content-preset','compact');
+    await waitUI(()=>doc.querySelector('[data-setting-warning="message_content"]').hidden);
+    equal((await api.getSettings()).message_content.preset,'compact');
+    for(const type of ['telegram','ntfy','email','webhook']){
+      editControl(doc,win,'#message-preview-type',type);doc.querySelector('[data-action="preview-message-content"]').click();
+      await waitUI(()=>doc.querySelector('.message-preview-controls .channel-preview'));
+      assert(doc.querySelector('.message-preview-controls').textContent.includes('Synthetic example only'));equal(sends,0);
+    }
+    win.location.hash='#jobs';await waitUI(()=>doc.querySelector('[name="content-inherit"]'));
+    assert(doc.querySelector('[name="content-inherit"]').checked);
+    doc.querySelector('[name="content-inherit"]').click();
+    equal(doc.querySelector('#job-content-preset').value,'compact');
+    editControl(doc,win,'#job-content-preset','custom');
+    editControl(doc,win,'#job-name','Content override');editControl(doc,win,'#target-0',fixtureBooking);
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>[...doc.querySelectorAll('#job-list h2')].some(node=>node.textContent==='Content override'));
+    saved=(await api.listJobs()).find(item=>item.name==='Content override');equal(saved.message_content.preset,'custom');
+    doc.querySelector(`[data-job-id="${saved.id}"] [data-action="edit"]`).click();
+    assert(!doc.querySelector('[name="content-inherit"]').checked);equal(doc.querySelector('#job-content-preset').value,'custom');
+    doc.querySelector('[name="content-inherit"]').click();
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>!doc.querySelector('[data-action="cancel-edit"]'));
+    equal((await api.getJob(saved.id)).message_content,null);
+  }finally{frame.remove();if(saved)await remove(saved.id);const latest=await api.getSettings();await api.updateSettings({default_interval_seconds:original.default_interval_seconds,request_spacing_seconds:original.request_spacing_seconds,message_content:original.message_content},{expectedVersion:latest.edit_version});}
 });
 document.querySelector('#results').textContent = lines.join('\n');
 document.documentElement.dataset.contracts = lines.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';

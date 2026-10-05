@@ -85,7 +85,7 @@ def test_import_idempotent_no_overwrite_and_preview(setup):
     replay=client.post('/api/v1/channels/import-legacy',headers={'Idempotency-Key':'import2'})
     assert replay.status_code==200 and replay.json()['name']=='My name'
     assert client.get('/api/v1/channels').json()['total']==1
-    preview=client.get('/api/v1/channels/'+cid+'/preview').json()['html']
+    preview=client.get('/api/v1/channels/'+cid+'/preview').json()['text']
     assert '&lt;Practitioner&gt;' in preview and 'Example &amp; Practice' in preview
     assert TOKEN not in preview and CHAT not in preview
 

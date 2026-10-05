@@ -620,7 +620,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -928,7 +928,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 10
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 11
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
@@ -1048,7 +1048,7 @@ def drop_revision_columns(conn, *, alerts=True):
         "jobs": ("lock_owner_token", "search_revision", "edit_version"),
         "check_runs": ("search_revision", "search_snapshot", "snapshot_known", "owner_token"),
         "check_results": ("search_revision", "snapshot_known", "published"),
-        "alerts": ("search_revision",) if alerts else (),
+        "alerts": ("search_revision", "message_content", "event_snapshot", "content_version", "policy_version") if alerts else (),
     }.items():
         for column in columns:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")

@@ -1,4 +1,4 @@
-"""Each durable retry refreshes its payload and uses current revision evidence."""
+"""Retries refresh eligibility evidence while retaining their original content."""
 
 from datetime import datetime
 
@@ -9,7 +9,7 @@ from app.storage.repositories import iso, utc_now
 from test_backend_journey import create_job, record_result, setup_backend
 
 
-def test_retry_turn_uses_freshly_revalidated_payload_for_same_episode(tmp_path):
+def test_retry_turn_uses_fresh_eligibility_and_saved_payload_for_same_episode(tmp_path):
     client, repository, settings, doctolib = setup_backend(tmp_path)
     job = create_job(client)
     CheckService(repository, doctolib, settings).run_due()
@@ -39,6 +39,6 @@ def test_retry_turn_uses_freshly_revalidated_payload_for_same_episode(tmp_path):
     assert not dispatcher.run_once()  # Cancellation is never revived implicitly.
     assert repository.recover_alert(original['id'])
     assert dispatcher.run_once()
-    assert messages[-1] == 'New practitioner label' and len(messages) == 2
+    assert messages[-1] == messages[0] and len(messages) == 2
     assert repository.alerts()[0]['status'] == 'sent'
     assert len(repository.alerts()) == 1

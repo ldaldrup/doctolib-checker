@@ -90,7 +90,7 @@ def create_harness(directory):
     def contracts():
         return HTMLResponse('<!doctype html><html lang="en"><title>UI contracts</title>'
                             '<h1>Native browser contracts</h1><pre id="results">Running…</pre>'
-                            '<script type="module" src="/__test/contracts.js"></script></html>')
+                            f'<script type="module" src="/__test/contracts.js?v={Path(__file__).with_name("ui_contracts.js").stat().st_mtime_ns}"></script></html>')
 
     @app.get("/__test/contracts.js", include_in_schema=False)
     def contracts_script():

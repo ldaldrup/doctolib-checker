@@ -178,3 +178,14 @@
 .channel-preview { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .channel-deliveries { margin: 8px 0; padding-left: 18px; color: var(--color-muted); font-size: 12px; }
 #channel-settings .settings-control { flex-wrap: wrap; }
+
+.message-content-controls { display: grid; gap: 12px; width: 100%; min-width: 0; }
+.message-field-options { display: grid; gap: 8px; padding: 0; border: 0; min-width: 0; }
+.message-field-options legend { margin-bottom: 8px; font-weight: 600; }
+.message-preview-controls { display: grid; gap: 12px; padding: 16px 20px; }
+.message-preview-controls .select, .message-preview-controls .button { width: fit-content; max-width: 100%; }
+.message-content-controls .checkbox-line { min-height: 44px; gap: 12px; }
+.settings-row:has(.message-content-controls) { align-items: start; }
+
+.settings-row:has(.message-content-controls) { grid-template-columns: minmax(180px, 1fr) minmax(240px, 2fr); }
+@media (max-width: 767px) { .settings-row:has(.message-content-controls) { grid-template-columns: 1fr; } }

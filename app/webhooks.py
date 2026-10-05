@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from app.notifications import (DeliveryOutcome, SEND_BUDGET_SECONDS,
     CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES,
-    send_bounded_attempt)
+    send_bounded_attempt, render_notification)
 
 MAX_PAYLOAD_BYTES = 16384
 PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in
@@ -97,21 +97,11 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 def webhook_payload(channel, alert):
     if channel['type'] == 'ntfy':
+        rendered = render_notification('ntfy', {'ntfy_priority': channel.get('ntfy_priority', 3), **alert})
         topic = urlsplit(channel['endpoint']).path.rsplit('/', 1)[-1]
-        return {'topic': topic, 'title': 'Matching appointment available',
-            'message': f"{alert.get('slot_count', 1)} matching appointment slot(s)\n"
-                f"{alert.get('practitioner_name', 'Practitioner')}\n{alert.get('practice_name', 'Practice')}\n"
-                f"Earliest: {alert.get('earliest_slot', '')} ({alert.get('time_zone') or 'UTC'})\n"
-                f"Event: {alert.get('event_id') or 'synthetic-test'}",
-            'click': alert.get('booking_url', ''), 'priority': channel.get('ntfy_priority', 3)}
-    return {'schema_version': 1, 'event_id': alert.get('event_id') or 'synthetic-test',
-        'trigger': alert.get('triggered_by') or 'test', 'search_revision': alert.get('search_revision'),
-        'job': {'id': alert.get('job_id'), 'name': alert.get('job_name', '')},
-        'target': {'id': alert.get('target_id'), 'practitioner_name': alert.get('practitioner_name', ''),
-            'practice_name': alert.get('practice_name', '')},
-        'earliest_slot': alert.get('earliest_slot'), 'slot_count': alert.get('slot_count', 1),
-        'checked_at': alert.get('checked_at'), 'time_zone': alert.get('time_zone') or 'UTC',
-        'booking_url': alert.get('booking_url', '')}
+        return {'topic': topic, 'title': rendered['title'], 'message': rendered['message'],
+            'click': rendered['click'], 'priority': rendered['priority']}
+    return render_notification('webhook', alert)
 
 
 def _prepare(channel, allowlist):

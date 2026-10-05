@@ -1,3 +1,4 @@
+import { previewText } from "../message-content.js";
 import { api } from "../api.js";
 import { escapeHtml as h, icon } from "../ui.js";
 
@@ -17,7 +18,7 @@ export function renderChannels(state) {
     ${state.settings?.legacy_telegram_available && !state.settings?.legacy_telegram_imported ? `<p class="notice"><span>Legacy environment Telegram settings are available. Import once as Telegram1 and map existing opted-in jobs.</span><button type="button" class="text-button" data-action="import-telegram" ${ui.busy || unavailable ? "disabled" : ""}>Import Telegram1</button></p>` : ""}
     ${ui.error ? `<p class="form-error" role="alert">${h(errorText(ui.error))}</p>` : ""}
     ${state.channels === null ? '<p>Loading saved channels…</p>' : channels.length ? channels.map(channel => `<div class="settings-row" data-channel-id="${h(channel.id)}"><div><h3>${h(channel.name)}</h3><p>${h(typeLabel(channel.type))} · ${channel.enabled ? channel.usable ? "Ready" : "Incomplete" : "Disabled"} · ${h(destinationSummary(channel))}</p>${ui.tests?.[channel.id] ? `<p role="status">${h(testFeedback(ui.tests[channel.id], channel.type))}</p><button type="button" class="text-button" data-action="channel-test-status">${ui.tests[channel.id].uncertain ? "Retry same test request" : "Check test status"}</button>` : ""}</div><div class="settings-control"><button class="text-button" type="button" data-action="edit-channel" ${locked || draft ? "disabled" : ""}>Edit</button><button class="text-button" type="button" data-action="preview-channel" ${ui.busy ? "disabled" : ""}>Preview</button><button class="text-button" type="button" data-action="test-channel" ${ui.busy || !channel.enabled || !channel.usable || ui.testAttempts?.[channel.id] ? "disabled" : ""}>Send test</button><button class="text-button" type="button" data-action="delete-channel" ${locked || draft ? "disabled" : ""}>Delete</button></div></div>`).join("") : '<p class="muted">No saved notification channels. Jobs can still check with notifications off.</p>'}
-    ${ui.preview ? `<div class="notice"><div><h3>Synthetic notification preview</h3><p>No appointment data or message is sent.</p><pre class="channel-preview">${h(ui.preview)}</pre><button class="text-button" type="button" data-action="close-channel-preview">Close preview</button></div></div>` : ""}
+    ${ui.preview ? `<div class="notice"><div><h3>Synthetic notification preview</h3><p>Saved Settings content. No appointment data or message is sent.</p><pre class="channel-preview">${h(ui.preview)}</pre><button class="text-button" type="button" data-action="close-channel-preview">Close preview</button></div></div>` : ""}
     ${draft ? `<form id="channel-form" class="channel-form" autocomplete="off" aria-busy="${Boolean(ui.busy)}"><h3>${ui.original ? `Edit ${h(ui.original.name)}` : "New notification channel"}</h3><fieldset ${locked ? "disabled" : ""}><div class="field"><label for="channel-name">Name</label><input class="input" id="channel-name" name="name" maxlength="120" value="${h(draft.name)}" required></div><label class="checkbox-line"><span>Enabled</span><input name="enabled" type="checkbox" ${draft.enabled ? "checked" : ""}></label>
       ${ui.original ? `<p>${h(typeLabel(draft.type))}. To change type, create another channel.</p>` : `<div class="field"><label for="channel-type">Type</label><select class="select" id="channel-type" name="type">${["telegram", "ntfy", "webhook", 'email'].map(type => `<option value="${type}" ${draft.type === type ? "selected" : ""}>${typeLabel(type)}</option>`).join("")}</select></div>`}
       ${draft.type === "telegram" ? `${credentialField("bot_token", "Bot token", "token_action", draft, ui.original?.bot_token_set)}${credentialField("chat_id", "Recipient chat ID", "chat_action", draft, ui.original?.chat_id_set)}` : draft.type === 'email' ? `${credentialField('recipient','Recipient email address','recipient_action',draft,ui.original?.recipient_set)}<p class="muted">One recipient per channel. Configure and enable the SMTP transport above before sending a test.</p>` : endpointFields(draft, ui.original)}
@@ -141,18 +142,18 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
         ui.importKey ||= crypto.randomUUID(); await api.importLegacyChannel(ui.importKey); announce("Legacy Telegram1 imported."); await load(); await refreshJobs();
       } else if (channel && action === "preview-channel") {
         const preview = await api.channelPreview(channel.id);
-        ui.preview = preview.html ? new DOMParser().parseFromString(preview.html, "text/html").body.textContent : preview.subject ? `${preview.subject}\n\n${preview.text}` : JSON.stringify(preview.json, null, 2);
+        ui.preview = previewText(preview);
       } else if (channel && action === "delete-channel") {
         const jobs = (channel.affected_jobs || []).map(job => job.name).join(", ");
         if (window.confirm(`Delete ${channel.name}? Affected jobs: ${jobs || "none"}. Unsent deliveries are cancelled. History is retained.`)) { await api.deleteChannel(channel.id, channel.edit_version); await load(); await refreshJobs(); }
       } else if (channel && ["test-channel", "channel-test-status"].includes(action)) {
         const prior = ui.tests[channel.id];
         if (action === "channel-test-status" && prior?.id) { await poll(channel.id, prior.id); return true; }
-        const attempt = ui.testAttempts[channel.id] || {key: crypto.randomUUID(), version: channel.edit_version};
+        const attempt = ui.testAttempts[channel.id] || {key: crypto.randomUUID(), version: channel.edit_version, contentVersion: state.settings?.content_version};
         if (!ui.testAttempts[channel.id] && !window.confirm(`Send a synthetic ${typeLabel(channel.type)} test to ${channel.name}?`)) return true;
         ui.testAttempts[channel.id] = attempt;
         try {
-          const saved = await api.testChannel(channel.id, attempt.version, attempt.key); ui.tests[channel.id] = saved;
+          const saved = await api.testChannel(channel.id, attempt.version, attempt.key, attempt.contentVersion); ui.tests[channel.id] = saved;
           delete ui.testAttempts[channel.id]; if (!terminal(saved.status)) poll(channel.id, saved.id);
         } catch (error) {
           if (error.ambiguous) ui.tests[channel.id] = {uncertain: true}; else delete ui.testAttempts[channel.id];

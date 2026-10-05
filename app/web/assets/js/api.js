@@ -1,8 +1,8 @@
 import { safeBookingUrl } from "./job-view.js";
 
 const ROOT = "/api/v1";
-const JOB_FIELDS = ["name", "target_urls", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth", "telegram_enabled", "notification_channel_ids"];
-const SETTINGS_FIELDS = ["default_interval_seconds", "request_spacing_seconds"];
+const JOB_FIELDS = ["name", "target_urls", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth", "telegram_enabled", "notification_channel_ids", "message_content"];
+const SETTINGS_FIELDS = ["default_interval_seconds", "request_spacing_seconds", "message_content"];
 const pick = (source, fields) => Object.fromEntries(fields.filter(key => Object.hasOwn(source, key) && source[key] !== undefined).map(key => [key, source[key]]));
 
 export class ApiError extends Error {
@@ -77,6 +77,7 @@ const page = ({limit = 100, offset = 0, status} = {}) => {
 };
 
 export const api = {
+  notificationPreview: (channel_type, message_content) => request("/notification-preview", {method: "POST", body: {channel_type, message_content}}),
   getSmtp: () => request('/settings/smtp'),
   smtpImpact: (values, version) => request('/settings/smtp/impact', {method: 'POST', body: {...values, expected_version: version}}),
   updateSmtp: (values, version, impactToken) => request('/settings/smtp', {method: 'PUT', body: {...values, expected_version: version, ...(impactToken ? {expected_impact_token: impactToken} : {})}}),
@@ -86,7 +87,7 @@ export const api = {
   deleteChannel: (id, version) => request(`/channels/${identifier(id)}`, {method: "DELETE", body: {expected_version: version, confirmed: true}}),
   importLegacyChannel: key => request("/channels/import-legacy", {method: "POST", body: {}, headers: {"Idempotency-Key": key}}),
   channelPreview: id => request(`/channels/${identifier(id)}/preview`),
-  testChannel: (id, version, key) => request(`/channels/${identifier(id)}/tests`, {method: "POST", body: {expected_version: version}, headers: {"Idempotency-Key": key}}),
+  testChannel: (id, version, key, contentVersion) => request(`/channels/${identifier(id)}/tests`, {method: "POST", body: {expected_version: version, ...(contentVersion === undefined ? {} : {expected_content_version: contentVersion})}, headers: {"Idempotency-Key": key}}),
   getChannelTest: id => request(`/channel-tests/${identifier(id)}`),
   getSettings: options => request("/settings", options),
   getStatus: options => request("/status", options),
@@ -144,6 +145,7 @@ export function createJobPayload(draft, settings) {
     if (!Array.isArray(draft.notification_channel_ids) || draft.notification_channel_ids.some(id => typeof id !== "string" || !id)) invalid("notification_channel_ids", "Choose saved notification channels.");
     payload.notification_channel_ids = [...new Set(draft.notification_channel_ids)];
   } else if (payload.telegram_enabled && !settings.telegram_configured) invalid("telegram_enabled", "No usable notification channel is configured.");
+  if (Object.hasOwn(draft, "message_content")) payload.message_content = draft.message_content;
   if (payload.date_mode === "custom") {
     payload.earliest_date = date(draft.earliest_date, "earliest_date");
     payload.latest_date = date(draft.latest_date, "latest_date");
@@ -155,7 +157,7 @@ export function createJobPayload(draft, settings) {
 
 export function updateJobPayload(draft, original, settings) {
   // Preserve the saved time zone; the initial job editor has no time-zone control.
-  const preserveTelegram = !settings.telegram_configured && Boolean(original.telegram_enabled);
+  const preserveTelegram = !Object.hasOwn(draft, "notification_channel_ids") && !settings.telegram_configured && Boolean(original.telegram_enabled);
   const clean = createJobPayload({...draft, time_zone: original.time_zone,
     ...(preserveTelegram ? {telegram_enabled: false} : {})}, settings);
   if (preserveTelegram) clean.telegram_enabled = Boolean(original.telegram_enabled);
@@ -168,6 +170,7 @@ export function updateJobPayload(draft, original, settings) {
 export function settingsPayload(draft, settings) {
   return {
     default_interval_seconds: number(draft.default_interval_seconds, "default_interval_seconds", Math.max(300, settings.minimum_poll_interval_seconds), 86400),
-    request_spacing_seconds: number(draft.request_spacing_seconds, "request_spacing_seconds", 3, 120, false)
+    request_spacing_seconds: number(draft.request_spacing_seconds, "request_spacing_seconds", 3, 120, false),
+    ...(Object.hasOwn(draft, "message_content") ? {message_content: draft.message_content} : {})
   };
 }

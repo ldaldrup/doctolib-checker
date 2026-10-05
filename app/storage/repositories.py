@@ -149,6 +149,11 @@ class Repository(ChannelOperations):
         if row is None:
             return None
         item = dict(row)
+        item['message_content'] = json.loads(item['message_content']) if item.get('message_content') else None
+        if conn is not None:
+            item['effective_message_content'] = self._effective_content(conn, item)
+            setting = conn.execute('SELECT content_version FROM settings WHERE singleton_id=1').fetchone()
+            item['effective_content_version'] = item['content_version'] if item['message_content'] is not None else (setting['content_version'] if setting else 1)
         item.pop("lock_run_id", None)
         item.pop("lock_owner_token", None)
         if conn is not None:
@@ -291,6 +296,24 @@ class Repository(ChannelOperations):
                          (precise_iso(now + timedelta(seconds=CREATE_LEASE_SECONDS)), operation["key"]))
             return self._create_operation(conn, conn.execute("SELECT * FROM create_operations WHERE key=?", (operation["key"],)).fetchone(), True)
 
+    @staticmethod
+    def _effective_content(conn, job=None):
+        from app.notifications import normalize_content
+        content = job['message_content'] if job is not None else None
+        if content is None:
+            row = conn.execute('SELECT message_content FROM settings WHERE singleton_id=1').fetchone()
+            content = row['message_content'] if row else None
+        if isinstance(content, str):
+            content = json.loads(content)
+        return normalize_content(content)
+
+    def _validate_content_channels(self, conn, content, channel_ids):
+        if content['silent']:
+            for channel_id in channel_ids:
+                row = conn.execute('SELECT type FROM notification_channels WHERE id=?', (channel_id,)).fetchone()
+                if row and row['type'] not in ('telegram','ntfy'):
+                    raise ValueError('Silent delivery is supported only by Telegram and ntfy')
+
     def create_job(self, values, targets, operation=None):
         if values["interval_seconds"] < self.minimum_poll_interval_seconds:
             raise ValueError("interval_seconds is below the server minimum")
@@ -310,6 +333,10 @@ class Repository(ChannelOperations):
                  values["time_zone"], values["insurance_sector"], int(values["telehealth"]),
                  int(values["telegram_enabled"]), now, now, now),
             )
+            from app.notifications import normalize_content
+            content = normalize_content(values['message_content']) if values.get('message_content') is not None else None
+            conn.execute('UPDATE jobs SET message_content=? WHERE id=?', (json.dumps(content) if content is not None else None, job_id))
+            self._validate_content_channels(conn, self._effective_content(conn, {'message_content':content}), values.get('notification_channel_ids', []))
             self._set_job_channels(conn, job_id, values.get("notification_channel_ids", []))
             for target in targets:
                 conn.execute(
@@ -381,6 +408,12 @@ class Repository(ChannelOperations):
                 for channel_id in removed:
                     conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='channel_detached'
                         WHERE job_id=? AND channel_config_id=? AND status IN ('pending','failed')""", (job_id,channel_id))
+            if 'message_content' in values:
+                from app.notifications import normalize_content
+                content = normalize_content(values['message_content']) if values['message_content'] is not None else None
+                conn.execute('UPDATE jobs SET message_content=? WHERE id=?', (json.dumps(content) if content is not None else None, job_id))
+            effective_content = self._effective_content(conn, dict(conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()))
+            self._validate_content_channels(conn, effective_content, values.get('notification_channel_ids', previous_channels))
             fields = ["name", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date",
                       "time_zone", "insurance_sector", "telehealth", "telegram_enabled"]
             update = {key: values[key] for key in fields if key in values}
@@ -426,13 +459,15 @@ class Repository(ChannelOperations):
             current_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
             search_changed = search_signature(current, current_targets) != previous_search
             channels_changed = "notification_channel_ids" in values and sorted(values["notification_channel_ids"]) != previous_channels
-            changed = search_changed or channels_changed or any(current[key] != row[key] for key in fields)
+            content_changed = current['message_content'] != row['message_content']
+            policy_changed = channels_changed or current['telegram_enabled'] != row['telegram_enabled']
+            changed = search_changed or content_changed or policy_changed or any(current[key] != row[key] for key in fields)
             if not current['telegram_enabled'] and row['telegram_enabled']:
                 conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='notifications_disabled'
                     WHERE job_id=? AND status IN ('pending','failed')""", (job_id,))
             if changed:
-                conn.execute("UPDATE jobs SET search_revision=search_revision+?,edit_version=edit_version+1,updated_at=? WHERE id=?",
-                             (int(search_changed), iso(), job_id))
+                conn.execute("UPDATE jobs SET search_revision=search_revision+?,content_version=content_version+?,policy_version=policy_version+?,edit_version=edit_version+1,updated_at=? WHERE id=?",
+                             (int(search_changed), int(content_changed), int(policy_changed), iso(), job_id))
             if search_changed:
                 current = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
                 if current['status'] == 'active':
@@ -705,13 +740,20 @@ class Repository(ChannelOperations):
         conn.execute("""INSERT INTO availability_events
             (id,job_id,target_id,result_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)
             VALUES(?,?,?,?,?,?,?,?,?)""", (event_id,job['id'],target['id'],result_id,dedupe,revision,now,now,json.dumps(channels)))
+        content = self._effective_content(conn, job)
+        setting = conn.execute('SELECT content_version FROM settings WHERE singleton_id=1').fetchone()
+        content_version = job['content_version'] if job['message_content'] is not None else (setting['content_version'] if setting else 1)
+        result = dict(conn.execute('SELECT * FROM check_results WHERE id=?',(result_id,)).fetchone())
+        run = conn.execute('SELECT * FROM check_runs WHERE id=?',(result['run_id'],)).fetchone()
+        event_snapshot = {key:result[key] for key in ('practitioner_name','practice_name','earliest_slot','booking_url','checked_at','slot_count')}
+        event_snapshot.update(time_zone=job['time_zone'],job_name=job['name'],triggered_by=run['triggered_by'])
         for channel in channels:
             conn.execute("""INSERT INTO alerts
                 (id,job_id,target_id,result_id,channel,event_type,dedupe_key,status,created_at,next_attempt_at,
-                 search_revision,event_id,channel_config_id,destination_version,credential_version,channel_name)
-                VALUES(?,?,?,?,?,'slot_found',?,'pending',?,?,?,?,?,?,?,?)""",
+                 search_revision,event_id,channel_config_id,destination_version,credential_version,channel_name,message_content,event_snapshot,content_version,policy_version)
+                VALUES(?,?,?,?,?,'slot_found',?,'pending',?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (new_id(),job['id'],target['id'],result_id,channel['type'],dedupe+':channel:'+channel['id']+':destination:'+str(channel['destination_version']),
-                 now,now,revision,event_id,channel['id'],channel['destination_version'],channel['credential_version'],channel['name']))
+                 now,now,revision,event_id,channel['id'],channel['destination_version'],channel['credential_version'],channel['name'],json.dumps(content),json.dumps({**event_snapshot, **({'ntfy_priority':channel['ntfy_priority']} if channel['type']=='ntfy' else {})}),content_version,job['policy_version']))
 
     def create_alert(self, job, target, result_id, earliest_slot, *, owner_token=None):
         # Events and their original routing are committed with observation.
@@ -782,8 +824,13 @@ class Repository(ChannelOperations):
                 now - parse_time(alert['delivery_epoch_at'] or alert['created_at']) < timedelta(hours=24))
 
     @staticmethod
-    def _public_alert(alert):
+    def _public_alert(alert, presentation=True):
         alert = dict(alert)
+        if presentation and alert.get('event_snapshot'):
+            alert.update(json.loads(alert['event_snapshot']))
+        if alert.get('message_content'):
+            alert['message_content'] = json.loads(alert['message_content'])
+        alert.pop('event_snapshot', None)
         for key in ('claim_owner_token', 'claim_result_id', 'claim_search_revision'):
             alert.pop(key, None)
         return alert
@@ -1172,7 +1219,7 @@ class Repository(ChannelOperations):
 
     def alerts(self, limit=50, offset=0):
         with self.database.connection() as conn:
-            return [self._public_alert(row) for row in conn.execute(
+            return [self._public_alert(row, presentation=False) for row in conn.execute(
                 """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
                 j.name AS job_name,j.time_zone
                 FROM alerts a
@@ -1189,7 +1236,9 @@ class Repository(ChannelOperations):
                 (default_interval, spacing, now),
             )
             row = conn.execute("SELECT * FROM settings WHERE singleton_id=1").fetchone()
-            return dict(row)
+            item = dict(row)
+            item['message_content'] = self._effective_content(conn)
+            return item
 
     def update_settings(self, values, minimum_interval, expected_version=None):
         with self.database.connection() as conn:
@@ -1205,13 +1254,21 @@ class Repository(ChannelOperations):
                 raise ValueError(f"default_interval_seconds must be at least {minimum_interval}")
             if not math.isfinite(spacing) or spacing < 3:
                 raise ValueError("request_spacing_seconds must be finite and at least 3")
-            changed = default_interval != current["default_interval_seconds"] or spacing != current["request_spacing_seconds"]
+            content = values.get('message_content', self._effective_content(conn))
+            from app.notifications import normalize_content
+            content = normalize_content(content)
+            inherited_channels = [row[0] for row in conn.execute('SELECT DISTINCT jc.channel_config_id FROM job_channels jc JOIN jobs j ON j.id=jc.job_id WHERE j.message_content IS NULL AND j.status!=\'deleted\'')]
+            self._validate_content_channels(conn, content, inherited_channels)
+            content_changed = content != self._effective_content(conn)
+            changed = content_changed or default_interval != current["default_interval_seconds"] or spacing != current["request_spacing_seconds"]
             conn.execute(
                 """UPDATE settings SET default_interval_seconds=?,request_spacing_seconds=?,updated_at=?,
-                edit_version=edit_version+? WHERE singleton_id=1""",
-                (default_interval, spacing, iso() if changed else current["updated_at"], int(changed)),
+                edit_version=edit_version+?,message_content=?,content_version=content_version+? WHERE singleton_id=1""",
+                (default_interval, spacing, iso() if changed else current["updated_at"], int(changed), json.dumps(content), int(content_changed)),
             )
-            return dict(conn.execute("SELECT * FROM settings WHERE singleton_id=1").fetchone())
+            item = dict(conn.execute("SELECT * FROM settings WHERE singleton_id=1").fetchone())
+            item['message_content'] = content
+            return item
 
     def reserve_request_turn(self, spacing_seconds):
         now = utc_now()

@@ -67,15 +67,16 @@ def test_invalid_http_config_has_safe_errors(setup,changes):
     assert 'notify.example/private' not in response.text and 'secret' not in response.text
 
 
-def test_ntfy_priority_fences_claimed_tests_and_telegram_rejects_http_options(setup):
+def test_ntfy_priority_keeps_claimed_test_snapshot_and_telegram_rejects_http_options(setup):
     client,repo,_ = setup
     channel = client.post('/api/v1/channels',json={'type':'ntfy','name':'Priority','endpoint':'https://notify.example/topic'},headers={'Idempotency-Key':'priority'}).json()
     cid = channel['id']
     test = client.post(f'/api/v1/channels/{cid}/tests',json={'expected_version':1},headers={'Idempotency-Key':'priority-test'}).json()
     claimed = repo.claim_channel_test()
     updated = client.patch(f'/api/v1/channels/{cid}',json={'expected_version':1,'ntfy_priority':5}).json()
-    assert updated['credential_version'] == 2 and updated['destination_version'] == 1
-    assert not repo.begin_channel_test_attempt(test['id'],claimed['owner_token'])
+    assert updated['credential_version'] == 1 and updated['destination_version'] == 1
+    assert claimed['ntfy_priority'] == 3
+    assert repo.begin_channel_test_attempt(test['id'],claimed['owner_token'])
     body = {'name':'Telegram','bot_token':'123456:fixture_secret_for_offline_checks_123','chat_id':'-100123456789','ntfy_priority':5}
     assert client.post('/api/v1/channels',json=body,headers={'Idempotency-Key':'wrong-options'}).status_code == 422
 
@@ -91,7 +92,7 @@ def test_schema8_backup_migrates_http_columns_without_changing_telegram(setup,tm
     archive = tmp_path/'schema8.zip'
     assert admin.backup(Path(settings.database_path),archive)['schema_version'] == 8
     work = tmp_path/'restored'
-    assert admin.verify(archive,work)['restored_schema_version'] == 10
+    assert admin.verify(archive,work)['restored_schema_version'] == 11
     restored = Repository(Database(str(work/'restored.sqlite3'))).get_channel(channel['id'],private=True)
     assert restored == original
 

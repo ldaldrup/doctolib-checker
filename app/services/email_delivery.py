@@ -4,16 +4,12 @@ import re
 import smtplib
 import socket
 import ssl
-from datetime import datetime
 from email.message import EmailMessage
 from email.headerregistry import Address
 from email.policy import SMTP as SMTP_POLICY
-from html import escape
-from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 from app.notifications import (DeliveryOutcome, SEND_BUDGET_SECONDS,
-    CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)
+    CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES, render_notification)
 from app.notification_secrets import SecretUnavailable
 from app.webhooks import approved_addresses, validate_endpoint
 
@@ -67,23 +63,8 @@ def mailbox(value):
 
 
 def email_preview(alert):
-    zone = alert.get('time_zone') or 'UTC'
-    slot = str(alert.get('earliest_slot', ''))
-    try:
-        slot = datetime.fromisoformat(slot.replace('Z', '+00:00')).astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M %Z')
-    except (ValueError, KeyError):
-        slot += ' (' + zone + ')'
-    booking = str(alert.get('booking_url', ''))
-    if urlsplit(booking).scheme != 'https' or any(ord(c) < 32 for c in booking):
-        booking = ''
-    lines = [f"{alert.get('slot_count', 1)} matching appointment slot(s)",
-        str(alert.get('practitioner_name', 'Practitioner')), str(alert.get('practice_name', 'Practice')),
-        'Earliest: ' + slot]
-    text = '\n'.join(lines) + ('\n\nOpen booking on Doctolib: ' + booking if booking else '')
-    html = '<p>' + '</p><p>'.join(escape(line) for line in lines) + '</p>'
-    if booking:
-        html += '<p><a href="' + escape(booking, quote=True) + '">Open booking on Doctolib</a></p>'
-    return {'text': text, 'html': html}
+    rendered = render_notification('email', alert)
+    return {'text': rendered['text'], 'html': rendered['html']}
 
 
 def email_message(transport, channel, alert):

@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class Database:
@@ -20,7 +20,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in range(1, 11):
+                if len(versions) != 1 or versions[0][0] not in range(1, 12):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" + CHANNEL_SCHEMA +
                 """
@@ -325,8 +325,38 @@ class Database:
                     if 'email_recipient_ciphertext' not in channel_columns:
                         conn.execute('ALTER TABLE notification_channels ADD COLUMN email_recipient_ciphertext TEXT')
                     current_version = 10
+                if current_version == 10:
+                    current_version = 11
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
+            # Additive content contracts preserve existing events and queued work.
+            for table, columns in {
+                'settings': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1'),
+                'jobs': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1'),
+                'alerts': ('message_content TEXT', 'event_snapshot TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1'),
+                'channel_tests': ('message_content TEXT', 'ntfy_priority INTEGER'),
+            }.items():
+                present = {row[1] for row in conn.execute('PRAGMA table_info('+table+')')}
+                for column in columns:
+                    if column.split()[0] not in present:
+                        conn.execute('ALTER TABLE '+table+' ADD COLUMN '+column)
+            import json
+            default_content = json.dumps({'preset':'standard','fields':['practitioner','practice','earliest_appointment','booking_link'],'silent':False})
+            conn.execute('UPDATE channel_tests SET message_content=? WHERE message_content IS NULL', (default_content,))
+            conn.execute("""UPDATE channel_tests SET ntfy_priority=(SELECT c.ntfy_priority FROM notification_channels c
+                WHERE c.id=channel_tests.channel_config_id AND c.type='ntfy') WHERE ntfy_priority IS NULL""")
+            for row in conn.execute("""SELECT a.id,r.practitioner_name,r.practice_name,r.earliest_slot,
+                    r.booking_url,r.checked_at,r.slot_count,j.time_zone,cr.job_name,cr.triggered_by,
+                    c.type AS channel_type,c.ntfy_priority
+                    FROM alerts a JOIN check_results r ON r.id=a.result_id JOIN jobs j ON j.id=a.job_id
+                    JOIN check_runs cr ON cr.id=r.run_id LEFT JOIN notification_channels c ON c.id=a.channel_config_id
+                    WHERE a.event_snapshot IS NULL""").fetchall():
+                snapshot = dict(row)
+                alert_id = snapshot.pop('id')
+                if snapshot.pop('channel_type') != 'ntfy':
+                    snapshot.pop('ntfy_priority')
+                conn.execute('UPDATE alerts SET message_content=?,event_snapshot=? WHERE id=?',
+                             (default_content,json.dumps(snapshot),alert_id))
             conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             from app.storage.channel_operations import now_text
             now = now_text()

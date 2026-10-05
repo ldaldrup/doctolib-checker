@@ -248,7 +248,7 @@ class ChannelOperations:
             if delete:
                 values.update(deleted=1,enabled=0)
             destination_changed = 'destination_identity' in values and values['destination_identity'] != before['destination_identity']
-            credentials_changed = any(key in values and values[key] != before[key] for key in (*SECRET_COLUMNS,'auth_type','ntfy_priority'))
+            credentials_changed = any(key in values and values[key] != before[key] for key in (*SECRET_COLUMNS,'auth_type'))
             changes = {key:value for key,value in values.items() if value != before[key]}
             if changes:
                 changes.update(edit_version=before['edit_version']+1,updated_at=now_text())
@@ -273,7 +273,7 @@ class ChannelOperations:
             return None
         return {key:row[key] for key in ('id','channel_config_id','destination_version','credential_version','status','attempt_count','error_code','created_at','updated_at')}
 
-    def reserve_channel_test(self, channel_id, expected_version, key, fingerprint, validate_usable=None):
+    def reserve_channel_test(self, channel_id, expected_version, key, fingerprint, validate_usable=None, expected_content_version=None):
         from app.storage.repositories import ConflictError, NotFoundError, VersionConflictError
         with self.database.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -293,9 +293,15 @@ class ChannelOperations:
                 raise ConflictError('channel_unusable')
             if validate_usable is not None:
                 validate_usable(dict(channel))
+            setting = conn.execute('SELECT content_version FROM settings WHERE singleton_id=1').fetchone()
+            content_version = setting['content_version'] if setting else 1
+            if expected_content_version is not None and expected_content_version != content_version:
+                raise ConflictError('content_version_conflict')
+            content = self._effective_content(conn)
+            self._validate_content_channels(conn, content, [channel_id])
             test_id = str(uuid.uuid4())
-            conn.execute('''INSERT INTO channel_tests(id,key,fingerprint,channel_config_id,destination_version,credential_version,created_at,updated_at,expires_at)
-                VALUES(?,?,?,?,?,?,?,?,?)''',(test_id,key,fingerprint,channel_id,channel['destination_version'],channel['credential_version'],now,now,expiry()))
+            conn.execute('''INSERT INTO channel_tests(id,key,fingerprint,channel_config_id,destination_version,credential_version,created_at,updated_at,expires_at,message_content,ntfy_priority)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(test_id,key,fingerprint,channel_id,channel['destination_version'],channel['credential_version'],now,now,expiry(),json.dumps(content),channel['ntfy_priority'] if channel['type']=='ntfy' else None))
             return self._test(conn.execute('SELECT * FROM channel_tests WHERE id=?',(test_id,)).fetchone())
 
     def get_channel_test(self, test_id):

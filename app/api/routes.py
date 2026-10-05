@@ -8,10 +8,10 @@ import re
 from fastapi import APIRouter, HTTPException, Query, Request, Response, Header, Body, status
 from requests import RequestException
 
-from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest
+from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest, NotificationPreviewRequest, ChannelTestRequest
 from app.notification_secrets import SecretUnavailable
-from app.services.channel_tests import notification_preview, synthetic_alert
-from app.services.email_delivery import email_preview, mailbox, smtp_transport_usable, validate_smtp_host
+from app.services.channel_tests import notification_preview
+from app.services.email_delivery import mailbox, smtp_transport_usable, validate_smtp_host
 from app.storage.channel_operations import SmtpImpactChangedError, channel_secret_columns
 from app.webhooks import validate_endpoint
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
@@ -245,7 +245,7 @@ def create_router():
         values = request.app.state.repository.settings(
             settings.minimum_poll_interval_seconds, settings.request_spacing_seconds
         )
-        return {"edit_version": values["edit_version"], "default_interval_seconds": values["default_interval_seconds"],
+        return {"edit_version": values["edit_version"], "message_content":values["message_content"], "content_version":values["content_version"], "default_interval_seconds": values["default_interval_seconds"],
                 "request_spacing_seconds": values["request_spacing_seconds"],
                 "minimum_poll_interval_seconds": settings.minimum_poll_interval_seconds,
                 "telegram_configured": any(item['type']=='telegram' and channel_public(request,item)["usable"] for item in request.app.state.repository.list_channels()["items"]),
@@ -263,7 +263,7 @@ def create_router():
             raise version_conflict(exc)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        return {"edit_version": saved["edit_version"], "default_interval_seconds": saved["default_interval_seconds"],
+        return {"edit_version": saved["edit_version"], "message_content":saved["message_content"], "content_version":saved["content_version"], "default_interval_seconds": saved["default_interval_seconds"],
                 "request_spacing_seconds": saved["request_spacing_seconds"],
                 "minimum_poll_interval_seconds": settings.minimum_poll_interval_seconds,
                 "telegram_configured": any(item['type']=='telegram' and channel_public(request,item)["usable"] for item in request.app.state.repository.list_channels()["items"]),
@@ -393,17 +393,29 @@ def create_router():
             raise HTTPException(404,detail='channel_not_found')
         return channel_public(request,channel)
 
+    @router.post('/api/v1/notification-preview')
+    def preview_notification(body: NotificationPreviewRequest, request: Request):
+        settings = request.app.state.settings
+        content = body.message_content.model_dump() if body.message_content else request.app.state.repository.settings(settings.minimum_poll_interval_seconds,settings.request_spacing_seconds)['message_content']
+        try:
+            return notification_preview({'type':body.channel_type},content)
+        except ValueError as exc:
+            raise HTTPException(422,detail=str(exc))
+
     @router.get('/api/v1/channels/{channel_id}/preview')
     def preview_channel(channel_id: str,request: Request):
         channel = request.app.state.repository.get_channel(channel_id)
         if channel is None or channel['deleted']:
             raise HTTPException(404,detail='channel_not_found')
-        if channel['type'] == 'email':
-            return email_preview(synthetic_alert())
-        return notification_preview(channel)
+        settings = request.app.state.settings
+        content = request.app.state.repository.settings(settings.minimum_poll_interval_seconds,settings.request_spacing_seconds)['message_content']
+        try:
+            return notification_preview(channel, content)
+        except ValueError as exc:
+            raise HTTPException(422,detail=str(exc))
 
     @router.post('/api/v1/channels/{channel_id}/tests',status_code=202)
-    def test_channel(channel_id: str,body: VersionedRequest,request: Request,
+    def test_channel(channel_id: str,body: ChannelTestRequest,request: Request,
                      idempotency_key: str = Header(alias='Idempotency-Key')):
         key_check(idempotency_key)
         repository = request.app.state.repository
@@ -420,13 +432,15 @@ def create_router():
                 raise HTTPException(409,detail={'code':'channel_unusable'})
         try:
             return repository.reserve_channel_test(channel_id,body.expected_version,idempotency_key,
-                fingerprint(['test',channel_id,body.expected_version]),validate_usable=validate_usable)
+                fingerprint(['test',channel_id,body.expected_version] + ([body.expected_content_version] if body.expected_content_version is not None else [])),validate_usable=validate_usable,expected_content_version=body.expected_content_version)
         except VersionConflictError as exc:
             raise version_conflict(exc)
         except NotFoundError:
             raise HTTPException(404,detail='channel_not_found')
         except ConflictError as exc:
             raise HTTPException(409,detail={'code':str(exc)})
+        except ValueError as exc:
+            raise HTTPException(422,detail=str(exc))
 
     @router.get('/api/v1/channel-tests/{test_id}')
     def read_test(test_id: str,request: Request):

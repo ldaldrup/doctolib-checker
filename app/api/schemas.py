@@ -3,7 +3,7 @@
 from datetime import date
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
 
 class StrictRequest(BaseModel):
@@ -14,8 +14,30 @@ class VersionedRequest(StrictRequest):
     expected_version: StrictInt = Field(gt=0)
 
 
+class ChannelTestRequest(VersionedRequest):
+    expected_content_version: Optional[StrictInt] = Field(default=None, gt=0)
+
+
 class TargetValidationRequest(StrictRequest):
     booking_url: str = Field(min_length=1, max_length=4096)
+
+
+class MessageContent(StrictRequest):
+    preset: Literal['standard', 'compact', 'custom'] = 'standard'
+    fields: List[Literal['job_name','practitioner','practice','earliest_appointment','check_time','time_zone','booking_link']] = Field(default_factory=lambda: ['practitioner','practice','earliest_appointment','booking_link'], min_length=1, max_length=7)
+    silent: StrictBool = False
+
+    @field_validator('fields')
+    @classmethod
+    def unique_fields(cls, fields):
+        if len(set(fields)) != len(fields):
+            raise ValueError('Message fields must be unique')
+        return fields
+
+
+class NotificationPreviewRequest(StrictRequest):
+    channel_type: Literal['telegram','ntfy','email','webhook']
+    message_content: Optional[MessageContent] = None
 
 
 class JobCreateRequest(StrictRequest):
@@ -29,6 +51,7 @@ class JobCreateRequest(StrictRequest):
     time_zone: str = "Europe/Berlin"
     insurance_sector: Literal["public", "private"] = "public"
     telehealth: bool = False
+    message_content: Optional[MessageContent] = None
     telegram_enabled: Optional[bool] = None
     notification_channel_ids: List[str] = Field(default_factory=list,max_length=100)
 
@@ -64,6 +87,7 @@ class JobUpdateRequest(VersionedRequest):
     time_zone: Optional[str] = None
     insurance_sector: Optional[Literal["public", "private"]] = None
     telehealth: Optional[bool] = None
+    message_content: Optional[MessageContent] = None
     telegram_enabled: Optional[bool] = None
     notification_channel_ids: Optional[List[str]] = Field(default=None,max_length=100)
 
@@ -78,7 +102,7 @@ class JobUpdateRequest(VersionedRequest):
 
     @model_validator(mode="after")
     def supplied_values_are_not_null(self):
-        nullable = {"earliest_date", "latest_date"}
+        nullable = {"earliest_date", "latest_date", "message_content"}
         for name in self.model_fields_set - nullable:
             if getattr(self, name) is None:
                 raise ValueError(name + " cannot be null")
@@ -86,6 +110,7 @@ class JobUpdateRequest(VersionedRequest):
 
 
 class SettingsUpdateRequest(VersionedRequest):
+    message_content: Optional[MessageContent] = None
     default_interval_seconds: Optional[int] = Field(default=None, ge=300, le=86400)
     request_spacing_seconds: Optional[float] = Field(default=None, ge=3, le=120)
 

@@ -154,12 +154,13 @@ def test_multiline_smtp_reply_is_bounded():
     with pytest.raises(ReplyLimitError): connection.getreply()
 
 
-def test_plaintext_and_oversized_message_are_rejected_before_connect():
+def test_plaintext_is_rejected_and_overlong_event_fields_are_bounded():
     config = configured(); config['transport']['tls_mode'] = 'plaintext'
     assert send(config=config).error_code == 'smtp_invalid_transport'
     outcome = send_email_alert(SimpleNamespace(),configured(),ALERT | {'practice_name':'x'*70000},
         resolver=public_dns,connection_factory=FakeSMTP)
-    assert outcome.error_code == 'smtp_message_too_large' and not outcome.attempted
+    assert outcome.category == 'sent' and outcome.attempted
+    assert len(email_message(configured()['transport'], configured(), ALERT | {'practice_name': 'x'*70000})) < 65536
 
 
 def test_spawned_email_adapter_rejects_invalid_mailbox_before_permission():

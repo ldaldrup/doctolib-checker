@@ -123,14 +123,27 @@ def test_default_dispatch_spawn_failure_never_counts_attempt(monkeypatch, tmp_pa
     assert alert['claim_until'] is None
 
 
-def test_invalid_format_does_not_request_network_permission(monkeypatch):
+def test_malformed_optional_event_value_has_bounded_fallback_before_permission():
     permitted = []
     settings = Settings(telegram_enabled=True, telegram_bot_token='synthetic', telegram_chat_id='synthetic')
-    outcome = notifications.send_telegram_alert(settings, {'slot_count': 'bad'}, session=object(),
-                                                before_send=lambda: permitted.append(True))
-    assert outcome.category == 'action_required'
-    assert not outcome.attempted
-    assert permitted == []
+    alert = {'slot_count': 'bad', 'practitioner_name': '<' * 70000}
+    payload = notifications._telegram_payload(settings, alert)
+    assert payload['text'].startswith('<b>1 matching appointment slot(s)</b>')
+    assert len(payload['text']) < 4096 and '&lt;' in payload['text']
+    def deny(**kwargs):
+        permitted.append(kwargs['remaining_seconds'])
+        return False
+    outcome = notifications.send_telegram_alert(settings, alert, session=object(), before_send=deny)
+    assert outcome.category == 'retry' and outcome.error_code == 'alert_no_longer_eligible'
+    assert not outcome.attempted and permitted == [notifications.SEND_BUDGET_SECONDS]
+
+
+def test_invalid_content_does_not_request_network_permission():
+    permitted = []
+    settings = Settings(telegram_enabled=True, telegram_bot_token='synthetic', telegram_chat_id='synthetic')
+    outcome = notifications.send_telegram_alert(settings, {'message_content': {'template': 'unsupported'}},
+        session=object(), before_send=lambda **kwargs: permitted.append(True))
+    assert outcome.category == 'action_required' and not outcome.attempted and not permitted
 
 
 def test_default_dispatch_child_format_failure_never_counts_attempt(monkeypatch, tmp_path):
