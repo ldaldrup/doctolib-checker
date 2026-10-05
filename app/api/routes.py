@@ -4,11 +4,12 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 import re
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, Header, Body, status
 from requests import RequestException
 
-from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest, NotificationPreviewRequest, ChannelTestRequest
+from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest, NotificationPreviewRequest, ChannelTestRequest, QuietHoursPreviewRequest
 from app.notification_secrets import SecretUnavailable
 from app.services.channel_tests import notification_preview
 from app.services.email_delivery import mailbox, smtp_transport_usable, validate_smtp_host
@@ -16,6 +17,8 @@ from app.storage.channel_operations import SmtpImpactChangedError, channel_secre
 from app.webhooks import validate_endpoint
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
 from app.services.jobs import create_job, resolve_target, update_job
+from app.services.jobs import validate_timezone
+from app.quiet_hours import next_release, validate_quiet_hours
 from app.storage.repositories import ConflictError, NotFoundError, VersionConflictError, CreateReservationLostError, iso, utc_now
 
 
@@ -52,6 +55,23 @@ def create_router():
         ) <= timedelta(seconds=90))
         result["telegram_configured"] = any(item['type']=='telegram' and channel_public(request, item)["usable"] for item in request.app.state.repository.list_channels()["items"])
         return result
+
+    @router.post("/api/v1/quiet-hours/preview")
+    def preview_quiet_hours(body: QuietHoursPreviewRequest):
+        try:
+            validate_timezone(body.time_zone)
+            validate_quiet_hours(body.enabled, body.start, body.end)
+            release = next_release(utc_now(), body.time_zone, body.enabled, body.start, body.end)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if release is None:
+            return {"enabled": False, "time_zone": body.time_zone, "next_release_at": None,
+                    "preview": "Quiet hours are off. Times use " + body.time_zone +
+                               ". Monitoring continues; fresh alerts can be sent immediately. No message sent."}
+        local = release.astimezone(ZoneInfo(body.time_zone))
+        return {"enabled": True, "time_zone": body.time_zone, "next_release_at": iso(release),
+                "preview": "Next eligible release: " + local.strftime("%d.%m.%Y %H:%M") +
+                           " (" + body.time_zone + "), after a fresh confirmation. Monitoring continues. No message sent."}
 
     @router.get("/api/v1/jobs")
     def list_jobs(request: Request, job_status: str = Query(default=None, alias="status"),
@@ -158,6 +178,12 @@ def create_router():
         # Final repository CAS still closes races during metadata resolution.
         if effective["edit_version"] != expected_version:
             raise version_conflict(VersionConflictError(effective["edit_version"]))
+        try:
+            validate_quiet_hours(values.get("quiet_hours_enabled", effective["quiet_hours_enabled"]),
+                                 values.get("quiet_hours_start", effective["quiet_hours_start"]),
+                                 values.get("quiet_hours_end", effective["quiet_hours_end"]))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         date_mode = values.get("date_mode", effective["date_mode"])
         if date_mode != "custom" and any(
             values.get(field) is not None for field in ("earliest_date", "latest_date")

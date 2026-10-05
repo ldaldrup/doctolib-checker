@@ -24,7 +24,7 @@ def test_restore_preserves_extra_budget_and_paused_pending_intent(tmp_path):
     admin.backup(Path(settings.database_path), archive)
     work = tmp_path / 'restore'
     report = admin.verify(archive, work)
-    assert report['restored_schema_version'] == 11
+    assert report['restored_schema_version'] == 12
     restored = Repository(Database(str(work / 'restored.sqlite3')))
     assert restored.claim_due_jobs() == []
     old = repository.get_job(job['id'])

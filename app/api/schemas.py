@@ -40,6 +40,13 @@ class NotificationPreviewRequest(StrictRequest):
     message_content: Optional[MessageContent] = None
 
 
+class QuietHoursPreviewRequest(StrictRequest):
+    enabled: StrictBool
+    start: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    time_zone: str = Field(min_length=1, max_length=100)
+
+
 class JobCreateRequest(StrictRequest):
     name: str = Field(min_length=1, max_length=120)
     target_urls: List[str] = Field(min_length=1, max_length=100)
@@ -52,6 +59,9 @@ class JobCreateRequest(StrictRequest):
     insurance_sector: Literal["public", "private"] = "public"
     telehealth: bool = False
     message_content: Optional[MessageContent] = None
+    quiet_hours_enabled: StrictBool = False
+    quiet_hours_start: str = Field(default="22:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    quiet_hours_end: str = Field(default="07:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     telegram_enabled: Optional[bool] = None
     notification_channel_ids: List[str] = Field(default_factory=list,max_length=100)
 
@@ -73,6 +83,8 @@ class JobCreateRequest(StrictRequest):
                 raise ValueError("Custom date range must not exceed 366 calendar dates")
         elif self.earliest_date is not None or self.latest_date is not None:
             raise ValueError("Use earliest_date and latest_date only with custom date mode")
+        from app.quiet_hours import validate_quiet_hours
+        validate_quiet_hours(self.quiet_hours_enabled, self.quiet_hours_start, self.quiet_hours_end)
         return self
 
 
@@ -88,6 +100,9 @@ class JobUpdateRequest(VersionedRequest):
     insurance_sector: Optional[Literal["public", "private"]] = None
     telehealth: Optional[bool] = None
     message_content: Optional[MessageContent] = None
+    quiet_hours_enabled: Optional[StrictBool] = None
+    quiet_hours_start: Optional[str] = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    quiet_hours_end: Optional[str] = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     telegram_enabled: Optional[bool] = None
     notification_channel_ids: Optional[List[str]] = Field(default=None,max_length=100)
 

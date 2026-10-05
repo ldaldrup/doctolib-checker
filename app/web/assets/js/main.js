@@ -16,10 +16,11 @@ const state = {
   checkSubmitting: new Set(), checkErrors: new Map(),
   jobSubmitting: false, settingsSubmitting: false, jobError: null, settingsError: null,
   settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false, settingsConflict: null, jobConflict: null, jobConflictBlocked: false, createAttempt: null,
-  query: "", filter: "all", intervalFilter: "all", uncertainCreate: null
+  query: "", filter: "all", intervalFilter: "all", uncertainCreate: null, quietPreview: null
 };
 let toastTimer, refreshTimer, refreshPromise, refreshAgain = false, refreshSettingsAgain = false, failures = 0, observer, deleteFocus;
 let historyActive = 0, settingsGeneration = 0, historyEpoch = 0;
+let quietPreviewTimer;
 const historyQueue = [], historyQueued = new Set(), searchSignatures = new Map(), invalidations = new Map();
 const channels = channelController(state, {render, announce, refreshJobs: () => refresh(true), onLoad: patchJobChannels});
 const smtp = smtpController(state, {render, announce, refreshJobs: () => refresh(true)});
@@ -60,6 +61,7 @@ function render() {
   }
   if (!focusId) restoreControl(control);
   window.scrollTo({top: scroll, behavior: "instant"});
+  syncQuietHoursPreview();
 }
 function workerStatus() {
   const delivery = document.getElementById("delivery-status");
@@ -245,7 +247,28 @@ function readDraft(form) {
     date_mode: data.get("date_mode"), horizon_days: form.querySelector("#horizon-days")?.value || state.formDraft?.horizon_days || 15,
     earliest_date: form.querySelector("#earliest-date")?.value || "", latest_date: form.querySelector("#latest-date")?.value || "",
     time_zone: state.original?.time_zone || state.settings.time_zone, insurance_sector: data.get("insurance_sector"),
-    message_content: data.has("content-inherit") ? null : form.querySelector('[name="job-content-preset"]') ? readContent(form, "job-content") : structuredClone(state.settings.message_content || defaultContent()), telehealth: data.has("telehealth"), telegram_enabled: data.has("telegram_enabled"), notification_channel_ids: [...data.getAll("notification_channel_ids"), ...(state.formDraft?.notification_channel_ids || []).filter(id => ![...form.querySelectorAll('[name="notification_channel_ids"]')].some(input => input.value === id))]};
+    message_content: data.has("content-inherit") ? null : form.querySelector('[name="job-content-preset"]') ? readContent(form, "job-content") : structuredClone(state.settings.message_content || defaultContent()), telehealth: data.has("telehealth"), telegram_enabled: data.has("telegram_enabled"), notification_channel_ids: [...data.getAll("notification_channel_ids"), ...(state.formDraft?.notification_channel_ids || []).filter(id => ![...form.querySelectorAll('[name="notification_channel_ids"]')].some(input => input.value === id))],
+    quiet_hours_enabled: data.has("quiet_hours_enabled"), quiet_hours_start: form.querySelector('[name="quiet_hours_start"]')?.value || "22:00", quiet_hours_end: form.querySelector('[name="quiet_hours_end"]')?.value || "07:00"};
+}
+function syncQuietHoursPreview() {
+  const output = document.getElementById("quiet-hours-preview"), form = document.getElementById("job-form");
+  if (!output || !form || !state.formDraft) return;
+  const draft = readDraft(form), signature = JSON.stringify([state.editingId || "new", draft.quiet_hours_enabled, draft.quiet_hours_start, draft.quiet_hours_end, draft.time_zone]);
+  if (state.quietPreview?.signature === signature) { output.textContent = state.quietPreview.text; return; }
+  clearTimeout(quietPreviewTimer);
+  state.quietPreview = {signature, text: "Updating release preview…"}; output.textContent = state.quietPreview.text;
+  quietPreviewTimer = setTimeout(async () => {
+    try {
+      const result = await api.previewQuietHours({enabled: draft.quiet_hours_enabled, start: draft.quiet_hours_start,
+        end: draft.quiet_hours_end, time_zone: draft.time_zone});
+      if (state.quietPreview?.signature !== signature) return;
+      state.quietPreview.text = result.preview;
+    } catch (error) {
+      if (state.quietPreview?.signature !== signature) return;
+      state.quietPreview.text = error.status === 422 ? "Choose different start and end times and a valid time zone." : "Release preview unavailable. No message was sent.";
+    }
+    const current = document.getElementById("quiet-hours-preview"); if (current) current.textContent = state.quietPreview.text;
+  }, 180);
 }
 function readSettings(form) {
   const data = new FormData(form), interval = data.get("default_interval_choice");
@@ -356,7 +379,8 @@ async function mutateJob(job, action) {
   finally { state.pendingJobs.delete(job.id); patchJobs(); }
 }
 async function requestJobCheck(job) {
-  if (state.pendingJobs.has(job.id) || job.check_intent?.status === "queued") return;
+  const queuedQuietRefresh = job.check_intent?.status === "queued" && job.check_intent.triggered_by === "quiet_hours";
+  if (state.pendingJobs.has(job.id) || (job.check_intent?.status === "queued" && !queuedQuietRefresh)) return;
   state.pendingJobs.add(job.id); state.checkSubmitting.add(job.id); state.checkErrors.delete(job.id); patchJobs();
   try {
     const intent = await api.checkNowJob(job.id);
@@ -490,6 +514,7 @@ document.addEventListener("input", event => {
   if (event.target.id === "job-search") { state.query = event.target.value; patchJobs(); clearTimeout(searchRefreshTimer); searchRefreshTimer = setTimeout(() => refresh(), 300); return; }
   if (event.target.closest("#job-form")) {
     state.formDraft = readDraft(document.getElementById("job-form"));
+    if (event.target.name.startsWith("quiet_hours_")) syncQuietHoursPreview();
     event.target.removeAttribute("aria-invalid");
     if (event.target.name === "target_urls") {
       const index = [...document.querySelectorAll('[name="target_urls"]')].indexOf(event.target);
@@ -506,7 +531,10 @@ document.addEventListener("change", event => {
   if (channels.input(event)) return;
   if (smtp.input(event)) return;
   if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); refresh(); return; }
-  if (event.target.closest("#job-form")) state.formDraft = readDraft(document.getElementById("job-form"));
+  if (event.target.closest("#job-form")) {
+    state.formDraft = readDraft(document.getElementById("job-form"));
+    if (event.target.name.startsWith("quiet_hours_")) syncQuietHoursPreview();
+  }
   if (event.target.closest("#settings-form") && !event.target.name.startsWith("reconcile-")) settingsEdited(event.target.type === "radio");
   if (["content-inherit", "job-content-preset", "settings-content-preset"].includes(event.target.name)) render();
   const toggle = (wrapperId, custom, inputId) => {

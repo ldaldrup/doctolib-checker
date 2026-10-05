@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class Database:
@@ -20,7 +20,7 @@ class Database:
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
                 versions = conn.execute("SELECT version FROM schema_version").fetchall()
-                if len(versions) != 1 or versions[0][0] not in range(1, 12):
+                if len(versions) != 1 or versions[0][0] not in range(1, 13):
                     raise RuntimeError("Unsupported database schema version")
             conn.executescript("BEGIN IMMEDIATE;" + CHANNEL_SCHEMA +
                 """
@@ -327,13 +327,17 @@ class Database:
                     current_version = 10
                 if current_version == 10:
                     current_version = 11
+                if current_version == 11:
+                    current_version = 12
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
             # Additive content contracts preserve existing events and queued work.
             for table, columns in {
                 'settings': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1'),
-                'jobs': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1'),
-                'alerts': ('message_content TEXT', 'event_snapshot TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1'),
+                'jobs': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1',
+                         'quiet_hours_enabled INTEGER NOT NULL DEFAULT 0', "quiet_hours_start TEXT NOT NULL DEFAULT '22:00'", "quiet_hours_end TEXT NOT NULL DEFAULT '07:00'"),
+                'alerts': ('message_content TEXT', 'event_snapshot TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1',
+                           "quiet_state TEXT NOT NULL DEFAULT 'released'", 'quiet_until TEXT'),
                 'channel_tests': ('message_content TEXT', 'ntfy_priority INTEGER'),
             }.items():
                 present = {row[1] for row in conn.execute('PRAGMA table_info('+table+')')}

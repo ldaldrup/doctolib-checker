@@ -34,6 +34,8 @@ await test('durable check intent shows cooldown, worker health and run outcome w
   assert(checkIntentFeedback(queued, state, now).includes('fresh check requested'));
   state.status.worker_alive = false; assert(checkIntentFeedback(queued, state, now).includes('Worker unavailable'));
   state.jobs = [queued]; assert(/data-action="check-now"[^>]*disabled/.test(renderJobList(state)));
+  const quietRefresh = {...queued, check_intent: {...queued.check_intent, triggered_by: 'quiet_hours'}};
+  state.jobs = [quietRefresh]; assert(!/data-action="check-now"[^>]*disabled/.test(renderJobList(state)));
   state.checkErrors = new Map([[job.id, 'Uncertain request <script>']]);
   assert(renderJobList(state).includes('Check queued') && renderJobList(state).includes('Uncertain request &lt;script&gt;'));
   state.checkErrors.clear();
@@ -178,6 +180,12 @@ await test('history signatures include search/target/run evidence but ignore lis
 });
 await test('payload dates, URL safety, bounds, allowlisting, and Telegram preservation', async () => {
   const first = createJobPayload({...draft, earliest_date: '', latest_date: '', unsupported: true}, settings); assert(!Object.hasOwn(first, 'earliest_date') && !Object.hasOwn(first, 'unsupported'));
+  equal([first.quiet_hours_enabled, first.quiet_hours_start, first.quiet_hours_end], [false, '22:00', '07:00']);
+  assert(!Object.keys(updateJobPayload(draft, {...job, targets: job.targets}, settings)).some(key => key.startsWith('quiet_hours_')));
+  const quiet = createJobPayload({...draft, quiet_hours_enabled: true, quiet_hours_start: '21:30', quiet_hours_end: '06:30'}, settings);
+  equal([quiet.quiet_hours_enabled, quiet.quiet_hours_start, quiet.quiet_hours_end], [true, '21:30', '06:30']);
+  await rejects(() => createJobPayload({...draft, quiet_hours_start: '', quiet_hours_end: ''}, settings), 'validation');
+  await rejects(() => createJobPayload({...draft, quiet_hours_enabled: true, quiet_hours_start: '07:00', quiet_hours_end: '07:00'}, settings), 'validation');
   const custom = createJobPayload({...draft, date_mode: 'custom', earliest_date: '2026-10-01', latest_date: '2026-10-31'}, settings); equal(custom.earliest_date, '2026-10-01');
   const patch = updateJobPayload(draft, {...job, date_mode: 'custom', earliest_date: '2026-10-01', latest_date: '2026-10-31'}, settings); equal(patch.earliest_date, null); equal(patch.latest_date, null); assert(!Object.hasOwn(patch, 'target_urls'));
   for (const unsafe of ['http://www.doctolib.de/a/booking/availabilities', 'https://evil.example/a/booking/availabilities', 'https://u:p@www.doctolib.de/a/booking/availabilities', 'https://www.doctolib.de:444/a/booking/availabilities', 'https://www.doctolib.de/a']) {
@@ -693,7 +701,7 @@ await test('explicit legacy import and mixed job selection preserve independent 
     await nativeFetch('/__test/checks',{method:'POST'});
     for(let index=0;index<5;index++)await nativeFetch('/__test/deliver',{method:'POST'});
     doc.dispatchEvent(new win.Event('visibilitychange'));
-    await waitUI(()=>{const text=doc.querySelector(`[data-job-id="${saved.id}"]`)?.textContent;return text?.includes('Telegram1: sent') && text.includes('Parallel Telegram: sent') && extra.every(channel=>text.includes(`${channel.name}: accepted by endpoint`));});
+    await waitUI(()=>{const text=doc.querySelector(`[data-job-id="${saved.id}"]`)?.textContent;return text?.includes('Telegram1: sent') && text.includes('Parallel Telegram: sent') && extra.every(channel=>text.includes(`${channel.name}: Accepted by endpoint`));});
     await api.updateChannel(second.id,{name:'Renamed parallel',token_action:'keep',chat_action:'keep'},second.edit_version);
     doc.dispatchEvent(new win.Event('visibilitychange'));await waitUI(()=>doc.querySelector(`[data-job-id="${saved.id}"]`).textContent.includes('Renamed parallel'));
     doc.querySelector(`[data-job-id="${saved.id}"] [data-action="edit"]`).click();

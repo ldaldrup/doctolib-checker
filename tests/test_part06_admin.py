@@ -25,7 +25,7 @@ def test_schema8_restore_preserves_encrypted_destination_and_event_routing(tmp_p
     admin.backup(Path(settings.database_path), archive)
     work = tmp_path / 'restore'
     report = admin.verify(archive, work)
-    assert report['backup_schema_version'] == report['restored_schema_version'] == 11
+    assert report['backup_schema_version'] == report['restored_schema_version'] == 12
     restored = Repository(Database(str(work / 'restored.sqlite3')))
     copied = restored.get_channel(channel['id'], private=True)
     assert copied == original
@@ -54,7 +54,7 @@ def test_schema7_backup_migrates_without_replaying_current_episode(tmp_path):
     archive = tmp_path / 'legacy.zip'
     assert admin.backup(Path(settings.database_path), archive)['schema_version'] == 7
     work = tmp_path / 'migrated'
-    assert admin.verify(archive, work)['restored_schema_version'] == 11
+    assert admin.verify(archive, work)['restored_schema_version'] == 12
     restored = Repository(Database(str(work / 'restored.sqlite3')))
     historical = restored.alerts()[0]
     assert historical['id'] == original['id']
@@ -84,7 +84,7 @@ def test_schema9_restore_adds_email_recipient_and_empty_smtp_transport(tmp_path)
     archive = tmp_path / 'schema9.zip'
     assert admin.backup(Path(source.path), archive)['schema_version'] == 9
     work = tmp_path / 'schema9-restore'
-    assert admin.verify(archive, work)['restored_schema_version'] == 11
+    assert admin.verify(archive, work)['restored_schema_version'] == 12
     with sqlite3.connect(work / 'restored.sqlite3') as conn:
         columns = {row[1] for row in conn.execute('PRAGMA table_info(notification_channels)')}
         assert 'email_recipient_ciphertext' in columns

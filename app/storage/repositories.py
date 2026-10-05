@@ -7,6 +7,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from app.doctolib import DoctolibClient
+from app.quiet_hours import quiet_window, validate_quiet_hours
 from app.storage.channel_operations import ChannelOperations, channel_complete, COMPLETE_SQL
 
 
@@ -170,13 +171,27 @@ class Repository(ChannelOperations):
             item['notification_channels'] = []
             for channel in conn.execute("""SELECT c.* FROM notification_channels c JOIN job_channels jc
                     ON jc.channel_config_id=c.id WHERE jc.job_id=? ORDER BY c.name,c.id""", (item['id'],)):
-                latest = conn.execute("SELECT status,delivery_state,error_summary,claim_owner_token FROM alerts WHERE job_id=? AND channel_config_id=? ORDER BY rowid DESC LIMIT 1", (item['id'],channel['id'])).fetchone()
+                latest = conn.execute("SELECT status,delivery_state,error_summary,claim_owner_token,quiet_state,quiet_until FROM alerts WHERE job_id=? AND channel_config_id=? ORDER BY rowid DESC LIMIT 1", (item['id'],channel['id'])).fetchone()
+                quiet_work = conn.execute("""SELECT status,delivery_state,error_summary,claim_owner_token,quiet_state,quiet_until
+                    FROM alerts WHERE job_id=? AND channel_config_id=? AND status IN ('pending','failed')
+                    AND quiet_state IN ('held','waiting_for_fresh_check','needs_manual_check')
+                    ORDER BY CASE quiet_state WHEN 'needs_manual_check' THEN 0
+                    WHEN 'waiting_for_fresh_check' THEN 1 ELSE 2 END,rowid DESC LIMIT 1""",
+                    (item['id'],channel['id'])).fetchone()
+                delivery = quiet_work or latest
+                delivery_status = delivery['status'] if delivery else None
+                if delivery and delivery['status'] in ('pending', 'failed'):
+                    delivery_status = {'held': 'held', 'waiting_for_fresh_check': 'waiting_for_fresh_check',
+                                       'needs_manual_check': 'needs_manual_check'}.get(delivery['quiet_state'],
+                                       'in_flight' if delivery['claim_owner_token'] else delivery['status'])
+                quiet_until = delivery['quiet_until'] if delivery and delivery['status'] in ('pending', 'failed') and delivery['quiet_state'] == 'held' else None
                 item['notification_channels'].append({'id':channel['id'],'name':channel['name'],'type':channel['type'],
                     'enabled':bool(channel['enabled']) and not channel['deleted'],
                     'usable':bool(channel['enabled'] and not channel['deleted'] and channel_complete(channel)),
-                    'delivery_status':('in_flight' if latest['claim_owner_token'] else latest['status']) if latest else None,
-                    'error_code':latest['error_summary'] if latest else None})
-        for key in ("telehealth", "telegram_enabled"):
+                    'delivery_status':delivery_status,
+                    'quiet_until':quiet_until,
+                    'error_code':delivery['error_summary'] if delivery else None})
+        for key in ("telehealth", "telegram_enabled", "quiet_hours_enabled"):
             item[key] = bool(item[key])
         return item
 
@@ -317,6 +332,9 @@ class Repository(ChannelOperations):
     def create_job(self, values, targets, operation=None):
         if values["interval_seconds"] < self.minimum_poll_interval_seconds:
             raise ValueError("interval_seconds is below the server minimum")
+        quiet_enabled = values.get("quiet_hours_enabled", False)
+        quiet_start, quiet_end = values.get("quiet_hours_start", "22:00"), values.get("quiet_hours_end", "07:00")
+        validate_quiet_hours(quiet_enabled, quiet_start, quiet_end)
         job_id = new_id()
         now = iso()
         with self.database.connection() as conn:
@@ -326,12 +344,13 @@ class Repository(ChannelOperations):
             conn.execute(
                 """INSERT INTO jobs
                 (id,name,status,interval_seconds,date_mode,horizon_days,earliest_date,latest_date,
-                 time_zone,insurance_sector,telehealth,telegram_enabled,created_at,updated_at,next_check_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 time_zone,insurance_sector,telehealth,telegram_enabled,created_at,updated_at,next_check_at,
+                 quiet_hours_enabled,quiet_hours_start,quiet_hours_end)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job_id, values["name"], "active", values["interval_seconds"], values["date_mode"],
                  values.get("horizon_days"), values.get("earliest_date"), values.get("latest_date"),
                  values["time_zone"], values["insurance_sector"], int(values["telehealth"]),
-                 int(values["telegram_enabled"]), now, now, now),
+                 int(values["telegram_enabled"]), now, now, now, int(quiet_enabled), quiet_start, quiet_end),
             )
             from app.notifications import normalize_content
             content = normalize_content(values['message_content']) if values.get('message_content') is not None else None
@@ -414,12 +433,19 @@ class Repository(ChannelOperations):
                 conn.execute('UPDATE jobs SET message_content=? WHERE id=?', (json.dumps(content) if content is not None else None, job_id))
             effective_content = self._effective_content(conn, dict(conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()))
             self._validate_content_channels(conn, effective_content, values.get('notification_channel_ids', previous_channels))
+            quiet_values = {
+                "quiet_hours_enabled": values.get("quiet_hours_enabled", bool(row["quiet_hours_enabled"])),
+                "quiet_hours_start": values.get("quiet_hours_start", row["quiet_hours_start"]),
+                "quiet_hours_end": values.get("quiet_hours_end", row["quiet_hours_end"]),
+            }
+            validate_quiet_hours(quiet_values["quiet_hours_enabled"], quiet_values["quiet_hours_start"], quiet_values["quiet_hours_end"])
             fields = ["name", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date",
-                      "time_zone", "insurance_sector", "telehealth", "telegram_enabled"]
+                      "time_zone", "insurance_sector", "telehealth", "telegram_enabled", "quiet_hours_enabled",
+                      "quiet_hours_start", "quiet_hours_end"]
             update = {key: values[key] for key in fields if key in values}
             if update:
                 assignments = ",".join(key + "=?" for key in update)
-                encoded = [int(value) if key in ("telehealth", "telegram_enabled") else value
+                encoded = [int(value) if key in ("telehealth", "telegram_enabled", "quiet_hours_enabled") else value
                            for key, value in update.items()]
                 conn.execute("UPDATE jobs SET " + assignments + " WHERE id=?", encoded + [job_id])
             if targets is not None:
@@ -460,7 +486,8 @@ class Repository(ChannelOperations):
             search_changed = search_signature(current, current_targets) != previous_search
             channels_changed = "notification_channel_ids" in values and sorted(values["notification_channel_ids"]) != previous_channels
             content_changed = current['message_content'] != row['message_content']
-            policy_changed = channels_changed or current['telegram_enabled'] != row['telegram_enabled']
+            quiet_changed = any(current[key] != row[key] for key in ("quiet_hours_enabled", "quiet_hours_start", "quiet_hours_end"))
+            policy_changed = channels_changed or current['telegram_enabled'] != row['telegram_enabled'] or quiet_changed
             changed = search_changed or content_changed or policy_changed or any(current[key] != row[key] for key in fields)
             if not current['telegram_enabled'] and row['telegram_enabled']:
                 conn.execute("""UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='notifications_disabled'
@@ -535,16 +562,18 @@ class Repository(ChannelOperations):
                 WHERE j.status!='deleted' AND (j.lock_until IS NULL OR j.lock_until<=?)
                 AND ((i.id IS NOT NULL AND i.eligible_at<=? AND i.search_revision=j.search_revision
                   AND i.status_version=j.status_version AND (j.status='active' OR i.paused_manual=1)
-                  AND (j.last_extra_started_at IS NULL OR j.last_extra_started_at<=?))
+                  AND (i.triggered_by='quiet_hours' OR j.last_extra_started_at IS NULL OR j.last_extra_started_at<=?))
                   OR (j.status='active' AND j.next_check_at<=?))
                 ORDER BY CASE WHEN i.id IS NOT NULL AND i.eligible_at<=? THEN i.eligible_at ELSE j.next_check_at END LIMIT ?""",
                 (now_text,now_text,precise_iso(now-timedelta(seconds=60)),now_text,now_text,limit)).fetchall()
             for row in rows:
                 intent = conn.execute("SELECT * FROM check_intents WHERE job_id=? AND status='queued'", (row['id'],)).fetchone()
+                extra_run = intent is not None and intent['triggered_by'] != 'quiet_hours'
                 extra_ready = (intent is not None and parse_time(intent['eligible_at'])<=now
                     and intent['search_revision']==row['search_revision'] and intent['status_version']==row['status_version']
                     and (row['status']=='active' or intent['paused_manual'])
-                    and (not row['last_extra_started_at'] or parse_time(row['last_extra_started_at'])<=now-timedelta(seconds=60)))
+                    and (not extra_run or not row['last_extra_started_at']
+                         or parse_time(row['last_extra_started_at'])<=now-timedelta(seconds=60)))
                 if not extra_ready:
                     intent = None
                 run_id, owner_token = new_id(), new_id()
@@ -556,7 +585,8 @@ class Repository(ChannelOperations):
                 snapshot = {'search':search,'targets':targets,'evaluated_at':now_text}
                 conn.execute("""UPDATE jobs SET lock_until=?,lock_run_id=?,lock_owner_token=?,last_started_at=?,
                     last_extra_started_at=CASE WHEN ? THEN ? ELSE last_extra_started_at END WHERE id=?""",
-                    (precise_iso(now+timedelta(minutes=10)),run_id,owner_token,now_text,int(intent is not None),now_text,row['id']))
+                    (precise_iso(now+timedelta(minutes=10)),run_id,owner_token,now_text,
+                     int(intent is not None and intent['triggered_by'] != 'quiet_hours'),now_text,row['id']))
                 trigger = intent['triggered_by'] if intent else 'schedule'
                 paused_manual = int(bool(intent and intent['paused_manual']))
                 intent_id = intent['id'] if intent else None
@@ -737,6 +767,9 @@ class Repository(ChannelOperations):
         channels = [channel for channel in channels if channel['type'] != 'email' or
                     self._email_channel_usable(conn,channel)]
         event_id, now = new_id(), precise_iso()
+        quiet_until = (quiet_window(parse_time(now), job['time_zone'], job['quiet_hours_start'], job['quiet_hours_end'])
+                       if job['quiet_hours_enabled'] else None)
+        quiet_state = 'held' if quiet_until else 'released'
         conn.execute("""INSERT INTO availability_events
             (id,job_id,target_id,result_id,dedupe_key,search_revision,observed_at,routed_at,routing_snapshot)
             VALUES(?,?,?,?,?,?,?,?,?)""", (event_id,job['id'],target['id'],result_id,dedupe,revision,now,now,json.dumps(channels)))
@@ -750,10 +783,10 @@ class Repository(ChannelOperations):
         for channel in channels:
             conn.execute("""INSERT INTO alerts
                 (id,job_id,target_id,result_id,channel,event_type,dedupe_key,status,created_at,next_attempt_at,
-                 search_revision,event_id,channel_config_id,destination_version,credential_version,channel_name,message_content,event_snapshot,content_version,policy_version)
-                VALUES(?,?,?,?,?,'slot_found',?,'pending',?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 search_revision,event_id,channel_config_id,destination_version,credential_version,channel_name,message_content,event_snapshot,content_version,policy_version,quiet_state,quiet_until)
+                VALUES(?,?,?,?,?,'slot_found',?,'pending',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (new_id(),job['id'],target['id'],result_id,channel['type'],dedupe+':channel:'+channel['id']+':destination:'+str(channel['destination_version']),
-                 now,now,revision,event_id,channel['id'],channel['destination_version'],channel['credential_version'],channel['name'],json.dumps(content),json.dumps({**event_snapshot, **({'ntfy_priority':channel['ntfy_priority']} if channel['type']=='ntfy' else {})}),content_version,job['policy_version']))
+                 now,precise_iso(quiet_until) if quiet_until else now,revision,event_id,channel['id'],channel['destination_version'],channel['credential_version'],channel['name'],json.dumps(content),json.dumps({**event_snapshot, **({'ntfy_priority':channel['ntfy_priority']} if channel['type']=='ntfy' else {})}),content_version,job['policy_version'],quiet_state,precise_iso(quiet_until) if quiet_until else None))
 
     def create_alert(self, job, target, result_id, earliest_slot, *, owner_token=None):
         # Events and their original routing are committed with observation.
@@ -788,10 +821,14 @@ class Repository(ChannelOperations):
     @staticmethod
     def _delivery_rows(conn, alert_id=None):
         return conn.execute(
-            """SELECT a.*,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
-            r.booking_url,r.checked_at,r.search_revision AS result_revision,r.snapshot_known,r.published,
+            """SELECT a.*,a.rowid AS alert_order,r.earliest_slot,r.slot_count,r.practitioner_name,r.practice_name,
+            r.booking_url,r.checked_at,r.status AS result_status,r.search_revision AS result_revision,r.snapshot_known,r.published,
+            latest.id AS latest_result_id,latest.status AS latest_result_status,
+            latest.earliest_slot AS latest_earliest_slot,latest.checked_at AS latest_checked_at,
             j.search_revision AS current_revision,j.time_zone,j.status AS job_status,j.telegram_enabled,
-            j.interval_seconds,j.status_version AS current_status_version, cr.status_version AS run_status_version,
+            j.interval_seconds,j.next_check_at,j.last_started_at,j.last_finished_at,j.lock_until,
+            j.quiet_hours_enabled,j.quiet_hours_start,j.quiet_hours_end,
+            j.status_version AS current_status_version, cr.status_version AS run_status_version,
             cr.paused_manual,cr.intent_id,cr.job_name,cr.triggered_by,c.type AS channel_type,t.active AS target_active,s.last_status,s.last_earliest_slot,
             c.enabled AS channel_enabled,c.deleted AS channel_deleted,c.destination_version AS current_destination_version,
             c.credential_version AS current_credential_version,
@@ -799,6 +836,9 @@ class Repository(ChannelOperations):
             EXISTS(SELECT 1 FROM job_channels jc WHERE jc.job_id=a.job_id AND jc.channel_config_id=a.channel_config_id) AS channel_selected
             FROM alerts a JOIN check_results r ON r.id=a.result_id JOIN check_runs cr ON cr.id=r.run_id
             JOIN jobs j ON j.id=a.job_id LEFT JOIN targets t ON t.id=a.target_id
+            LEFT JOIN check_results latest ON latest.id=(SELECT x.id FROM check_results x
+                WHERE x.target_id=a.target_id AND x.search_revision=j.search_revision
+                AND x.snapshot_known=1 AND x.published=1 ORDER BY x.rowid DESC LIMIT 1)
             LEFT JOIN target_alert_state s ON s.target_id=a.target_id
             LEFT JOIN notification_channels c ON c.id=a.channel_config_id
             WHERE (? IS NULL OR a.id=?) ORDER BY COALESCE(a.next_attempt_at,a.created_at),a.created_at,a.rowid""",
@@ -806,7 +846,7 @@ class Repository(ChannelOperations):
         ).fetchall()
 
     @staticmethod
-    def _delivery_eligible(alert, now):
+    def _delivery_route_valid(alert, now):
         return (alert['status'] in ('pending', 'failed') and (alert['job_status'] == 'active' or (alert['job_status'] == 'paused' and alert['paused_manual']))
                 and alert['current_status_version'] == alert['run_status_version']
                 and alert['telegram_enabled'] and alert['target_active']
@@ -815,8 +855,80 @@ class Repository(ChannelOperations):
                 and alert['snapshot_known'] and alert['published']
                 and alert['search_revision'] == alert['current_revision'] == alert['result_revision']
                 and alert['earliest_slot'] and parse_time(alert['earliest_slot']) > now
-                and alert['last_status'] == 'available' and alert['last_earliest_slot'] == alert['earliest_slot']
-                and now - parse_time(alert['checked_at']) <= timedelta(seconds=alert['interval_seconds']))
+                and alert['last_status'] == 'available' and alert['last_earliest_slot'] == alert['earliest_slot'])
+
+    @staticmethod
+    def _delivery_confirmed(alert, now):
+        age = now - parse_time(alert['latest_checked_at']) if alert['latest_checked_at'] else None
+        return (alert['latest_result_status'] == 'available'
+                and alert['latest_earliest_slot'] == alert['earliest_slot']
+                and age is not None and timedelta(0) <= age <= timedelta(seconds=alert['interval_seconds']))
+
+    @staticmethod
+    def _delivery_eligible(alert, now):
+        return (Repository._delivery_route_valid(alert, now)
+                and Repository._delivery_confirmed(alert, now)
+                and alert['quiet_state'] == 'released'
+                and (not alert['quiet_hours_enabled'] or quiet_window(
+                    now, alert['time_zone'], alert['quiet_hours_start'], alert['quiet_hours_end']) is None))
+
+    @staticmethod
+    def _normal_check_due(job, now):
+        due = max(now, parse_time(job['next_check_at']))
+        for field in ('last_started_at', 'last_finished_at'):
+            if job[field]:
+                due = max(due, parse_time(job[field]) + timedelta(seconds=job['interval_seconds']))
+        return due
+
+    @staticmethod
+    def _queue_quiet_refresh(conn, alert, now):
+        job = conn.execute("SELECT * FROM jobs WHERE id=?", (alert['job_id'],)).fetchone()
+        if job is None or job['status'] != 'active':
+            return None
+        due = Repository._normal_check_due(job, now)
+        if job['lock_until'] and parse_time(job['lock_until']) > now:
+            return max(due, parse_time(job['lock_until']))
+        intent = conn.execute("""SELECT * FROM check_intents WHERE job_id=? AND status IN ('queued','running')
+            ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END,rowid DESC LIMIT 1""", (job['id'],)).fetchone()
+        if intent:
+            if intent['status'] == 'running':
+                return due
+            if intent['search_revision'] == job['search_revision'] and intent['status_version'] == job['status_version']:
+                return max(due, parse_time(intent['eligible_at']))
+            conn.execute("UPDATE check_intents SET status='cancelled',cancel_reason='search_edited' WHERE id=?", (intent['id'],))
+        conn.execute("""INSERT INTO check_intents(id,job_id,search_revision,triggered_by,requested_at,eligible_at,
+            status,paused_manual,status_version) VALUES(?,?,?,'quiet_hours',?,?,'queued',0,?)""",
+            (new_id(), job['id'], job['search_revision'], precise_iso(now), precise_iso(due), job['status_version']))
+        return due
+
+    @staticmethod
+    def _refresh_quiet_delivery(conn, alert, now):
+        if (alert['status'] not in ('pending', 'failed') or
+                (alert['claim_owner_token'] and alert['attempt_started_at']) or
+                not Repository._delivery_route_valid(alert, now)):
+            return
+        fresh = Repository._delivery_confirmed(alert, now)
+        if alert['job_status'] == 'paused' and alert['paused_manual'] and not fresh:
+            next_attempt = alert['next_attempt_at'] if alert['delivery_state'] == 'retry' else None
+            conn.execute("UPDATE alerts SET quiet_state='needs_manual_check',quiet_until=NULL,next_attempt_at=? WHERE id=?",
+                         (next_attempt, alert['id']))
+            return
+        quiet_until = None
+        if alert['quiet_hours_enabled']:
+            quiet_until = quiet_window(now, alert['time_zone'], alert['quiet_hours_start'], alert['quiet_hours_end'])
+        if quiet_until:
+            conn.execute("UPDATE alerts SET quiet_state='held',quiet_until=? WHERE id=?",
+                         (precise_iso(quiet_until), alert['id']))
+            return
+        if fresh:
+            next_attempt = alert['next_attempt_at'] if alert['delivery_state'] == 'retry' else precise_iso(now)
+            conn.execute("UPDATE alerts SET quiet_state='released',quiet_until=NULL,next_attempt_at=? WHERE id=?",
+                         (next_attempt, alert['id']))
+            return
+        if alert['job_status'] == 'active':
+            Repository._queue_quiet_refresh(conn, alert, now)
+            conn.execute("UPDATE alerts SET quiet_state='waiting_for_fresh_check',quiet_until=NULL WHERE id=?",
+                         (alert['id'],))
 
     @staticmethod
     def _delivery_budget(alert, now):
@@ -826,6 +938,12 @@ class Repository(ChannelOperations):
     @staticmethod
     def _public_alert(alert, presentation=True):
         alert = dict(alert)
+        if alert.get('status') == 'cancelled':
+            alert['quiet_state'] = 'cancelled'
+            alert['quiet_until'] = None
+        elif alert.get('status') == 'sent':
+            alert['quiet_state'] = 'released'
+            alert['quiet_until'] = None
         if presentation and alert.get('event_snapshot'):
             alert.update(json.loads(alert['event_snapshot']))
         if alert.get('message_content'):
@@ -910,6 +1028,28 @@ class Repository(ChannelOperations):
             conn.execute('BEGIN IMMEDIATE')
             now = utc_now()
             self._cancel_invalid_deliveries(conn, self._delivery_rows(conn), now)
+            rows = self._delivery_rows(conn)
+            for row in rows:
+                self._refresh_quiet_delivery(conn, row, now)
+            rows = self._delivery_rows(conn)
+            newest_unsent = {}
+            held_states = ('held', 'waiting_for_fresh_check', 'needs_manual_check')
+            for row in rows:
+                if row['status'] not in ('pending', 'failed') or not self._delivery_route_valid(row, now):
+                    continue
+                key = (row['job_id'], row['target_id'], row['channel_config_id'], row['destination_version'])
+                prior = newest_unsent.get(key)
+                if prior is None or (row['created_at'], row['alert_order']) > (prior['created_at'], prior['alert_order']):
+                    newest_unsent[key] = row
+            for row in rows:
+                if row['quiet_state'] not in held_states or row['status'] not in ('pending', 'failed'):
+                    continue
+                key = (row['job_id'], row['target_id'], row['channel_config_id'], row['destination_version'])
+                newest = newest_unsent.get(key)
+                if newest and row['event_id'] != newest['event_id']:
+                    conn.execute("""UPDATE alerts SET status='cancelled',quiet_state='cancelled',quiet_until=NULL,
+                        next_attempt_at=NULL,error_summary='quiet_superseded' WHERE id=? AND status IN ('pending','failed')""",
+                        (row['id'],))
             for row in self._delivery_rows(conn):
                 if row['status'] not in ('pending', 'failed') or row['claim_owner_token']:
                     continue
@@ -955,9 +1095,14 @@ class Repository(ChannelOperations):
                 return None
             if (row['claim_result_id'] != row['result_id'] or row['claim_search_revision'] != row['search_revision']
                     or row['credential_version'] != row['current_credential_version']
-                    or not self._delivery_eligible(row, now) or not self._delivery_budget(row, now)):
+                    or not self._delivery_budget(row, now)):
                 self._release_delivery(conn, alert_id, 'exhausted' if not self._delivery_budget(row, now)
                                        else ('retry' if row['attempt_count'] else 'ready'))
+                return None
+            self._refresh_quiet_delivery(conn, row, now)
+            row = self._delivery_rows(conn, alert_id)[0]
+            if not self._delivery_eligible(row, now):
+                self._release_delivery(conn, alert_id, 'retry' if row['attempt_count'] else 'ready')
                 return None
             conn.execute("""UPDATE alerts SET attempt_count=attempt_count+1,delivery_epoch_attempts=delivery_epoch_attempts+1,attempt_started_at=?,last_attempt_at=?,
                          last_attempt_outcome='started',delivery_epoch_at=COALESCE(delivery_epoch_at,created_at)

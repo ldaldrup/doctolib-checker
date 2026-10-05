@@ -92,7 +92,7 @@ def test_schema8_backup_migrates_http_columns_without_changing_telegram(setup,tm
     archive = tmp_path/'schema8.zip'
     assert admin.backup(Path(settings.database_path),archive)['schema_version'] == 8
     work = tmp_path/'restored'
-    assert admin.verify(archive,work)['restored_schema_version'] == 11
+    assert admin.verify(archive,work)['restored_schema_version'] == 12
     restored = Repository(Database(str(work/'restored.sqlite3'))).get_channel(channel['id'],private=True)
     assert restored == original
 

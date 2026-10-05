@@ -1,7 +1,7 @@
 import { safeBookingUrl } from "./job-view.js";
 
 const ROOT = "/api/v1";
-const JOB_FIELDS = ["name", "target_urls", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth", "telegram_enabled", "notification_channel_ids", "message_content"];
+const JOB_FIELDS = ["name", "target_urls", "interval_seconds", "date_mode", "horizon_days", "earliest_date", "latest_date", "time_zone", "insurance_sector", "telehealth", "telegram_enabled", "notification_channel_ids", "message_content", "quiet_hours_enabled", "quiet_hours_start", "quiet_hours_end"];
 const SETTINGS_FIELDS = ["default_interval_seconds", "request_spacing_seconds", "message_content"];
 const pick = (source, fields) => Object.fromEntries(fields.filter(key => Object.hasOwn(source, key) && source[key] !== undefined).map(key => [key, source[key]]));
 
@@ -90,6 +90,7 @@ export const api = {
   testChannel: (id, version, key, contentVersion) => request(`/channels/${identifier(id)}/tests`, {method: "POST", body: {expected_version: version, ...(contentVersion === undefined ? {} : {expected_content_version: contentVersion})}, headers: {"Idempotency-Key": key}}),
   getChannelTest: id => request(`/channel-tests/${identifier(id)}`),
   getSettings: options => request("/settings", options),
+  previewQuietHours: values => request("/quiet-hours/preview", {method: "POST", body: values}),
   getStatus: options => request("/status", options),
   listJobs: (options = {}) => request(`/jobs?${page(options)}`, {signal: options.signal}),
   getJob: (id, options) => request(`/jobs/${identifier(id)}`, options),
@@ -140,6 +141,13 @@ export function createJobPayload(draft, settings) {
     time_zone: String(draft.time_zone || settings.time_zone),
     insurance_sector: draft.insurance_sector, telehealth: Boolean(draft.telehealth), telegram_enabled: Boolean(draft.telegram_enabled)
   };
+  const quietStart = String(draft.quiet_hours_start ?? "22:00"), quietEnd = String(draft.quiet_hours_end ?? "07:00");
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(quietStart)) invalid("quiet_hours_start", "Enter a quiet-hours start time.");
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(quietEnd)) invalid("quiet_hours_end", "Enter a quiet-hours end time.");
+  if (draft.quiet_hours_enabled && quietStart === quietEnd) invalid("quiet_hours_end", "Quiet-hours start and end must differ.");
+  payload.quiet_hours_enabled = Boolean(draft.quiet_hours_enabled);
+  payload.quiet_hours_start = quietStart;
+  payload.quiet_hours_end = quietEnd;
   try { new Intl.DateTimeFormat("en", {timeZone: payload.time_zone}); } catch { invalid("time_zone", "Choose a valid IANA time zone."); }
   if (Object.hasOwn(draft, "notification_channel_ids")) {
     if (!Array.isArray(draft.notification_channel_ids) || draft.notification_channel_ids.some(id => typeof id !== "string" || !id)) invalid("notification_channel_ids", "Choose saved notification channels.");
@@ -161,7 +169,8 @@ export function updateJobPayload(draft, original, settings) {
   const clean = createJobPayload({...draft, time_zone: original.time_zone,
     ...(preserveTelegram ? {telegram_enabled: false} : {})}, settings);
   if (preserveTelegram) clean.telegram_enabled = Boolean(original.telegram_enabled);
-  const previous = {...original, target_urls: original.targets.map(target => target.booking_url)};
+  const previous = {...original, quiet_hours_enabled: false, quiet_hours_start: "22:00", quiet_hours_end: "07:00",
+    target_urls: original.targets.map(target => target.booking_url)};
   const payload = Object.fromEntries(Object.entries(clean).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(previous[key])));
   if (clean.date_mode === "first_available" && original.date_mode === "custom") Object.assign(payload, {earliest_date: null, latest_date: null});
   return payload;
