@@ -4,6 +4,7 @@ import os
 import ipaddress
 import json
 import re
+import math
 from dataclasses import dataclass
 
 
@@ -27,6 +28,16 @@ class Settings:
     api_port: int = 8000
     log_level: str = "INFO"
     check_interval_seconds: float = 2.0
+    target_budget_seconds: float = 120.0
+    slice_budget_seconds: float = 180.0
+
+    def __post_init__(self):
+        for name in ("target_budget_seconds", "slice_budget_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.slice_budget_seconds < self.target_budget_seconds:
+            raise ValueError("slice_budget_seconds must allow a full target budget")
 
     @classmethod
     def from_env(cls):
@@ -54,6 +65,8 @@ class Settings:
             user_agent=os.getenv("USER_AGENT", "DoctolibChecker/2.0"),
             doctolib_profile=profile,
             doctolib_page_days=page_days,
+            target_budget_seconds=float(os.getenv("TARGET_BUDGET_SECONDS", "120")),
+            slice_budget_seconds=float(os.getenv("SLICE_BUDGET_SECONDS", "180")),
             default_timezone=os.getenv("DEFAULT_TIMEZONE", "Europe/Berlin"),
             minimum_poll_interval_seconds=max(
                 300, int(os.getenv("MINIMUM_POLL_INTERVAL_SECONDS", "300"))

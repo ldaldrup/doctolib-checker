@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app import admin
-from app.storage.db import Database
+from app.storage.db import Database, SCHEMA_VERSION
 from app.storage.repositories import Repository
 from test_backend_journey import create_job, setup_backend
 
@@ -24,7 +24,7 @@ def test_restore_preserves_extra_budget_and_paused_pending_intent(tmp_path):
     admin.backup(Path(settings.database_path), archive)
     work = tmp_path / 'restore'
     report = admin.verify(archive, work)
-    assert report['restored_schema_version'] == 13
+    assert report['restored_schema_version'] == SCHEMA_VERSION
     restored = Repository(Database(str(work / 'restored.sqlite3')))
     assert restored.claim_due_jobs() == []
     old = repository.get_job(job['id'])

@@ -134,6 +134,35 @@ await test('negative evidence requires complete successful coverage', () => {
     const view = deriveJobView(job, [run('completed', results)]); assert(view.state !== 'no_availability'); assert(!view.coverageComplete);
   }
 });
+await test('yielded checks preserve progress, useful evidence and incomplete budget errors', () => {
+  const yielded = run('yielded', [result('a', 'no_availability')], {target_cursor: 1});
+  const view = deriveJobView(job, [yielded]);
+  equal(view.state, 'yielded'); assert(view.yielded && !view.running && !view.coverageComplete);
+  assert(view.warning.includes('continuation') && !view.warning.includes('Results are missing'));
+  const current = {...job, current_run: {id: 'r', outcome: 'yielded', search_revision: 1,
+    target_completed: 1, target_total: 2, target_cursor: 1}};
+  assert(historyKey(current) !== historyKey({...current, current_run: {...current.current_run, target_cursor: 2}}));
+  const state = {jobs: [current], filter: 'all', intervalFilter: 'all',
+    load: {status: {phase: 'loaded'}, jobs: {phase: 'loaded'}}, status: {worker_alive: true}, views: new Map([[job.id, view]])};
+  equal(jobStatus(current, state).label, 'Continuation queued');
+  equal(nextCheck(current, state), 'continuation queued');
+  assert(renderJobList(state).includes('1 of 2 targets have results'));
+  state.status.worker_alive = false;
+  assert(checkIntentFeedback({...current, status: 'paused'}, state).includes('keeps the job paused'));
+  assert(checkIntentFeedback(current, state).includes('Worker unavailable'));
+  equal(jobStatus(current, state).label, 'Blocked');
+  const empty = deriveJobView(job, [run('yielded', [], {id: 'new', started_at: t(20)}),
+    run('completed', [result('a', 'available'), result('b', 'no_availability')])]);
+  assert(empty.detected && empty.historical && !empty.coverageComplete && empty.slot.run_id === 'r');
+  const budget = deriveJobView(job, [run('partial_error', [result('a', 'error', {error_category: 'budget_exceeded', count_complete: false}), result('b', 'no_availability')])]);
+  assert(budget.warning.includes('time budget') && !budget.coverageComplete && budget.state !== 'no_availability');
+  state.activity = {items: [{...yielded, history_state: 'current', job_name: job.name, target_total: 2,
+    target_completed: 1, targets: [{id: 'a'}, {id: 'b'}], results: [result('a', 'error', {error_category: 'budget_exceeded'})]}], phase: 'loaded'};
+  const html = renderActivity(state);
+  assert(html.includes('Continuation queued') && html.includes('1 of 2 targets have results'));
+  assert(html.includes('time budget exceeded') && html.includes('awaiting its result'));
+  assert(!html.includes('No appointments found across all'));
+});
 await test('empty running/interrupted checks retain preceding historical detection', () => {
   for (const outcome of ['running', 'interrupted']) {
     const view = deriveJobView(job, [run(outcome, [], {id: 'new', started_at: t(20)}), run('completed', [result('a', 'available'), result('b', 'no_availability')])]);

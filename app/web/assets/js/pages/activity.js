@@ -6,8 +6,8 @@ const when = value => {
     ? `${new Intl.DateTimeFormat("en-GB", {dateStyle: "medium", timeStyle: "short", timeZone: "UTC"}).format(date)} UTC`
     : "Not recorded";
 };
-const runOutcomes = {running: "In progress", completed: "Completed", partial_error: "Partial errors", error: "Failed", interrupted: "Interrupted"};
-const errorTypes = {upstream_rejected: "Doctolib rejected the request", throttled: "Rate limited by Doctolib", upstream_error: "Doctolib returned an error", timeout: "Request timed out", connectivity: "Could not reach Doctolib", invalid_metadata: "Booking metadata could not be resolved", malformed_response: "Invalid availability response", incomplete_response: "Availability response was incomplete", unknown: "Check failed for an unknown reason"};
+const runOutcomes = {running: "In progress", yielded: "Continuation queued", completed: "Completed", partial_error: "Partial errors", error: "Failed", interrupted: "Interrupted"};
+const errorTypes = {budget_exceeded: "Target check time budget exceeded; partial availability was discarded", upstream_rejected: "Doctolib rejected the request", throttled: "Rate limited by Doctolib", upstream_error: "Doctolib returned an error", timeout: "Request timed out", connectivity: "Could not reach Doctolib", invalid_metadata: "Booking metadata could not be resolved", malformed_response: "Invalid availability response", incomplete_response: "Availability response was incomplete", unknown: "Check failed for an unknown reason"};
 const reasonText = code => typeof code === "string" && /^[A-Za-z0-9_]{1,80}$/.test(code) ? code.replaceAll("_", " ") : "";
 const runUrl = (jobId, runId) => `#activity?job=${encodeURIComponent(jobId || "")}&amp;run=${encodeURIComponent(runId || "")}`;
 
@@ -71,9 +71,9 @@ function renderResult(result, run) {
   return `<li class="activity-target"><div class="activity-target-head"><div><h4>${h(name)}</h4><small>${h(when(result.checked_at))}${result.target_removed ? " · Removed from current job" : ""}</small></div>${badge(result.status === "error" ? "Check error" : result.status === "available" ? "Available" : "No availability", result.status === "error" ? "warning" : result.status === "available" ? "success" : "paused")}</div><p>${h(summary)}${result.upstream_status ? ` (HTTP ${h(result.upstream_status)})` : ""}</p>${historical ? '<small class="activity-historical">Historical evidence only; not current published availability.</small>' : ""}${result.retry_at ? `<small>Retry after ${h(when(result.retry_at))}</small>` : ""}${result.deliveries?.length ? `<ul class="activity-deliveries" aria-label="Notification destinations">${result.deliveries.map(item => renderDelivery(item, run)).join("")}</ul>` : ""}</li>`;
 }
 
-function renderMissingTarget(target) {
+function renderMissingTarget(target, run) {
   const name = [target.practitioner_name, target.practice_name].filter(Boolean).join(" · ") || "Target identity unavailable";
-  return `<li class="activity-target"><div class="activity-target-head"><div><h4>${h(name)}</h4></div>${badge("No result recorded", "warning")}</div><p>No result was recorded for this target in this run.</p></li>`;
+  return `<li class="activity-target"><div class="activity-target-head"><div><h4>${h(name)}</h4></div>${badge(["running", "yielded"].includes(run.outcome) ? "Awaiting result" : "No result recorded", ["running", "yielded"].includes(run.outcome) ? "running" : "warning")}</div><p>${["running", "yielded"].includes(run.outcome) ? "This target is awaiting its result in the current check." : "No result was recorded for this target in this run."}</p></li>`;
 }
 
 function renderRun(run) {
@@ -87,10 +87,10 @@ function renderRun(run) {
   const knownTargets = new Set(targets.map(target => target.id));
   const resultByTarget = new Map(results.map(result => [result.target_id, result]));
   const rows = targets.length
-    ? [...targets.map(target => resultByTarget.has(target.id) ? renderResult(resultByTarget.get(target.id), run) : renderMissingTarget(target)),
+    ? [...targets.map(target => resultByTarget.has(target.id) ? renderResult(resultByTarget.get(target.id), run) : renderMissingTarget(target, run)),
       ...results.filter(result => !knownTargets.has(result.target_id)).map(result => renderResult(result, run))]
     : results.map(result => renderResult(result, run));
-  return `<article class="panel activity-run" id="run-${h(run.id)}"><div class="panel-header activity-run-header"><div><p class="eyebrow">${h(run.triggered_by?.replaceAll("_", " ") || "Check")}${run.paused_manual ? " · one-time check while paused" : ""}</p><h2>${h(run.job_name || "Deleted job")}</h2></div><div>${badge(outcome, run.outcome === "completed" ? "success" : run.outcome === "running" ? "running" : "warning")}<small>${h(history)}</small></div></div><div class="panel-content"><dl class="activity-run-meta"><div><dt>Requested</dt><dd>${h(when(run.requested_at))}</dd></div><div><dt>Started</dt><dd>${h(when(run.started_at))}</dd></div><div><dt>Finished</dt><dd>${h(when(run.finished_at))}</dd></div><div><dt>Search revision</dt><dd>${run.search_revision == null ? "Unknown" : h(run.search_revision)}${run.current_search_revision == null ? "" : ` · current ${h(run.current_search_revision)}`}</dd></div></dl><p class="activity-coverage">${h(summary)}</p>${rows.length ? `<ul class="activity-targets">${rows.join("")}</ul>` : `<p class="notice" role="status">${run.outcome === "running" ? "This run is still in progress; no target results have been saved yet." : "No target results were saved for this run."}</p>`}</div></article>`;
+  return `<article class="panel activity-run" id="run-${h(run.id)}"><div class="panel-header activity-run-header"><div><p class="eyebrow">${h(run.triggered_by?.replaceAll("_", " ") || "Check")}${run.paused_manual ? " · one-time check while paused" : ""}</p><h2>${h(run.job_name || "Deleted job")}</h2></div><div>${badge(outcome, run.outcome === "completed" ? "success" : ["running", "yielded"].includes(run.outcome) ? "running" : "warning")}<small>${h(history)}</small></div></div><div class="panel-content"><dl class="activity-run-meta"><div><dt>Requested</dt><dd>${h(when(run.requested_at))}</dd></div><div><dt>Started</dt><dd>${h(when(run.started_at))}</dd></div><div><dt>Finished</dt><dd>${h(when(run.finished_at))}</dd></div><div><dt>Search revision</dt><dd>${run.search_revision == null ? "Unknown" : h(run.search_revision)}${run.current_search_revision == null ? "" : ` · current ${h(run.current_search_revision)}`}</dd></div></dl><p class="activity-coverage">${h(summary)}</p>${rows.length ? `<ul class="activity-targets">${rows.join("")}</ul>` : `<p class="notice" role="status">${["running", "yielded"].includes(run.outcome) ? "This run awaits target results; completed targets will be preserved between worker turns." : "No target results were saved for this run."}</p>`}</div></article>`;
 }
 
 export function renderActivity(state) {

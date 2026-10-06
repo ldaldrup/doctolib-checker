@@ -1,4 +1,4 @@
-"""A dead worker's intent ends without discarding a newer paused request."""
+"""A dead worker's continuation retains intent and a newer paused request."""
 from datetime import datetime, timedelta, timezone
 
 from app.services.checks import CheckService
@@ -19,15 +19,21 @@ def test_expired_manual_run_reconciles_without_erasing_followup(tmp_path, monkey
     now[0] += timedelta(minutes=11)
     restarted = Repository(repository.database)
     restarted.interrupt_stale_runs()
-    assert restarted.checks(job['id'])[0]['outcome'] == 'interrupted'
+    assert restarted.checks(job['id'])[0]['outcome'] == 'yielded'
     with restarted.database.connection() as conn:
-        assert conn.execute('SELECT status FROM check_intents WHERE id=?', (first['id'],)).fetchone()[0] == 'completed'
+        assert conn.execute('SELECT status FROM check_intents WHERE id=?', (first['id'],)).fetchone()[0] == 'running'
     assert restarted.get_job(job['id'])['check_intent']['id'] == followup['id']
     assert restarted.get_job(job['id'])['check_intent']['status'] == 'queued'
     assert not restarted.finish_run(run_id, job['id'], 0, 0, 300, owner_token=abandoned['owner_token'])
     next_run, current = restarted.claim_due_jobs(limit=1)[0]
-    assert current['intent_id'] == followup['id']
+    assert next_run==run_id and current['intent_id'] == first['id']
+    assert current['owner_token']!=abandoned['owner_token']
     CheckService(restarted, doctolib, settings).run_claim(next_run, current)
+    assert restarted.get_job(job['id'])['check_intent']['id']==followup['id']
+    assert restarted.get_job(job['id'])['check_intent']['status']=='queued'
+    following_run, following = restarted.claim_due_jobs(limit=1)[0]
+    assert following_run!=run_id and following['intent_id']==followup['id']
+    CheckService(restarted, doctolib, settings).run_claim(following_run,following)
     assert restarted.get_job(job['id'])['check_intent']['run_outcome'] == 'completed'
     assert restarted.get_job(job['id'])['status'] == 'paused'
     assert restarted.claim_due_jobs() == []

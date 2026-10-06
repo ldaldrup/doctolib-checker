@@ -14,7 +14,7 @@ from app.services.checks import CheckService
 from app.services.delivery import DeliveryService
 from app.notifications import DeliveryOutcome
 from app.settings import Settings
-from app.storage.db import Database
+from app.storage.db import Database, SCHEMA_VERSION
 from app.storage.repositories import Repository, LeaseLostError, ConflictError, iso, parse_time, utc_now
 
 
@@ -244,7 +244,7 @@ def claim_for_result(repository, job):
     if previous[0]:
         repository.finish_run(previous[0], job["id"], 0, 0, job["interval_seconds"], owner_token=previous[1])
     with repository.database.connection() as conn:
-        conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (iso(utc_now()), job["id"]))
+        conn.execute("UPDATE jobs SET next_check_at=? WHERE id=?", (iso(), job["id"]))
     run_id, claimed = repository.claim_due_jobs(limit=1)[0]
     assert claimed["id"] == job["id"]
     job["owner_token"] = claimed["owner_token"]
@@ -600,8 +600,11 @@ def test_edit_preserves_original_options_across_targets_in_same_run(tmp_path):
 
     Journey(repository, updating, settings, notifier=FakeNotifier()).run_due(limit=1)
 
-    assert [search["insurance_sector"] for search in updating.searches] == ["public", "public"]
-    assert [search["telehealth"] for search in updating.searches] == [False, False]
+    assert [search["insurance_sector"] for search in updating.searches] == ["public"]
+    assert [search["telehealth"] for search in updating.searches] == [False]
+    old = repository.checks(job['id'])[0]
+    assert old['outcome']=='interrupted' and old['results']==[]
+    assert repository.get_job(job['id'])['check_intent']['status']=='queued'
 
 
 def test_manual_intent_bypasses_floor_while_resume_preserves_it_after_restart(tmp_path):
@@ -684,7 +687,7 @@ def test_worker_claims_one_job_at_a_time_and_renews_owned_lease(tmp_path):
     assert not repository.finish_run(run_id, first["id"], 0, 0, 300, owner_token=_job["owner_token"])
 
 
-def test_stale_run_is_interrupted_after_its_lease_expires(tmp_path):
+def test_stale_capable_run_yields_and_reclaims_after_its_lease_expires(tmp_path):
     client, repository, _settings, _doctolib = setup_backend(tmp_path)
     job = create_job(client)
     run_id, _claimed_job = repository.claim_due_jobs(limit=1)[0]
@@ -695,8 +698,11 @@ def test_stale_run_is_interrupted_after_its_lease_expires(tmp_path):
 
     run = repository.checks(job["id"])[0]
     assert run["id"] == run_id
-    assert run["outcome"] == "interrupted"
-    assert lock_owner(repository, job["id"]) is None
+    assert run["outcome"] == "yielded"
+    assert lock_owner(repository, job["id"]) == run_id
+    resumed_id, resumed = repository.claim_due_jobs(limit=1)[0]
+    assert resumed_id==run_id and resumed['owner_token']!=_claimed_job['owner_token']
+    assert not repository.owns_run(job['id'],run_id,_claimed_job['owner_token'])
 
 
 def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
@@ -714,7 +720,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     assert run["id"] == run_id and run["outcome"] == "interrupted"
     assert not run["snapshot_known"] and run["search_snapshot"] is None
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_delete_keeps_history_available_through_job_id(tmp_path):
@@ -1022,7 +1028,7 @@ def test_v2_migration_preserves_sent_and_failed_alerts_without_resending(tmp_pat
 
     repository.database.initialize()
     with repository.database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM target_alert_state").fetchone()[0] == 2
     after = {alert["job_id"]: alert for alert in repository.alerts()}
     assert {key: value["status"] for key, value in after.items()} == {
@@ -1375,7 +1381,8 @@ def test_lease_is_rechecked_after_gate_wait_and_before_retry(tmp_path, monkeypat
     assert len(calls) == (0 if boundary == 'gate_wait' else 1)
     assert repository.checks(job['id'])[0]['results'] == []
     repository.interrupt_stale_runs()
-    assert repository.checks(job['id'])[0]['outcome'] == 'interrupted'
+    assert repository.checks(job['id'])[0]['outcome'] == 'yielded'
+    assert repository.checks(job['id'])[0]['target_cursor'] == 0
 
 
 def test_scheduled_retry_rechecks_revision_before_another_attempt(tmp_path):
@@ -1416,12 +1423,13 @@ def test_periodic_stale_reconciliation_preserves_actual_terminal_counts(tmp_path
     with repository.database.connection() as conn:
         conn.execute("UPDATE jobs SET lock_until=?,next_check_at=? WHERE id=?",
                      (iso(utc_now() - timedelta(seconds=1)), iso(utc_now() + timedelta(hours=1)), job["id"]))
-    # A normal tick must reconcile without restart or another claim.
-    assert Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due() == []
+    # A normal tick reclaims the same run and skips both terminal targets.
+    assert Journey(repository, doctolib, settings, notifier=FakeNotifier()).run_due() == [
+        {'successful_targets':2,'failed_targets':1}]
     run = repository.checks(job["id"])[0]
-    assert run["id"] == run_id and run["outcome"] == "interrupted"
-    assert (run["successful_targets"], run["failed_targets"]) == (1, 1)
-    assert len(run["results"]) == 2
+    assert run["id"] == run_id and run["outcome"] == "partial_error"
+    assert (run["successful_targets"], run["failed_targets"]) == (2, 1)
+    assert len(run["results"]) == 3 and run['target_cursor']==3
     assert lock_owner(repository, job["id"]) is None
 
 
@@ -1446,10 +1454,10 @@ def test_worker_uses_snapshot_metadata_for_each_target_after_midrun_edit(tmp_pat
             return AvailabilityResult(status="no_availability", slot_count=0,
                                       earliest_slot=None, count_complete=True)
 
-    Journey(repository, MetadataEditingDoctolib(), settings, notifier=FakeNotifier()).run_due()
-    assert observed == [("Dr. Ada Beispiel", "1234"), ("Dr. Ada Beispiel", "1234")]
+    Journey(repository, MetadataEditingDoctolib(), settings, notifier=FakeNotifier()).run_due(limit=1)
+    assert observed == [("Dr. Ada Beispiel", "1234")]
     run = repository.checks(job["id"])[0]
-    assert len(run["results"]) == 2
+    assert len(run["results"]) == 1 and run['outcome']=='interrupted'
     assert all(result["practitioner_name"] == "Dr. Ada Beispiel" and not result["published"]
                for result in run["results"])
 

@@ -33,6 +33,10 @@ class MetadataResolutionError(ValueError):
     """Doctolib metadata did not identify a usable booking target."""
 
 
+class TargetBudgetExceeded(TimeoutError):
+    """The target's total checking deadline expired; coverage is incomplete."""
+
+
 class DoctolibHTTPError(requests.RequestException):
     """Safe HTTP failure details for activity history."""
 
@@ -179,6 +183,18 @@ class DoctolibClient:
             raise ValueError("Doctolib page size must be between 1 and 15 days")
         self.profile = profile
         self.page_days = page_days
+        self.deadline = None
+        self.check_permission = lambda: None
+
+    def remaining_budget(self):
+        self.check_permission()
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time_module.monotonic()
+        # libcurl converts timeout to integer milliseconds; zero disables it.
+        if remaining < 0.001:
+            raise TargetBudgetExceeded("The target checking budget was exceeded.")
+        return remaining
 
     def _get(self, url, **kwargs):
         timeout = kwargs.pop("timeout", 15)
@@ -193,18 +209,22 @@ class DoctolibClient:
             request_url = url
             request_kwargs = dict(kwargs)
             for redirect_count in range(6):
+                self.remaining_budget()
                 self.before_request()
+                remaining = self.remaining_budget()
                 try:
                     call_kwargs = {
-                        "timeout": timeout,
+                        "timeout": min(timeout, remaining) if remaining is not None else timeout,
                         "allow_redirects": False,
                         **request_kwargs,
                     }
                     if not availability:
                         call_kwargs["headers"] = {"User-Agent": self.user_agent}
                     response = session.get(request_url, **call_kwargs)
+                    self.remaining_budget()
                 except (requests.Timeout, requests.ConnectionError,
                         curl_requests.exceptions.Timeout, curl_requests.exceptions.ConnectionError) as exc:
+                    self.remaining_budget()
                     last_error = exc
                     if attempt == 3:
                         raise
@@ -235,7 +255,10 @@ class DoctolibClient:
                 response.raise_for_status()
                 return response
             if attempt < 3:
-                time_module.sleep(min(2 ** attempt, 8))
+                remaining = self.remaining_budget()
+                delay = min(2 ** attempt, 8)
+                time_module.sleep(min(delay, remaining) if remaining is not None else delay)
+                self.remaining_budget()
         raise last_error
 
     def resolve(self, booking_url):
@@ -396,6 +419,7 @@ class DoctolibClient:
             "telehealth": str(bool(search.get("telehealth", False))).lower(),
         }
         while page_start <= latest:
+            self.remaining_budget()
             page_end = min(page_start + timedelta(days=self.page_days - 1), latest)
             response = self._get(
                 availability_url,
@@ -412,6 +436,7 @@ class DoctolibClient:
             except (TypeError, ValueError):
                 return _availability_error("malformed_response", "invalid_availability_response",
                                            "Doctolib returned invalid availability data.")
+            self.remaining_budget()
             if not isinstance(data, dict) or not isinstance(data.get("availabilities"), list):
                 return _availability_error("malformed_response", "invalid_availability_response",
                                            "Doctolib returned invalid availability data.")
@@ -422,6 +447,7 @@ class DoctolibClient:
             returned_count = 0
             page_slots = {}
             for day_info in data.get("availabilities", []) or []:
+                self.remaining_budget()
                 if not isinstance(day_info, dict) or not isinstance(day_info.get("slots", []), list):
                     return _availability_error("malformed_response", "invalid_availability_response",
                                                "Doctolib returned invalid availability data.")
@@ -456,7 +482,9 @@ class DoctolibClient:
                                            "Doctolib returned only part of the availability list.")
             all_slots.update(page_slots)
             page_start = page_end + timedelta(days=1)
+            self.remaining_budget()
 
+        self.remaining_budget()
         matched = sorted(all_slots.values(), key=lambda item: item.starts_at)
         if not matched:
             return AvailabilityResult(

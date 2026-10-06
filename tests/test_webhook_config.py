@@ -7,7 +7,7 @@ from cryptography.fernet import Fernet
 
 from app import admin
 from app.notification_secrets import NotificationSecrets
-from app.storage.db import Database
+from app.storage.db import Database, SCHEMA_VERSION
 from app.storage.repositories import Repository
 from test_channel_api import setup
 
@@ -92,7 +92,7 @@ def test_schema8_backup_migrates_http_columns_without_changing_telegram(setup,tm
     archive = tmp_path/'schema8.zip'
     assert admin.backup(Path(settings.database_path),archive)['schema_version'] == 8
     work = tmp_path/'restored'
-    assert admin.verify(archive,work)['restored_schema_version'] == 13
+    assert admin.verify(archive,work)['restored_schema_version'] == SCHEMA_VERSION
     restored = Repository(Database(str(work/'restored.sqlite3'))).get_channel(channel['id'],private=True)
     assert restored == original
 

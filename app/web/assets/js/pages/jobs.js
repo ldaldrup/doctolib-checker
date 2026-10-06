@@ -72,6 +72,7 @@ export function nextCheck(job, state, now = Date.now()) {
   if (job.status === "paused") return "paused";
   if (state.load?.status?.phase !== "loaded") return "unknown";
   if (!state.status?.worker_alive) return "blocked";
+  if ((job.current_run?.outcome === "yielded" && job.current_run.search_revision === job.search_revision) || viewFor(state, job)?.yielded) return "continuation queued";
   if (viewFor(state, job)?.running) return "checking";
   const due = Date.parse(job.next_check_at || "");
   return !Number.isFinite(due) ? "unknown" : due <= now ? "due" : compactDuration((due - now) / 1000);
@@ -101,6 +102,13 @@ export function checkedAgo(value, now = Date.now()) {
 // prove that a user's requested revision was checked.
 export function checkIntentFeedback(job, state, now = Date.now()) {
   if (state.pendingJobs?.has(job.id) && state.checkSubmitting?.has(job.id)) return "Requesting a check…";
+  const run = job.current_run;
+  if (run?.search_revision === job.search_revision && ["running", "yielded"].includes(run.outcome)) {
+    const progress = Number.isInteger(run.target_completed) && Number.isInteger(run.target_total)
+      ? ` ${run.target_completed} of ${run.target_total} targets have results.` : "";
+    const saved = run.outcome === "yielded" ? "Continuation queued for the next worker turn." : "Check in progress.";
+    return `${saved}${progress}${job.status === "paused" ? " This one-time check keeps the job paused." : ""}${state.load?.status?.phase !== "loaded" ? " Worker status is unknown; showing saved progress." : !state.status?.worker_alive ? " Worker unavailable; showing saved progress." : ""}`;
+  }
   const intent = job.check_intent;
   if (!intent) return null;
   const revision = intent.search_revision;
@@ -139,6 +147,7 @@ export function jobStatus(job, state, now = Date.now()) {
   if (state.load?.status?.phase !== "loaded") return {label: "Status unknown", tone: "warning", detail: state.load?.status?.error ? "Worker status unavailable" : "Checking worker status…"};
   if (!state.status?.worker_alive) return {label: "Blocked", tone: "warning", detail: "Worker unavailable"};
   if (view?.error) return {label: "Status unknown", tone: "warning", detail: "Check history unavailable"};
+  if ((job.current_run?.outcome === "yielded" && job.current_run.search_revision === job.search_revision) || view?.yielded) return {label: "Continuation queued", tone: "running", detail: "Awaiting the next worker turn"};
   if (view?.state === "error") return {label: "Check failed", tone: "warning", detail: "Targets could not be checked"};
   if (view?.state === "partial") return {label: "Check incomplete", tone: "warning", detail: "Some target results are missing or failed"};
   const labels = {unknown: "Loading check history…", never: "Awaiting first check", awaiting: "Awaiting a fresh check", running: "Check in progress", no_availability: "Awaiting a check", available: "Historical slot detection"};

@@ -1,11 +1,12 @@
 """Run one job and persist its per-target results and alert outcomes."""
 
 import logging
+import time
 from copy import deepcopy
 
 from app.models import BookingMeta
 from app.notifications import send_telegram_alert
-from app.doctolib import BookingUrlError, DoctolibHTTPError, MetadataResolutionError
+from app.doctolib import BookingUrlError, DoctolibHTTPError, MetadataResolutionError, TargetBudgetExceeded
 from app.storage.repositories import LeaseLostError
 from curl_cffi import requests as curl_requests
 import requests
@@ -16,6 +17,8 @@ class _RunStopped(Exception):
 
 
 def _safe_error(exc):
+    if isinstance(exc, TargetBudgetExceeded):
+        return "target_budget_exceeded", "The target check exceeded its time budget; coverage is incomplete.", "budget_exceeded", None, None
     if isinstance(exc, DoctolibHTTPError) or isinstance(exc, requests.HTTPError):
         response = getattr(exc, "response", None)
         status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
@@ -36,12 +39,13 @@ def _safe_error(exc):
 
 def _result_error(result):
     categories = {"upstream_rejected", "throttled", "upstream_error", "timeout", "connectivity",
-                  "invalid_metadata", "malformed_response", "incomplete_response"}
+                  "invalid_metadata", "malformed_response", "incomplete_response", "budget_exceeded"}
     category = result.error_category
     if category not in categories:
         category = {"invalid_availability_response": "malformed_response",
                     "incomplete_availability_response": "incomplete_response"}.get(result.error_code, "unknown")
-    messages = {"upstream_rejected": "Doctolib rejected the availability request.",
+    messages = {"budget_exceeded": "The target check exceeded its time budget; coverage is incomplete.",
+                "upstream_rejected": "Doctolib rejected the availability request.",
                 "throttled": "Doctolib is rate-limiting the availability request.",
                 "upstream_error": "Doctolib returned a temporary error.",
                 "timeout": "The availability request timed out.",
@@ -85,44 +89,60 @@ class CheckService:
         )
 
     def run_claim(self, run_id, job):
-        successful = 0
-        failed = 0
+        successful = job.get("successful_targets", 0)
+        failed = job.get("failed_targets", 0)
         last_error = None
         owner_token = job["owner_token"]
         snapshot = job["search_snapshot"]
-        had_hook = hasattr(self.doctolib, "before_request")
-        original_hook = getattr(self.doctolib, "before_request", None)
+        slice_deadline = time.monotonic() + self.settings.slice_budget_seconds
+        # Preserve injected clients and hooks used by metadata/API callers.
+        saved_hooks = {name: (hasattr(self.doctolib, name), getattr(self.doctolib, name, None))
+                       for name in ("before_request", "deadline", "check_permission")}
+        original_hook = saved_hooks["before_request"][1]
+        yielded = False
 
         def guard_request():
-            # Only a manual intent created while paused grants one-run access;
-            # status and revision changes revoke that capability in storage.
             if not self.repository.run_can_check(job["id"], run_id, owner_token):
                 raise _RunStopped()
-            if not self.repository.renew_job_lock(job["id"], run_id, owner_token=owner_token):
+            remaining = slice_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TargetBudgetExceeded()
+            if not self.repository.renew_job_lock(
+                    job["id"], run_id, owner_token=owner_token, lease_seconds=remaining + 10):
                 raise LeaseLostError("The check claim is no longer owned")
 
         def before_request():
             guard_request()
             if original_hook is not None:
                 original_hook()
-            # A reserved request turn may wait beyond the lease or a pause.
+            # Waiting for a reserved turn can revoke permission or exhaust time.
             guard_request()
 
         try:
             self.doctolib.before_request = before_request
-            for saved_target in snapshot["targets"]:
+            self.doctolib.check_permission = guard_request
+            for position, saved_target in enumerate(snapshot["targets"][job.get("target_cursor", 0):]):
+                # A target needs its full allowance. Yield before starting one
+                # which would otherwise inherit a nearly exhausted slice.
+                if position and slice_deadline - time.monotonic() < self.settings.target_budget_seconds:
+                    yielded = self.repository.yield_run(run_id, job["id"], owner_token=owner_token)
+                    break
+                if self.repository.result_id(run_id, saved_target["id"]):
+                    continue
                 guard_request()
                 target = deepcopy(saved_target)
                 search = deepcopy(snapshot["search"])
+                self.doctolib.deadline = min(slice_deadline, time.monotonic() + self.settings.target_budget_seconds)
                 try:
                     result = self.doctolib.check(target["booking_url"], search, meta=self._meta(target))
+                    # Also fence injected adapters that do not use _get.
+                    if time.monotonic() >= self.doctolib.deadline:
+                        raise TargetBudgetExceeded()
                     if result.status == "error":
                         code, safe_message, category, status, retry_at = _result_error(result)
                         result.error_code, result.error_message = code, safe_message
                         result.error_category, result.upstream_status, result.retry_at = category, status, retry_at
-                    result_id = self.repository.insert_result(
-                        run_id, job, target, result, owner_token=owner_token
-                    )
+                    self.repository.insert_result(run_id, job, target, result, owner_token=owner_token)
                     if result.status == "error":
                         failed += 1
                         last_error = result.error_code
@@ -131,32 +151,31 @@ class CheckService:
                 except (_RunStopped, LeaseLostError):
                     break
                 except Exception as exc:
-                    failed += 1
                     code, message, category, status, retry_at = _safe_error(exc)
                     last_error = code
                     try:
                         self.repository.insert_error_result(
                             run_id, job, target, code, message, error_category=category,
-                            upstream_status=status, retry_at=retry_at, owner_token=owner_token
-                        )
+                            upstream_status=status, retry_at=retry_at, owner_token=owner_token)
+                        failed += 1
                     except LeaseLostError:
                         break
                     logging.warning("Availability check failed for target %s (%s)", target["id"], code)
         except (_RunStopped, LeaseLostError):
             pass
         except Exception as exc:
-            failed += 1
             last_error = _safe_error(exc)[0]
-            logging.error("Unable to load or process targets for job %s (%s)", job["id"], last_error)
+            logging.error("Unable to process targets for job %s (%s)", job["id"], last_error)
         finally:
-            if had_hook:
-                self.doctolib.before_request = original_hook
-            else:
-                del self.doctolib.before_request
-            self.repository.finish_run(
-                run_id, job["id"], successful, failed, int(job["interval_seconds"]), last_error,
-                owner_token=owner_token,
-            )
+            for name, (existed, value) in saved_hooks.items():
+                if existed:
+                    setattr(self.doctolib, name, value)
+                else:
+                    delattr(self.doctolib, name)
+            if not yielded:
+                self.repository.finish_run(
+                    run_id, job["id"], successful, failed, int(job["interval_seconds"]), last_error,
+                    owner_token=owner_token)
         return {"successful_targets": successful, "failed_targets": failed}
 
     def run_due(self, limit=10):

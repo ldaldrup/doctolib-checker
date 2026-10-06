@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.quiet_hours import next_release, quiet_window, validate_quiet_hours
-from app.storage.db import Database
+from app.storage.db import Database, SCHEMA_VERSION
 
 
 def utc(value):
@@ -52,7 +52,7 @@ def test_schema_11_migrates_to_disabled_quiet_hours(tmp_path):
 
     database.initialize()
     with database.connection() as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 13
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
         defaults = {row[1]: row[4] for row in conn.execute("PRAGMA table_info(jobs)")}
         assert defaults["quiet_hours_enabled"] == "0"
         assert defaults["quiet_hours_start"] == "'22:00'"

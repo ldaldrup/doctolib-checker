@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import admin
 from app.api.app import create_app
-from app.storage.db import Database
+from app.storage.db import Database, SCHEMA_VERSION
 from app.storage.repositories import Repository
 from test_backend_journey import setup_backend, URL
 
@@ -25,7 +25,7 @@ def test_restored_create_replays_without_metadata_and_preserves_settings_version
     archive=tmp_path/'create.zip'
     admin.backup(Path(settings.database_path),archive)
     work=tmp_path/'verify'
-    assert admin.verify(archive,work)['restored_schema_version']==13
+    assert admin.verify(archive,work)['restored_schema_version']==SCHEMA_VERSION
     restored=Repository(Database(str(work/'restored.sqlite3')))
     doctolib.resolve=lambda _url: pytest.fail('metadata on completed replay')
     with TestClient(create_app(replace(settings,database_path=restored.database.path),restored,doctolib)) as app:

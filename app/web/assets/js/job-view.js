@@ -16,7 +16,7 @@ export function safeBookingUrl(value) {
 
 // Includes search/target identity and scheduler evidence, never list.last_result.
 export function historyKey(job) {
-  return JSON.stringify([job.id, job.search_revision, job.updated_at, job.last_started_at, job.last_finished_at, job.last_outcome, job.check_intent,
+  return JSON.stringify([job.id, job.search_revision, job.updated_at, job.last_started_at, job.last_finished_at, job.last_outcome, job.check_intent, job.current_run,
     job.date_mode, job.horizon_days, job.earliest_date, job.latest_date, job.time_zone,
     job.insurance_sector, job.telehealth,
     activeTargets(job).map(target => [target.id, target.booking_url, target.last_validated_at])]);
@@ -37,7 +37,7 @@ function resultsFor(run, targets) {
 export function deriveJobView(job, runs = [], {historyState = "loaded", historyError = null, invalidatedAt = null} = {}) {
   const targets = activeTargets(job);
   const view = {state: "unknown", detected: false, slot: null, warning: null, checkedAt: null,
-    runId: null, running: false, stale: historyState === "stale", coverageComplete: false,
+    runId: null, running: false, yielded: false, stale: historyState === "stale", coverageComplete: false,
     countComplete: false, targetCount: targets.length, historical: false, error: historyError};
   if (!["loaded", "stale"].includes(historyState)) {
     view.warning = historyState === "error" ? "Check history could not be loaded." : null;
@@ -55,14 +55,15 @@ export function deriveJobView(job, runs = [], {historyState = "loaded", historyE
   const fresh = run => revision(job.search_revision) && flag(run.snapshot_known)
     && run.search_revision === job.search_revision && !!run.search_snapshot;
   const uncertain = !fresh(latest);
+  view.yielded = latest.outcome === "yielded" && !uncertain;
   if (uncertain) view.historical = true;
   let snapshot = latest;
   const snapshotTargets = run => fresh(run) ? targets : (run.search_snapshot?.targets || (run.results || []).map(result => ({id: result.target_id})));
   let results = resultsFor(snapshot, snapshotTargets(snapshot));
-  // A running/interrupted check with no current-target result has no snapshot.
+  // An unfinished check with no current-target result has no snapshot.
   // Retain the nearest preceding evidence only as historical. Do not skip a
   // completed negative check and revive an older contradicted detection.
-  if (!results.length && ["running", "interrupted"].includes(latest.outcome)) {
+  if (!results.length && ["running", "yielded", "interrupted"].includes(latest.outcome)) {
     const previous = ordered.slice(1).find(run => run.outcome !== "running" && resultsFor(run, snapshotTargets(run)).length);
     if (previous) {
       snapshot = previous;
@@ -95,14 +96,16 @@ export function deriveJobView(job, runs = [], {historyState = "loaded", historyE
   const warnings = [];
   if (uncertain) warnings.push(latest.snapshot_known ? "These historical results use an earlier search revision. Awaiting a fresh check with the saved options." : "The search options used for this historical check are unknown. Awaiting a fresh check.");
   if (view.running) warnings.push(snapshot !== latest ? "Check in progress; showing the preceding check evidence." : "Check in progress; results may be incomplete.");
+  if (view.yielded) warnings.push(snapshot !== latest ? "Check awaits continuation; showing the preceding check evidence." : "Check awaits continuation; results are incomplete.");
   if (latest.outcome === "interrupted") warnings.push("The latest check was interrupted.");
   if (["partial_error", "error"].includes(latest.outcome) || errors.length) warnings.push("Some targets could not be checked.");
-  if (missing && !view.running) warnings.push("Results are missing for some current targets.");
+  if (errors.some(result => result.error_category === "budget_exceeded")) warnings.push("A target exceeded its check time budget; its partial availability was discarded.");
+  if (missing && !view.running && !view.yielded) warnings.push("Results are missing for some current targets.");
   if (!uncertain && results.length && eligible.length !== results.length) warnings.push("Some results were not published for the current search; awaiting fresh evidence.");
   if (known.length && !view.countComplete) warnings.push("Availability counts are incomplete.");
   if (view.stale) warnings.push("Showing last loaded check history; refresh failed.");
   view.warning = warnings.length ? warnings.join(" ") : null;
-  view.state = view.detected ? "available" : uncertain ? "awaiting" : view.running ? "running"
+  view.state = view.detected ? "available" : uncertain ? "awaiting" : view.running ? "running" : view.yielded ? "yielded"
     : latest.outcome === "error" || (errors.length > 0 && !known.length) ? "error"
     : latest.outcome === "completed" && view.coverageComplete && known.every(result => result.status === "no_availability") ? "no_availability"
     : "partial";

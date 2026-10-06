@@ -197,10 +197,17 @@ class Repository(ChannelOperations):
 
     @staticmethod
     def _current_run(conn, job_id):
-        row = conn.execute("""SELECT r.id,r.outcome,r.search_revision,r.triggered_by,r.intent_id,r.paused_manual
-            FROM check_runs r JOIN jobs j ON j.lock_run_id=r.id WHERE j.id=? AND r.outcome='running'
-            AND j.lock_until>?""", (job_id, precise_iso())).fetchone()
-        return dict(row) if row else None
+        row = conn.execute("""SELECT r.id,r.outcome,r.search_revision,r.triggered_by,r.intent_id,r.paused_manual,
+            r.target_cursor,r.successful_targets,r.failed_targets,r.search_snapshot
+            FROM check_runs r JOIN jobs j ON j.lock_run_id=r.id WHERE j.id=?
+            AND (r.outcome='yielded' OR (r.outcome='running' AND j.lock_until>?))""", (job_id, precise_iso())).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        snapshot = json.loads(result.pop('search_snapshot'))
+        result.update(target_total=len(snapshot['targets']),
+                      target_completed=result['successful_targets'] + result['failed_targets'])
+        return result
 
     @staticmethod
     def _intent_evidence(conn, job_id, intent_id=None):
@@ -558,15 +565,36 @@ class Repository(ChannelOperations):
             conn.execute("BEGIN IMMEDIATE")
             now = utc_now()
             now_text = precise_iso(now)
+            self._reconcile_runs(conn, now)
             rows = conn.execute("""SELECT j.* FROM jobs j LEFT JOIN check_intents i ON i.job_id=j.id AND i.status='queued'
+                LEFT JOIN check_runs continuation ON continuation.id=j.lock_run_id AND continuation.outcome='yielded'
                 WHERE j.status!='deleted' AND (j.lock_until IS NULL OR j.lock_until<=?)
-                AND ((i.id IS NOT NULL AND i.eligible_at<=? AND i.search_revision=j.search_revision
+                AND (continuation.id IS NOT NULL OR (i.id IS NOT NULL AND i.eligible_at<=? AND i.search_revision=j.search_revision
                   AND i.status_version=j.status_version AND (j.status='active' OR i.paused_manual=1)
                   AND (i.triggered_by='quiet_hours' OR j.last_extra_started_at IS NULL OR j.last_extra_started_at<=?))
                   OR (j.status='active' AND j.next_check_at<=?))
-                ORDER BY CASE WHEN i.id IS NOT NULL AND i.eligible_at<=? THEN i.eligible_at ELSE j.next_check_at END LIMIT ?""",
+                ORDER BY COALESCE(j.last_served_at,''),
+                CASE WHEN i.id IS NOT NULL AND i.eligible_at<=? THEN i.eligible_at ELSE j.next_check_at END,j.rowid LIMIT ?""",
                 (now_text,now_text,precise_iso(now-timedelta(seconds=60)),now_text,now_text,limit)).fetchall()
             for row in rows:
+                last_served = conn.execute("SELECT MAX(last_served_at) FROM jobs").fetchone()[0]
+                served_at = max(now, parse_time(last_served)+timedelta(microseconds=1)) if last_served else now
+                conn.execute("UPDATE jobs SET last_served_at=? WHERE id=?", (precise_iso(served_at), row['id']))
+                continuation = conn.execute("SELECT * FROM check_runs WHERE id=? AND outcome='yielded'", (row['lock_run_id'],)).fetchone()
+                if continuation:
+                    owner_token = new_id()
+                    conn.execute("UPDATE check_runs SET outcome='running',owner_token=?,generation=generation+1 WHERE id=?",
+                                 (owner_token,continuation['id']))
+                    conn.execute("UPDATE jobs SET lock_until=?,lock_owner_token=? WHERE id=?",
+                                 (precise_iso(now+timedelta(minutes=10)),owner_token,row['id']))
+                    job = dict(row)
+                    job.update(owner_token=owner_token,search_snapshot=json.loads(continuation['search_snapshot']),
+                               search_revision=continuation['search_revision'],intent_id=continuation['intent_id'],
+                               triggered_by=continuation['triggered_by'],paused_manual=continuation['paused_manual'],
+                               target_cursor=continuation['target_cursor'],generation=continuation['generation']+1,
+                               successful_targets=continuation['successful_targets'],failed_targets=continuation['failed_targets'])
+                    claimed.append((continuation['id'],job))
+                    continue
                 intent = conn.execute("SELECT * FROM check_intents WHERE job_id=? AND status='queued'", (row['id'],)).fetchone()
                 extra_run = intent is not None and intent['triggered_by'] != 'quiet_hours'
                 extra_ready = (intent is not None and parse_time(intent['eligible_at'])<=now
@@ -599,7 +627,8 @@ class Repository(ChannelOperations):
                 if intent:
                     conn.execute("UPDATE check_intents SET status='running',run_id=? WHERE id=? AND status='queued'", (run_id,intent_id))
                 job = dict(row)
-                job.update(owner_token=owner_token,search_snapshot=snapshot,intent_id=intent_id,triggered_by=trigger,paused_manual=paused_manual)
+                job.update(owner_token=owner_token,search_snapshot=snapshot,intent_id=intent_id,triggered_by=trigger,
+                           paused_manual=paused_manual,target_cursor=0,generation=1,successful_targets=0,failed_targets=0)
                 claimed.append((run_id,job))
             conn.execute("""INSERT INTO worker_heartbeat(singleton_id,started_at,last_seen_at) VALUES(1,?,?)
                 ON CONFLICT(singleton_id) DO UPDATE SET last_seen_at=excluded.last_seen_at""", (now_text,now_text))
@@ -615,9 +644,9 @@ class Repository(ChannelOperations):
         with self.database.connection() as conn:
             run = self._owned(conn,job_id,run_id,owner_token)
             job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            return bool(run and job and self._run_capable(job,run))
+            return bool(run and job and self._run_capable(job,run) and job['search_revision']==run['search_revision'])
 
-    def renew_job_lock(self, job_id, run_id, owner_token=None, lease_minutes=10):
+    def renew_job_lock(self, job_id, run_id, owner_token=None, lease_minutes=10, *, lease_seconds=None):
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             run = self._owned(conn,job_id,run_id,owner_token)
@@ -625,7 +654,7 @@ class Repository(ChannelOperations):
             if not run or not job or not self._run_capable(job,run):
                 return False
             conn.execute("UPDATE jobs SET lock_until=? WHERE id=? AND lock_run_id=? AND lock_owner_token=?",
-                (precise_iso(utc_now()+timedelta(minutes=lease_minutes)),job_id,run_id,owner_token))
+                (precise_iso(utc_now()+timedelta(seconds=lease_seconds if lease_seconds is not None else lease_minutes*60)),job_id,run_id,owner_token))
             return True
 
     def _owned(self, conn, job_id, run_id, owner_token):
@@ -674,6 +703,8 @@ class Repository(ChannelOperations):
             previous = conn.execute("SELECT id FROM check_results WHERE run_id=? AND target_id=?", (run_id, target["id"])).fetchone()
             if previous:
                 return previous["id"]
+            if run['target_cursor'] >= len(snapshot['targets']) or snapshot['targets'][run['target_cursor']]['id'] != target['id']:
+                raise ValueError("Target is not the next uncompleted snapshot target")
             current = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
             active = conn.execute("SELECT active FROM targets WHERE id=? AND job_id=?", (target["id"], job["id"])).fetchone()
             published = (self._run_capable(current, run) and current["search_revision"] == run["search_revision"]
@@ -691,6 +722,13 @@ class Repository(ChannelOperations):
                  iso(result.retry_at) if result.retry_at else None,
                  run["search_revision"], 1, int(published)),
             )
+            completed = {row[0] for row in conn.execute("SELECT target_id FROM check_results WHERE run_id=?", (run_id,))}
+            cursor = run['target_cursor']
+            while cursor < len(snapshot['targets']) and snapshot['targets'][cursor]['id'] in completed:
+                cursor += 1
+            conn.execute("""UPDATE check_runs SET target_cursor=?,
+                successful_targets=successful_targets+?,failed_targets=failed_targets+? WHERE id=?""",
+                (cursor,int(result.status!='error'),int(result.status=='error'),run_id))
             if published and result.status in ("available", "no_availability"):
                 state = conn.execute(
                     "SELECT last_status,last_earliest_slot,episode FROM target_alert_state WHERE target_id=?",
@@ -1281,31 +1319,55 @@ class Repository(ChannelOperations):
             )
             return True
 
+    def yield_run(self, run_id, job_id, *, owner_token=None):
+        """Release a live slice while retaining its logical run and intent."""
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._owned(conn, job_id, run_id, owner_token)
+            if run is None:
+                return False
+            job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not self._run_capable(job,run) or job['search_revision'] != run['search_revision']:
+                self._interrupt_run(conn,run,precise_iso())
+                return False
+            conn.execute("UPDATE check_runs SET outcome='yielded',owner_token=NULL WHERE id=?", (run_id,))
+            conn.execute("UPDATE jobs SET lock_until=NULL,lock_owner_token=NULL WHERE id=? AND lock_run_id=?",
+                         (job_id,run_id))
+            return True
+
+    @staticmethod
+    def _interrupt_run(conn, run, now):
+        conn.execute("UPDATE check_intents SET status='completed' WHERE run_id=? AND status='running'", (run['id'],))
+        conn.execute("""UPDATE check_runs SET outcome='interrupted',finished_at=?,owner_token=NULL,
+            successful_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status!='error'),
+            failed_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status='error')
+            WHERE id=?""", (now,run['id']))
+        conn.execute("""UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL
+            WHERE id=? AND lock_run_id=?""", (run['job_id'],run['id']))
+
+    def _reconcile_runs(self, conn, now):
+        now_text = precise_iso(now)
+        runs = conn.execute("SELECT * FROM check_runs WHERE outcome IN ('running','yielded')").fetchall()
+        for run in runs:
+            job = conn.execute("SELECT * FROM jobs WHERE id=?", (run['job_id'],)).fetchone()
+            if (run['outcome']=='running' and job is not None and run['owner_token']
+                    and job['lock_run_id']==run['id'] and job['lock_owner_token']==run['owner_token']
+                    and job['lock_until'] and parse_time(job['lock_until'])>now):
+                continue
+            capable = (job is not None and run['snapshot_known'] and run['search_snapshot']
+                       and self._run_capable(job,run) and job['search_revision']==run['search_revision']
+                       and job['lock_run_id']==run['id'])
+            if not capable:
+                self._interrupt_run(conn,run,now_text)
+            elif run['outcome']=='running' and (not job['lock_until'] or parse_time(job['lock_until'])<=now
+                                                or job['lock_owner_token']!=run['owner_token']):
+                conn.execute("UPDATE check_runs SET outcome='yielded',owner_token=NULL WHERE id=?", (run['id'],))
+                conn.execute("UPDATE jobs SET lock_until=NULL,lock_owner_token=NULL WHERE id=?", (job['id'],))
+
     def interrupt_stale_runs(self):
         with self.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            now = precise_iso()
-            stale = conn.execute(
-                """SELECT r.id,r.job_id,r.owner_token FROM check_runs r LEFT JOIN jobs j ON j.id=r.job_id
-                WHERE r.outcome='running' AND (j.id IS NULL OR j.lock_until IS NULL
-                OR j.lock_until<=? OR j.lock_run_id IS NOT r.id OR j.lock_owner_token IS NOT r.owner_token
-                OR r.owner_token IS NULL)""", (now,),
-            ).fetchall()
-            for run in stale:
-                conn.execute("UPDATE check_intents SET status='completed' WHERE run_id=? AND status='running'", (run['id'],))
-                conn.execute(
-                    """UPDATE check_runs SET outcome='interrupted',finished_at=?,
-                    successful_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status!='error'),
-                    failed_targets=(SELECT COUNT(*) FROM check_results WHERE run_id=check_runs.id AND status='error')
-                    WHERE id=? AND outcome='running'""",
-                    (now, run["id"]),
-                )
-                conn.execute(
-                    """UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL
-                    WHERE id=? AND lock_run_id=? AND lock_owner_token IS ?""",
-                    (run["job_id"], run["id"], run["owner_token"]),
-                )
-            conn.execute("UPDATE jobs SET lock_until=NULL,lock_run_id=NULL,lock_owner_token=NULL WHERE lock_until<=?", (now,))
+            self._reconcile_runs(conn, utc_now())
 
     def worker_status(self):
         with self.database.connection() as conn:
@@ -1393,7 +1455,8 @@ class Repository(ChannelOperations):
         with self.database.connection() as conn:
             runs = [dict(row) for row in conn.execute(
                 """SELECT id,job_id,job_name,started_at,finished_at,outcome,successful_targets,
-                failed_targets,triggered_by,search_revision,search_snapshot,snapshot_known,intent_id,paused_manual,status_version FROM check_runs WHERE job_id=?
+                failed_targets,triggered_by,search_revision,search_snapshot,snapshot_known,intent_id,paused_manual,status_version,
+                target_cursor FROM check_runs WHERE job_id=?
                 ORDER BY started_at DESC,rowid DESC LIMIT ? OFFSET ?""",
                 (job_id, limit, offset),
             ).fetchall()]
@@ -1438,7 +1501,7 @@ class Repository(ChannelOperations):
             args.extend((limit + 1, 0 if before else offset))
             rows = conn.execute(f"""SELECT r.id,r.job_id,r.job_name,r.requested_at,r.started_at,r.finished_at,
                 r.outcome,r.successful_targets,r.failed_targets,r.triggered_by,r.search_revision,r.search_snapshot,
-                r.snapshot_known,r.intent_id,r.paused_manual,ci.requested_at AS intent_requested_at,
+                r.snapshot_known,r.intent_id,r.paused_manual,r.target_cursor,ci.requested_at AS intent_requested_at,
                 ci.eligible_at,j.search_revision AS current_search_revision,j.status AS job_status,
                 j.time_zone AS time_zone
                 FROM check_runs r LEFT JOIN check_intents ci ON ci.id=r.intent_id
@@ -1498,7 +1561,7 @@ class Repository(ChannelOperations):
                 job_status = job_status_by_run[row["run_id"]]
                 category = row["error_category"]
                 if category not in {"upstream_rejected", "throttled", "upstream_error", "timeout", "connectivity",
-                                    "invalid_metadata", "malformed_response", "incomplete_response", "unknown"}:
+                                    "invalid_metadata", "malformed_response", "incomplete_response", "budget_exceeded", "unknown"}:
                     category = "unknown" if row["status"] == "error" else None
                 code = row["error_code"]
                 if (not isinstance(code, str) or len(code) > 80 or not code.isascii()
@@ -1545,6 +1608,7 @@ class Repository(ChannelOperations):
                     "search_revision": row["search_revision"], "current_search_revision": row["current_search_revision"],
                     "history_state": history_state, "snapshot_known": known,
                     "target_total": len(expected_ids) if known else None, "target_completed": len(results),
+                    "target_cursor": row['target_cursor'],
                     "target_successful": row["successful_targets"], "target_failed": row["failed_targets"],
                     "coverage_complete": bool(known and expected_ids == covered_ids),
                     "paused_manual": bool(row["paused_manual"]), "targets": safe_targets, "results": results,
@@ -1616,18 +1680,41 @@ class Repository(ChannelOperations):
             item['message_content'] = content
             return item
 
-    def reserve_request_turn(self, spacing_seconds):
-        now = utc_now()
+    def reserve_request_turn(self, spacing_seconds, *, deadline=None):
+        import sqlite3
+        from app.doctolib import TargetBudgetExceeded
+
         with self.database.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining < 0.001:
+                    raise TargetBudgetExceeded("The target checking budget was exceeded.")
+                conn.execute(f"PRAGMA busy_timeout={min(10000, int(remaining * 1000))}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if (deadline is not None and deadline - time.monotonic() <= 0.002
+                        and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY):
+                    raise TargetBudgetExceeded("The target checking budget was exceeded.") from None
+                raise
+            now = utc_now()
             row = conn.execute("SELECT next_allowed_at FROM request_gate WHERE singleton_id=1").fetchone()
             scheduled = max(now, parse_time(row[0])) if row else now
+            wait_seconds = max(0.0, (scheduled - utc_now()).total_seconds())
+            if deadline is not None and wait_seconds >= deadline - time.monotonic():
+                # Reject before reservation: existing callers retain their slots,
+                # and cancelled work cannot move the shared gate backwards.
+                raise TargetBudgetExceeded("The target checking budget was exceeded.")
             following = scheduled + timedelta(seconds=spacing_seconds)
             conn.execute(
                 """INSERT INTO request_gate(singleton_id,next_allowed_at) VALUES(1,?)
                 ON CONFLICT(singleton_id) DO UPDATE SET next_allowed_at=excluded.next_allowed_at""",
                 (precise_iso(following),),
             )
-        wait_seconds = max(0.0, (scheduled - utc_now()).total_seconds())
         if wait_seconds:
-            time.sleep(wait_seconds)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TargetBudgetExceeded("The target checking budget was exceeded.")
+            time.sleep(wait_seconds if remaining is None else min(wait_seconds, remaining))
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TargetBudgetExceeded("The target checking budget was exceeded.")
