@@ -1,4 +1,4 @@
-"""Local SQLite backup and disposable verification; no live restore or sends."""
+"""Explicit local retention, safe export, backup and offline verification."""
 
 import argparse
 import asyncio
@@ -17,6 +17,7 @@ import zipfile
 from contextlib import closing
 
 from app.storage.db import Database, SCHEMA_VERSION
+from app.admin_errors import AdminError
 
 
 DATABASE_MEMBER = "checker.sqlite3"
@@ -40,10 +41,6 @@ REQUIRED_COLUMNS = {
     "worker_heartbeat": "singleton_id started_at last_seen_at last_completed_run_at last_error",
     "request_gate": "singleton_id next_allowed_at",
 }
-
-
-class AdminError(Exception):
-    """A safe user-facing failure, without database contents or input paths."""
 
 
 def _readonly(path):
@@ -109,6 +106,9 @@ def _inspect(path):
                     requirements["check_runs"] += " target_cursor generation"
                 if version >= 15:
                     requirements["targets"] += " metadata_validation_state metadata_validation_reason metadata_checked_at"
+                if version >= 16:
+                    requirements["availability_events"] += " sent_destinations"
+                    requirements["retention_plans"] = "id cutoff created_at candidates"
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 for table, fields in requirements.items():
                     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -167,7 +167,45 @@ def _snapshot(source, target, timeout):
     os.chmod(target, 0o600)
 
 
-def backup(source, destination, timeout=30):
+def _notification_configuration(path, key=""):
+    """Inspect encrypted configuration without returning decrypted values."""
+    from app.notification_secrets import NotificationSecrets, SecretUnavailable
+
+    secrets = NotificationSecrets(key)
+    values = []
+    counts = {}
+    with closing(_readonly(path)) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in ("notification_channels", "smtp_transport"):
+            if table not in tables:
+                counts[table] = 0
+                continue
+            columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                       if row[1].endswith("_ciphertext")]
+            counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if columns:
+                for row in conn.execute(f"SELECT {','.join(columns)} FROM {table}"):
+                    values.extend(value for value in row if value is not None)
+    unreadable = 0
+    for value in values:
+        try:
+            secrets.decrypt(value)
+        except SecretUnavailable:
+            unreadable += 1
+    state = ("not_required" if not values else "available" if not unreadable else
+             "missing" if not secrets.available else "unreadable")
+    return {
+        "included": counts,
+        "encrypted_values": len(values),
+        "key_required": bool(values),
+        "external_key_fingerprint": (hashlib.sha256(secrets.key).hexdigest()
+                                     if secrets.available and not unreadable else None),
+        "key_state": state,
+        "action_required": bool(unreadable),
+    }
+
+
+def backup(source, destination, timeout=30, notification_secret_key=""):
     """Publish one complete bundle with an atomic, no-overwrite hard link."""
     source, destination = Path(source), Path(destination)
     if timeout <= 0 or not timeout < float("inf"):
@@ -188,6 +226,13 @@ def backup(source, destination, timeout=30):
             "application_revision": _revision(),
             "revision_scope": "backup_tool_checkout",
             "database_sha256": _digest(snapshot),
+            "application_compatibility": {
+                "supported_schema_min": min(SUPPORTED_SCHEMAS),
+                "supported_schema_max": SCHEMA_VERSION,
+                "restore_policy": "matching_or_forward_migrating_application",
+            },
+            "notification_configuration": _notification_configuration(snapshot, notification_secret_key),
+            "external_key_included": False,
         }
         archive = directory / "backup.zip"
         with archive.open("xb") as stream:
@@ -246,12 +291,13 @@ class _OfflineDoctolib:
         raise AdminError("verification_upstream_disabled")
 
 
-async def _health(path):
+async def _health(path, notification_secret_key=""):
     # Runtime dependencies only: no httpx/TestClient, socket, server or worker.
     from app.api.app import create_app
     from app.settings import Settings
 
-    app = create_app(settings=Settings(database_path=str(path)), doctolib=_OfflineDoctolib())
+    app = create_app(settings=Settings(database_path=str(path),
+                     notification_secret_key=notification_secret_key), doctolib=_OfflineDoctolib())
     repository = app.state.repository
     jobs = repository.list_jobs(limit=1)
     if jobs:
@@ -283,7 +329,7 @@ async def _health(path):
         raise AdminError("restored_health_failed")
 
 
-def verify(archive, work_directory, integrity_only=False):
+def verify(archive, work_directory, integrity_only=False, notification_secret_key=""):
     """Verify an archive in a new private directory; migrate only a second copy."""
     archive, directory = Path(archive), Path(work_directory)
     if not archive.is_file():
@@ -304,8 +350,10 @@ def verify(archive, work_directory, integrity_only=False):
             shutil.copyfile(directory / DATABASE_MEMBER, restored)
             os.chmod(restored, 0o600)
             Database(str(restored)).initialize()
-            asyncio.run(_health(restored))
+            asyncio.run(_health(restored, notification_secret_key))
             report.update(status="verified", restored_schema_version=_inspect(restored), health="ok")
+            report["notification_configuration"] = _notification_configuration(restored, notification_secret_key)
+            report["live_claims"] = "preserved_until_expiry; never_resumed_by_verification"
         return report
     except BaseException:
         # Only this invocation's newly created disposable directory is removed.
@@ -324,12 +372,42 @@ def main(argv=None):
     check.add_argument("--archive", required=True)
     check.add_argument("--work-directory", required=True)
     check.add_argument("--integrity-only", action="store_true", help="skip migration and API health")
+    preview = commands.add_parser("retention-preview", help="preview terminal history eligibility; no history deletion")
+    preview.add_argument("--source", required=True)
+    preview.add_argument("--cutoff", help="timezone-aware ISO cutoff; default 90 days ago")
+    preview.add_argument("--cleanup-expired-keys", action="store_true", help="also prune terminal keys after their 7-day guarantee")
+    apply = commands.add_parser("retention-apply", help="apply an explicit preview; recheck every bounded transaction")
+    apply.add_argument("--source", required=True)
+    apply.add_argument("--cutoff", required=True)
+    apply.add_argument("--plan-id", required=True)
+    apply.add_argument("--batch-size", type=int, default=100)
+    export = commands.add_parser("export-history", help="write redacted history; not a restorable backup")
+    export.add_argument("--source", required=True)
+    export.add_argument("--destination", required=True)
+    export.add_argument("--job-id", action="append", help="export only requested job IDs; repeat up to 100")
+    export.add_argument("--include-private-urls", action="store_true", help="include booking URLs; destination directory must be private")
     args = parser.parse_args(argv)
     try:
         if args.command == "backup":
-            result = backup(args.source, args.destination, args.timeout)
+            result = backup(args.source, args.destination, args.timeout,
+                            notification_secret_key=os.getenv("NOTIFICATION_SECRET_KEY", ""))
+        elif args.command == "verify":
+            result = verify(args.archive, args.work_directory, args.integrity_only,
+                            notification_secret_key=os.getenv("NOTIFICATION_SECRET_KEY", ""))
+        elif args.command == "export-history":
+            from app.history_export import export_history
+            result = export_history(args.source, args.destination, job_ids=args.job_id,
+                                    include_private_urls=args.include_private_urls)
         else:
-            result = verify(args.archive, args.work_directory, args.integrity_only)
+            from app.retention import preview_retention, apply_retention
+            if _inspect(Path(args.source)) != SCHEMA_VERSION:
+                raise AdminError("retention_requires_current_schema")
+            database = Database(args.source)
+            if args.command == "retention-preview":
+                result = preview_retention(database, cutoff=args.cutoff, cleanup_keys=args.cleanup_expired_keys)
+            else:
+                result = apply_retention(database, cutoff=args.cutoff, plan_id=args.plan_id,
+                                         batch_size=args.batch_size)
         print(json.dumps(result, sort_keys=True))
         return 0
     except AdminError as exc:

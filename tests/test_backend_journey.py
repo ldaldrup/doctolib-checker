@@ -712,6 +712,7 @@ def test_database_v1_upgrade_interrupts_unprovable_running_lease(tmp_path):
     with repository.database.connection() as conn:
         drop_revision_columns(conn)
         conn.execute("DROP TABLE target_alert_state")
+        conn.execute("DROP INDEX IF EXISTS idx_retention_jobs_lock_run_id")
         conn.execute("ALTER TABLE jobs DROP COLUMN lock_run_id")
         conn.execute("UPDATE schema_version SET version=1")
     repository.database.initialize()
@@ -1124,6 +1125,7 @@ def drop_mutation_columns(conn):
 
 def drop_intent_columns(conn):
     drop_mutation_columns(conn)
+    conn.execute("DROP INDEX IF EXISTS idx_retention_check_runs_intent_id")
     conn.execute("DROP TABLE IF EXISTS check_intents")
     for table, columns in {
         "jobs": ("status_version", "last_extra_started_at"),
@@ -1137,6 +1139,7 @@ def drop_delivery_columns(conn, *, alerts=True):
     drop_intent_columns(conn)
     conn.execute("DROP TABLE IF EXISTS dispatcher_heartbeat")
     if alerts:
+        conn.execute("DROP INDEX IF EXISTS idx_retention_alerts_claim_result_id")
         for column in ("delivery_state", "claim_owner_token", "claim_until", "claim_result_id", "claim_search_revision", "attempt_started_at", "last_attempt_at", "last_attempt_outcome", "delivery_epoch_at", "delivery_epoch_attempts"):
             conn.execute(f"ALTER TABLE alerts DROP COLUMN {column}")
 

@@ -41,6 +41,8 @@ Dry run suppresses alerts but still contacts Doctolib. Keep `config.json` privat
 
 ## Security and backup
 
+See [retention, history export and recovery](OPERATIONS.md) for operator commands and key custody.
+
 The web app has no authentication and binds to localhost; put it behind an authenticated reverse proxy before exposing it. `.env.example` sets `API_HOST=0.0.0.0` for containers. Back up the database and notification key separately:
 
 ```bash

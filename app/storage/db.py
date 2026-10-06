@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 class Database:
@@ -220,6 +220,12 @@ class Database:
                     cancel_reason TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_intents_pending_job ON check_intents(job_id) WHERE status='queued';
+                CREATE TABLE IF NOT EXISTS retention_plans (
+                    id TEXT PRIMARY KEY,
+                    cutoff TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    candidates TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS request_gate (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     next_allowed_at TEXT NOT NULL
@@ -348,12 +354,15 @@ class Database:
                     current_version = 14
                 if current_version == 14:
                     current_version = 15
+                if current_version == 15:
+                    current_version = 16
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
             metadata_migration = 'metadata_validation_state' not in {
                 row[1] for row in conn.execute('PRAGMA table_info(targets)')}
             # Additive content contracts preserve existing events and queued work.
             for table, columns in {
+                'availability_events': ("sent_destinations TEXT NOT NULL DEFAULT '[]'",),
                 'targets': ("metadata_validation_state TEXT NOT NULL DEFAULT 'unknown'", 'metadata_validation_reason TEXT', 'metadata_checked_at TEXT'),
                 'settings': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1'),
                 'jobs': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1',
@@ -408,6 +417,11 @@ class Database:
             conn.execute("""INSERT OR IGNORE INTO smtp_transport(singleton_id,enabled,port,tls_mode,edit_version,
                 destination_version,credential_version,created_at,updated_at)
                 VALUES(1,0,587,'starttls',1,1,1,?,?)""", (now,now))
+            # Retention checks reference closure without scanning entire history per batch.
+            for table, column in (('check_results','run_id'), ('alerts','result_id'),
+                                  ('alerts','claim_result_id'), ('availability_events','result_id'),
+                                  ('check_intents','run_id'), ('check_runs','intent_id'), ('jobs','lock_run_id')):
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_retention_{table}_{column} ON {table}({column})")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_event_destination ON alerts(event_id,channel_config_id,destination_version)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_results_known_run_target ON check_results(run_id,target_id) WHERE snapshot_known=1")
             if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:

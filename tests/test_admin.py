@@ -44,6 +44,8 @@ def test_backup_restore_preserves_data_and_uses_offline_health(tmp_path, monkeyp
     assert admin.verify(archive, work) == {
         "status": "verified", "backup_schema_version": SCHEMA_VERSION, "restored_schema_version": SCHEMA_VERSION,
         "integrity": "ok", "foreign_keys": "ok", "health": "ok",
+        "notification_configuration": admin._notification_configuration(source),
+        "live_claims": "preserved_until_expiry; never_resumed_by_verification",
     }
     assert rows(work / "restored.sqlite3") == expected
     assert rows(source) == expected
@@ -174,6 +176,7 @@ def test_legacy_archive_stays_immutable_while_copy_migrates(tmp_path, version):
         if version < 3:
             conn.execute("DROP TABLE target_alert_state")
         if version == 1:
+            conn.execute("DROP INDEX IF EXISTS idx_retention_jobs_lock_run_id")
             conn.execute("ALTER TABLE jobs DROP COLUMN lock_run_id")
         conn.execute("UPDATE schema_version SET version=?", (version,))
     archive = tmp_path / "legacy.zip"
@@ -247,6 +250,7 @@ def test_incomplete_checker_cannot_be_blessed_by_initialization(tmp_path, missin
         Database(str(source)).initialize()
         with sqlite3.connect(source) as conn:
             if missing == "column":
+                conn.execute("DROP INDEX IF EXISTS idx_retention_jobs_lock_run_id")
                 conn.execute("ALTER TABLE jobs DROP COLUMN lock_run_id")
             else:
                 conn.execute(f"DROP TABLE {missing}")
