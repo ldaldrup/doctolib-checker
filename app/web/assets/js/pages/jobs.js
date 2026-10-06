@@ -154,6 +154,25 @@ export function jobStatus(job, state, now = Date.now()) {
   return {label: "Monitoring", tone: "running", detail: checkedAgo(view?.checkedAt, now) || labels[view?.state || "unknown"]};
 }
 
+export function metadataIdentity(target) {
+  return `${[target.practice_name, target.practitioner_name, target.motive_name].filter(Boolean).join(" · ") || "Identity unavailable"}. Practice: ${target.practice_id || "unknown"}; practitioner: ${target.practitioner_id || "any"}; motive: ${target.motive_id || "unknown"}; agendas: ${target.agenda_ids || "unknown"}.`;
+}
+
+export function metadataValidation(target, zone) {
+  const states = {validated: "Metadata validated", unavailable: "Validation unavailable; saved metadata retained", invalid: "Metadata could not be resolved; saved metadata retained", unknown: "Metadata validation unknown"};
+  const result = states[target.metadata_validation_state] || states.unknown;
+  const checked = target.last_validated_at ? formatSlot(target.last_validated_at, zone) : "unknown";
+  return `${result}. Last successful metadata validation: ${checked}. ${target.metadata_validation_reason ? `Reason: ${target.metadata_validation_reason.replaceAll("_", " ")}. ` : ""}This is separate from an availability check.`;
+}
+
+function targetDetails(job, state) {
+  const list = targets(job);
+  return `<details class="target-details" data-target-details="${h(job.id)}" ${state.targetDetailsOpen?.has(job.id) ? "open" : ""}><summary>Target metadata and repair</summary><p>Repair resolves metadata for the saved booking URL. Use Edit to change the URL. Repair does not reserve an appointment.</p>${list.map(target => {
+    const feedback = state.targetRepairs?.get(target.id);
+    return `<section class="target-repair" aria-label="Metadata for ${h(target.practice_name || "saved target")}" aria-busy="${feedback?.pending || false}"><strong>${h(target.practice_name || "Practice unavailable")}</strong><p>${h(metadataIdentity(target))}</p><p class="target-validation">${h(metadataValidation(target, job.time_zone))}</p><button id="repair-${h(target.id)}" class="button button-secondary button-small" type="button" data-action="repair-target" data-target-id="${h(target.id)}" ${state.pendingJobs?.has(job.id) || feedback?.unresolved ? "disabled" : ""}>${feedback?.pending ? "Repairing metadata…" : "Revalidate and repair"}</button>${feedback ? `<div class="target-repair-result ${feedback.warning ? "notice notice-warning" : ""}" role="status"><p>${h(feedback.message)}</p>${feedback.before ? `<p>Before: ${h(metadataIdentity(feedback.before))}</p>` : ""}${feedback.after ? `<p>After: ${h(metadataIdentity(feedback.after))}</p>` : ""}${feedback.unresolved ? `<button class="text-button" type="button" data-action="repair-status" data-target-id="${h(target.id)}">Fetch saved metadata</button>` : ""}</div>` : ""}</section>`;
+  }).join("")}</details>`;
+}
+
 function card(job, state) {
   const view = viewFor(state, job);
   const list = targets(job);
@@ -177,6 +196,7 @@ function card(job, state) {
       ${(job.notification_channels || []).length ? `<ul class="channel-deliveries" aria-label="Notification destination status">${job.notification_channels.map(channel => `<li>${h(channel.name)}: ${h(deliveryLabel(channel, job))}${channel.error_code ? ` (${h(channel.error_code)})` : ""}</li>`).join("")}</ul>` : ""}
       ${job.quiet_hours_enabled ? `<p class="job-quiet-hours">Quiet hours: ${h(job.quiet_hours_start)}–${h(job.quiet_hours_end)} (${h(job.time_zone)}). Monitoring continues.</p>` : ""}
       <div class="job-meta"><span>Range: <strong>${range}</strong></span><span class="meta-dot">•</span><span>Interval: <strong>${h(compactDuration(job.interval_seconds))}</strong> <span title="${h(nextCheckTitle(job))}">(next: ${h(nextCheck(job, state))})</span></span><span class="meta-dot">•</span><span>Content: <strong>${job.message_content == null ? "Inherited" : "Override"} · ${h(job.effective_message_content?.preset || job.message_content?.preset || state.settings?.message_content?.preset || "standard")}</strong></span><span class="meta-dot">•</span><span>Alert: <strong>${job.telegram_enabled ? h((job.notification_channels || []).map(channel => channel.name).join(", ") || "No selected channel") : "Off"}</strong></span></div>
+      ${targetDetails(job, state)}
       <div class="job-actions"><a class="button button-quiet" href="#activity?job=${encodeURIComponent(job.id)}" aria-label="Activity for ${h(job.name)}">${icon("list")}<span class="action-label">Activity</span></a>${[["check-now", "bolt", job.status === "paused" ? "Check once" : "Check now"], ...(job.status === "paused" && ["queued", "running"].includes(job.check_intent?.status) ? [["pause", "pause", "Stop check"]] : []), [job.status === "paused" ? "resume" : "pause", job.status === "paused" ? "play" : "pause", job.status === "paused" ? "Resume" : "Pause"], ["edit", "edit", "Edit"], ["delete", "trash", "Delete"]].map(([action, symbol, label]) => `<button class="button button-quiet" type="button" data-action="${action}" aria-label="${label} ${h(job.name)}" ${pending || (action === "edit" && state.uncertainCreate) || (action === "check-now" && queuedCheck && !canPromoteQuietCheck) ? "disabled" : ""}>${icon(symbol)}<span class="action-label">${label}</span></button>`).join("")}</div>
     </div></article>`;
 }

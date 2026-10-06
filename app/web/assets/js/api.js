@@ -110,6 +110,7 @@ export const api = {
     return request(`/activity?${query}`);
   },
   validateTarget: (booking_url, options = {}) => request("/targets/validate", {signal: options.signal, method: "POST", body: {booking_url}, timeout: 120_000}),
+  repairTarget: (id, targetId, booking_url, expected_version) => request(`/jobs/${identifier(id)}/targets/${identifier(targetId)}/revalidate`, {method: "POST", body: {booking_url, expected_version}, timeout: 125_000}),
   createJob: (values, options = {}) => {
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(options.idempotencyKey || "")) throw new ApiError("A saved creation request key is required.", {kind: "validation"});
     return request("/jobs", {signal: options.signal, method: "POST", body: pick(values, JOB_FIELDS), headers: {"Idempotency-Key": options.idempotencyKey}, timeout: 120_000});

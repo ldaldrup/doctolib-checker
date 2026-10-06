@@ -107,6 +107,8 @@ def _inspect(path):
                 if version >= 14:
                     requirements["jobs"] += " last_served_at"
                     requirements["check_runs"] += " target_cursor generation"
+                if version >= 15:
+                    requirements["targets"] += " metadata_validation_state metadata_validation_reason metadata_checked_at"
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 for table, fields in requirements.items():
                     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}

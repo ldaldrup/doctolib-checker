@@ -375,6 +375,7 @@ class Repository(ChannelOperations):
                      target["agenda_ids_str"], target["practice_name"], target["practitioner_name"],
                      target.get("motive_name"), "ready", now),
                 )
+            conn.execute("UPDATE targets SET metadata_validation_state='validated',metadata_checked_at=last_validated_at WHERE job_id=?", (job_id,))
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if operation is not None:
                 # Recheck the deadline after inserts, while the same transaction
@@ -415,7 +416,7 @@ class Repository(ChannelOperations):
                 result.append(job)
             return result
 
-    def update_job(self, job_id, values, targets=None, expected_version=None):
+    def update_job(self, job_id, values, targets=None, expected_version=None, target_repair=None):
         if values.get("interval_seconds", self.minimum_poll_interval_seconds) < self.minimum_poll_interval_seconds:
             raise ValueError("interval_seconds is below the server minimum")
         with self.database.connection() as conn:
@@ -427,6 +428,21 @@ class Repository(ChannelOperations):
                 raise VersionConflictError(row["edit_version"])
             previous_targets = [dict(target) for target in conn.execute("SELECT * FROM targets WHERE job_id=? AND active=1", (job_id,))]
             previous_search = search_signature(dict(row), previous_targets)
+            if target_repair is not None:
+                target_id, booking_url, candidate, validation_state, reason = target_repair
+                saved = next((target for target in previous_targets if target['id'] == target_id), None)
+                if saved is None or saved['booking_url'] != booking_url:
+                    raise ConflictError("target_conflict")
+                checked_at = precise_iso()
+                conn.execute("""UPDATE targets SET metadata_validation_state=?,metadata_validation_reason=?,
+                    metadata_checked_at=? WHERE id=?""", (validation_state, reason, checked_at, target_id))
+                if candidate is not None:
+                    fields = [key for key in TARGET_FIELDS if key != 'booking_url']
+                    conn.execute("UPDATE targets SET " + ','.join(key + '=?' for key in fields) +
+                        ",validation_state='ready',last_validated_at=? WHERE id=?",
+                        [candidate['agenda_ids_str'] if key == 'agenda_ids' else candidate.get(key) for key in fields] +
+                        [checked_at, target_id])
+
             previous_channels = [r[0] for r in conn.execute("SELECT channel_config_id FROM job_channels WHERE job_id=? ORDER BY channel_config_id", (job_id,))]
             if "notification_channel_ids" in values:
                 self._set_job_channels(conn, job_id, values["notification_channel_ids"])
@@ -466,10 +482,10 @@ class Repository(ChannelOperations):
                         conn.execute(
                             """UPDATE targets SET country=?,profile_slug=?,practice_id=?,motive_id=?,
                             practitioner_id=?,agenda_ids=?,practice_name=?,practitioner_name=?,motive_name=?,
-                            active=1,validation_state='ready',last_validated_at=? WHERE id=?""",
+                            active=1,validation_state='ready',metadata_validation_state='validated',metadata_validation_reason=NULL,metadata_checked_at=?,last_validated_at=? WHERE id=?""",
                             (target["country"], target["profile_slug"], target["practice_id"], target["motive_id"],
                              target.get("practitioner_id"), target["agenda_ids_str"], target["practice_name"],
-                             target["practitioner_name"], target.get("motive_name"), iso(), saved["id"]),
+                             target["practitioner_name"], target.get("motive_name"), precise_iso(), precise_iso(), saved["id"]),
                         )
                     else:
                         conn.execute(
@@ -482,6 +498,7 @@ class Repository(ChannelOperations):
                              target["agenda_ids_str"], target["practice_name"], target["practitioner_name"],
                              target.get("motive_name"), "ready", iso()),
                         )
+                conn.execute("UPDATE targets SET metadata_validation_state='validated',metadata_checked_at=last_validated_at WHERE job_id=? AND metadata_checked_at IS NULL", (job_id,))
                 conn.execute(
                     """UPDATE alerts SET status='cancelled',next_attempt_at=NULL,error_summary='target_removed'
                     WHERE job_id=? AND status IN ('pending','failed') AND target_id IN

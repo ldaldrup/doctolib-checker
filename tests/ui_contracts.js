@@ -933,5 +933,60 @@ await test('content previews render draft without sending and job override persi
     equal((await api.getJob(saved.id)).message_content,null);
   }finally{frame.remove();if(saved)await remove(saved.id);const latest=await api.getSettings();await api.updateSettings({default_interval_seconds:original.default_interval_seconds,request_spacing_seconds:original.request_spacing_seconds,message_content:original.message_content},{expectedVersion:latest.edit_version});}
 });
+await test('saved target repair updates identity, stays paused, reconciles conflict and lost response without retry', async () => {
+  const fixtureUrl = 'https://www.doctolib.de/praxis/berlin/beispiel/booking/availabilities?placeId=practice-123&motiveIds%5B%5D=789&practitionerId=456';
+  const saved = await create({...draft, name: 'Metadata repair journey', target_urls: [fixtureUrl], telegram_enabled: false});
+  await setStatus(saved.id, 'pause');
+  const frame = document.createElement('iframe'); frame.src = '/#jobs'; document.body.append(frame);
+  const wait = async predicate => {
+    const end = Date.now() + 8000;
+    while (!predicate()) { if (Date.now() > end) throw new Error('Repair UI journey timed out'); await new Promise(resolve => setTimeout(resolve, 50)); }
+  };
+  const provider = async query => assert((await nativeFetch(`/__test/metadata?${query}`, {method: 'POST'})).ok);
+  try {
+    await wait(() => frame.contentDocument?.querySelector(`[data-job-id="${saved.id}"] .target-details`));
+    const doc = frame.contentDocument, win = frame.contentWindow;
+    const card = () => doc.querySelector(`[data-job-id="${saved.id}"]`);
+    card().querySelector('summary').click();
+    card().querySelector('[data-action="edit"]').click();
+    await wait(() => doc.querySelector('#job-name')?.value === saved.name);
+    const name = doc.querySelector('#job-name'); name.value = 'Unsaved repair draft'; name.dispatchEvent(new win.Event('input', {bubbles: true}));
+    const fetch = win.fetch.bind(win); let calls = 0, mode = 'normal';
+    win.fetch = async (url, options) => {
+      if (String(url).endsWith('/revalidate')) {
+        calls++;
+        if (mode === 'conflict') { await api.updateJob(saved.id, {name: 'Concurrent saved edit'}, {expectedVersion: (await api.getJob(saved.id)).edit_version}); }
+        const response = await fetch(url, options);
+        if (mode === 'lost') throw new TypeError('Synthetic lost response');
+        return response;
+      }
+      return fetch(url, options);
+    };
+    await provider('agenda_id=5678');
+    card().querySelector('[data-action="repair-target"]').click();
+    await wait(() => card().textContent.includes('Metadata repaired.') && !card().querySelector('[data-action="repair-target"]').disabled);
+    const repaired = await api.getJob(saved.id);
+    equal(repaired.targets[0].id, saved.targets[0].id); equal(repaired.search_revision, saved.search_revision + 1);
+    equal(repaired.status, 'paused'); equal(repaired.targets[0].agenda_ids, '5678'); equal(calls, 1);
+    assert(card().textContent.includes('Job remains paused') && card().textContent.includes('Before:') && card().textContent.includes('After:'));
+    assert(card().querySelector('details').open, 'Repair closed target details');
+    equal(doc.querySelector('#job-name'), name); equal(name.value, 'Unsaved repair draft');
+    mode = 'conflict'; card().querySelector('[data-action="repair-target"]').click();
+    await wait(() => card().textContent.includes('Repair conflicted with a saved edit') && !card().querySelector('[data-action="repair-target"]').disabled);
+    equal(calls, 2); equal((await api.getJob(saved.id)).search_revision, repaired.search_revision);
+    mode = 'lost'; card().querySelector('[data-action="repair-target"]').click();
+    await wait(() => card().textContent.includes('Request outcome unknown') && !card().querySelector('[data-action="repair-target"]').disabled);
+    equal(calls, 3); equal((await api.getJob(saved.id)).search_revision, repaired.search_revision);
+    assert(card().textContent.includes('Showing current saved metadata'));
+    const beforeFailure = await api.getJob(saved.id);
+    mode = 'normal'; await provider('failure=true'); card().querySelector('[data-action="repair-target"]').click();
+    await wait(() => card().textContent.includes('Validation failed.') && !card().querySelector('[data-action="repair-target"]').disabled);
+    const failed = await api.getJob(saved.id);
+    equal(failed.targets[0].agenda_ids, '5678'); equal(failed.targets[0].metadata_validation_state, 'unavailable');
+    equal(failed.targets[0].last_validated_at, beforeFailure.targets[0].last_validated_at);
+    assert(card().textContent.includes('separate from an availability check'));
+    equal(calls, 4);
+  } finally { frame.remove(); await provider('agenda_id=1234'); await remove(saved.id); }
+});
 document.querySelector('#results').textContent = lines.join('\n');
 document.documentElement.dataset.contracts = lines.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';

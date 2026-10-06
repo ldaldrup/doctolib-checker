@@ -271,12 +271,29 @@ class DoctolibClient:
         except (TypeError, ValueError):
             raise MetadataResolutionError("Doctolib returned invalid booking metadata") from None
         data = payload.get("data") if isinstance(payload, dict) else None
-        if (not isinstance(data, dict) or
-                not isinstance(data.get("profile", {}), dict) or
-                not isinstance(data.get("practitioners", []), list) or
-                not isinstance(data.get("agendas", []), list)):
+        if not isinstance(data, dict) or not isinstance(data.get("profile", {}), dict):
             raise MetadataResolutionError("Doctolib returned invalid booking metadata")
+        # Provider metadata is untrusted. Reject malformed identity/name fields
+        # before matching or formatting; never stringify containers into IDs.
+        for collection, id_fields, name_fields in (
+                ('practitioners', ('id',), ('name', 'full_name', 'display_name', 'first_name', 'last_name')),
+                ('agendas', ('id', 'practice_id', 'practitioner_id'), ()),
+                ('visit_motives', ('id',), ('name', 'label', 'visit_motive_name')),
+                ('motives', ('id',), ('name', 'label', 'visit_motive_name'))):
+            items = data.get(collection, [])
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise MetadataResolutionError("Doctolib returned invalid booking metadata")
+            for item in items:
+                if (any(item.get(key) is not None and type(item[key]) not in (str, int) for key in id_fields)
+                        or any(item.get(key) is not None and not isinstance(item[key], str) for key in name_fields)):
+                    raise MetadataResolutionError("Doctolib returned invalid booking metadata")
+                if collection == 'agendas':
+                    motives = item.get('visit_motive_ids', [])
+                    if not isinstance(motives, list) or any(type(value) not in (str, int) for value in motives):
+                        raise MetadataResolutionError("Doctolib returned invalid booking metadata")
         profile = data.get("profile", {})
+        if any(profile.get(key) is not None and not isinstance(profile[key], str) for key in ('name_with_title', 'name')):
+            raise MetadataResolutionError("Doctolib returned invalid booking metadata")
         practice_name = profile.get("name_with_title") or profile.get("name") or parts["profile_slug"]
         practitioners = data.get("practitioners", [])
         practitioner_id = parts["practitioner_id"]

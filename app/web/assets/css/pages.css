@@ -237,3 +237,12 @@
   .activity-delivery { grid-template-columns: minmax(0, 1fr); }
   .activity-delivery > span:not(.badge), .activity-delivery small { grid-column: 1; }
 }
+
+.target-details { margin-top: 12px; color: var(--color-body); font-size: 12px; }
+.target-details summary { min-height: 44px; display: list-item; align-content: center; cursor: pointer; color: var(--color-primary-deep); font-weight: 600; }
+.target-details > p { color: var(--color-muted); margin: 0 0 12px; }
+.target-repair { padding: 12px; margin-bottom: 8px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-ground); overflow-wrap: anywhere; }
+.target-repair p { margin: 6px 0; }
+.target-validation { color: var(--color-muted); }
+.target-repair .button, .target-repair .text-button { min-height: 44px; }
+.target-repair-result { margin-top: 8px; display: block; }

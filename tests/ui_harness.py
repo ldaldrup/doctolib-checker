@@ -45,9 +45,19 @@ class FixtureResponse:
 
 
 class FixtureSession:
+    agenda_id = 1234
+    metadata_failure = False
+
     def get(self, url, **kwargs):
         fixture = "info_de.json" if url.endswith("info.json") else "availability_window.json"
-        return FixtureResponse(json.loads((FIXTURES / fixture).read_text()))
+        if fixture == "info_de.json" and self.metadata_failure:
+            response = FixtureResponse({})
+            response.status_code = 403
+            return response
+        payload = json.loads((FIXTURES / fixture).read_text())
+        if fixture == "info_de.json":
+            payload["data"]["agendas"][0]["id"] = self.agenda_id
+        return FixtureResponse(payload)
 
 
 class FixtureDoctolib(DoctolibClient):
@@ -106,6 +116,12 @@ def create_harness(directory):
 <script>const frame=document.querySelector('iframe');
 document.querySelector('#width').onchange=e=>frame.width=e.target.value;
 document.querySelector('#page').onchange=e=>frame.src='/#'+e.target.value;</script></html>''')
+
+    @app.post("/__test/metadata", include_in_schema=False)
+    def metadata(agenda_id: int = 1234, failure: bool = False):
+        doctolib.metadata_session.agenda_id = agenda_id
+        doctolib.metadata_session.metadata_failure = failure
+        return {"configured": True}
 
     @app.post("/__test/reset-worker", include_in_schema=False)
     def reset_worker():

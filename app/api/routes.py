@@ -9,14 +9,14 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Query, Request, Response, Header, Body, status
 from requests import RequestException
 
-from app.api.schemas import JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest, NotificationPreviewRequest, ChannelTestRequest, QuietHoursPreviewRequest
+from app.api.schemas import TargetRevalidationRequest, JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest, NotificationPreviewRequest, ChannelTestRequest, QuietHoursPreviewRequest
 from app.notification_secrets import SecretUnavailable
 from app.services.channel_tests import notification_preview
 from app.services.email_delivery import mailbox, smtp_transport_usable, validate_smtp_host
 from app.storage.channel_operations import SmtpImpactChangedError, channel_secret_columns
 from app.webhooks import validate_endpoint
 from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
-from app.services.jobs import create_job, resolve_target, update_job
+from app.services.jobs import create_job, resolve_target, update_job, revalidate_target
 from app.services.jobs import validate_timezone
 from app.quiet_hours import next_release, validate_quiet_hours
 from app.storage.repositories import ConflictError, NotFoundError, VersionConflictError, CreateReservationLostError, iso, utc_now
@@ -221,6 +221,22 @@ def create_router():
         if job is None:
             raise HTTPException(status_code=404, detail="job_not_found")
         return job_public(request,job)
+
+    @router.post("/api/v1/jobs/{job_id}/targets/{target_id}/revalidate")
+    def repair_target(job_id: str, target_id: str, body: TargetRevalidationRequest, request: Request):
+        try:
+            outcome = revalidate_target(request.app.state.repository, request.app.state.doctolib,
+                request.app.state.settings, job_id, target_id, body.booking_url, body.expected_version)
+        except VersionConflictError as exc:
+            raise version_conflict(exc)
+        except NotFoundError:
+            raise HTTPException(status_code=404, detail="job_not_found")
+        except ConflictError:
+            raise HTTPException(status_code=409, detail={"code": "target_conflict"})
+        except BookingUrlError:
+            raise HTTPException(status_code=422, detail={"code": "invalid_target"})
+        outcome['job'] = job_public(request, outcome['job'])
+        return outcome
 
     @router.post("/api/v1/jobs/{job_id}/pause")
     def pause_job(job_id: str, body: VersionedRequest, request: Request):

@@ -1,10 +1,14 @@
 """Validation and orchestration for job API operations."""
 
 from copy import copy
+import time
+
+import requests
+from curl_cffi import requests as curl_requests
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.doctolib import BookingUrlError, DoctolibClient, MetadataResolutionError, parse_booking_url
-from app.storage.repositories import VersionConflictError
+from app.doctolib import BookingUrlError, DoctolibClient, MetadataResolutionError, TargetBudgetExceeded, get_availability_session, parse_booking_url
+from app.storage.repositories import ConflictError, NotFoundError, TARGET_FIELDS, VersionConflictError
 from app.services.create_lease import MetadataLease
 
 
@@ -113,3 +117,75 @@ def update_job(repository, doctolib, settings, job_id, values, expected_version=
 
 def _date_text(value):
     return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def revalidate_target(repository, doctolib, settings, job_id, target_id, booking_url, expected_version):
+    """Resolve without a write lock, then apply through the existing edit CAS."""
+    existing = repository.get_job(job_id)
+    if existing is None:
+        raise NotFoundError("Job not found")
+    if existing['edit_version'] != expected_version:
+        raise VersionConflictError(existing['edit_version'])
+    canonical = parse_booking_url(booking_url)['url']
+    before = next((target for target in existing['targets'] if target['id'] == target_id), None)
+    if before is None or before['booking_url'] != canonical:
+        raise ConflictError("target_conflict")
+    guarded = copy(doctolib)
+    guarded.deadline = time.monotonic() + settings.target_budget_seconds
+    # requests' read timeout is an inactivity timeout. The installed curl
+    # adapter enforces a total transfer timeout, including trickling metadata.
+    if isinstance(getattr(guarded, 'metadata_session', None), requests.Session):
+        guarded.metadata_session = get_availability_session(settings.doctolib_profile)
+
+    def guard():
+        if time.monotonic() >= guarded.deadline:
+            raise TargetBudgetExceeded()
+        current = repository.get_job(job_id)
+        if current is None:
+            raise NotFoundError("Job not found")
+        if current['edit_version'] != expected_version:
+            raise VersionConflictError(current['edit_version'])
+        target = next((item for item in current['targets'] if item['id'] == target_id), None)
+        if target is None or target['booking_url'] != canonical:
+            raise ConflictError("target_conflict")
+
+    def before_request():
+        guard()
+        values = repository.settings(settings.minimum_poll_interval_seconds, settings.request_spacing_seconds)
+        repository.reserve_request_turn(float(values['request_spacing_seconds']), deadline=guarded.deadline)
+        guard()
+
+    guarded.before_request = before_request
+    guarded.check_permission = guard
+    candidate, state, reason = None, 'validated', None
+    try:
+        candidate = resolve_target(canonical, guarded)
+        guard()
+        if any(not isinstance(candidate.get(key), str) or not candidate[key].strip()
+               for key in ('country', 'profile_slug', 'practice_id', 'motive_id', 'agenda_ids_str',
+                           'practice_name', 'practitioner_name', 'motive_name')):
+            raise MetadataResolutionError('Incomplete booking metadata')
+        parts = parse_booking_url(canonical)
+        if any(candidate[key] != str(parts[key]) for key in ('country', 'profile_slug', 'practice_id', 'motive_id')):
+            raise MetadataResolutionError('Inconsistent booking metadata')
+        if (parts['practitioner_id'] not in (None, 'NO_PREFERENCE')
+                and candidate.get('practitioner_id') != parts['practitioner_id']):
+            raise MetadataResolutionError('Inconsistent practitioner metadata')
+    except TargetBudgetExceeded:
+        candidate, state, reason = None, 'unavailable', 'budget_exceeded'
+    except (requests.RequestException, curl_requests.exceptions.RequestException):
+        candidate, state, reason = None, 'unavailable', 'upstream_unavailable'
+    except BookingUrlError:
+        # The submitted canonical URL was validated before outbound work.
+        # A redirect failure says nothing definitive about that saved URL.
+        candidate, state, reason = None, 'unavailable', 'upstream_unavailable'
+    except MetadataResolutionError:
+        candidate, state, reason = None, 'invalid', 'invalid_metadata'
+    job = repository.update_job(job_id, {}, expected_version=expected_version,
+        target_repair=(target_id, canonical, candidate, state, reason))
+    after = next(target for target in job['targets'] if target['id'] == target_id)
+    changed = job['search_revision'] != existing['search_revision']
+    identity = lambda target: {key: target.get(key) for key in TARGET_FIELDS if key != 'booking_url'}
+    return {'job': job, 'changed': changed, 'validation_state': state, 'validation_reason': reason,
+            'before': identity(before), 'after': identity(after),
+            'fresh_check_queued': changed and job['status'] == 'active'}

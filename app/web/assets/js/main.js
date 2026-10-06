@@ -15,7 +15,7 @@ const state = {
   views: new Map(), histories: new Map(), targetMetadata: new Map(),
   activity: {jobId: null, runId: null, items: [], nextOffset: 0, nextBeforeRunId: null, hasMore: false, phase: "loading", error: null},
   formDraft: null, editingId: null, original: null, pendingJobs: new Set(),
-  checkSubmitting: new Set(), checkErrors: new Map(),
+  checkSubmitting: new Set(), checkErrors: new Map(), targetRepairs: new Map(), targetDetailsOpen: new Set(),
   jobSubmitting: false, settingsSubmitting: false, jobError: null, settingsError: null,
   settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false, settingsConflict: null, jobConflict: null, jobConflictBlocked: false, createAttempt: null,
   query: "", filter: "all", intervalFilter: "all", uncertainCreate: null, quietPreview: null
@@ -50,7 +50,14 @@ function restoreControl(focus) {
   element?.focus({preventScroll: true});
   return Boolean(element);
 }
+function rememberTargetDetails() {
+  document.querySelectorAll("[data-target-details]").forEach(element => {
+    if (element.open) state.targetDetailsOpen.add(element.dataset.targetDetails);
+    else state.targetDetailsOpen.delete(element.dataset.targetDetails);
+  });
+}
 function render() {
+  rememberTargetDetails();
   const control = controlFocus();
   const focused = document.activeElement;
   const focusId = focused?.id, start = focused?.selectionStart, end = focused?.selectionEnd;
@@ -85,6 +92,7 @@ function workerStatus() {
     : state.status?.worker_alive ? "Worker online" : "Worker unavailable";
 }
 function patchJobs() {
+  rememberTargetDetails();
   workerStatus(); if (route() !== "jobs") return;
   const focus = controlFocus();
   const list = document.querySelector("#job-list");
@@ -426,6 +434,44 @@ async function mutateJob(job, action) {
   } catch (error) { announce(message(error)); if (error.ambiguous || error.status === 404 || error.status === 409) await refresh(); }
   finally { state.pendingJobs.delete(job.id); patchJobs(); }
 }
+async function fetchRepairStatus(job, targetId) {
+  const feedback = state.targetRepairs.get(targetId);
+  try {
+    const latest = await api.getJob(job.id);
+    canonicalJob(latest);
+    const target = latest.targets.find(item => item.id === targetId && item.active);
+    state.targetRepairs.set(targetId, {...feedback, pending: false, warning: true, unresolved: false,
+      after: target, message: target ? `${feedback?.conflict ? "Repair conflicted with a saved edit. Review current metadata before repairing again." : "Request outcome unknown. Showing current saved metadata; another repair may still be running."}` : "Target was removed. Repair was not retried."});
+  } catch (error) {
+    state.targetRepairs.set(targetId, {...feedback, pending: false, warning: true, unresolved: true,
+      message: `Saved metadata could not be fetched. Request outcome remains unknown. ${message(error)}`});
+  }
+  patchJobs();
+}
+async function repairTarget(job, targetId) {
+  if (state.pendingJobs.has(job.id)) return;
+  const target = job.targets.find(item => item.id === targetId && item.active);
+  if (!target) return;
+  state.pendingJobs.add(job.id);
+  state.targetRepairs.set(targetId, {pending: true, before: target, message: "Resolving saved target metadata…"});
+  patchJobs();
+  try {
+    const result = await api.repairTarget(job.id, targetId, target.booking_url, job.edit_version);
+    canonicalJob(result.job);
+    const success = result.validation_state === "validated";
+    const text = success ? result.changed
+      ? `Metadata repaired. ${result.job.status === "paused" ? "Job remains paused; select Check once to check new metadata." : "Fresh check queued for the new metadata."}`
+      : "Metadata revalidated; identity unchanged. No extra check queued."
+      : "Validation failed. Saved metadata retained; availability evidence was not renewed.";
+    state.targetRepairs.set(targetId, {before: result.before || target, after: result.after, message: text, warning: !success});
+    announce(text);
+    await refresh();
+  } catch (error) {
+    state.targetRepairs.set(targetId, {before: target, warning: true, conflict: error.status === 409,
+      message: message(error), unresolved: error.ambiguous || error.status === 409 || error.status === 404});
+    if (error.ambiguous || error.status === 409 || error.status === 404) await fetchRepairStatus(job, targetId);
+  } finally { state.pendingJobs.delete(job.id); patchJobs(); }
+}
 async function requestJobCheck(job) {
   const queuedQuietRefresh = job.check_intent?.status === "queued" && job.check_intent.triggered_by === "quiet_hours";
   if (state.pendingJobs.has(job.id) || (job.check_intent?.status === "queued" && !queuedQuietRefresh)) return;
@@ -482,6 +528,8 @@ document.addEventListener("click", async event => {
   if (control.closest("#channel-settings")) { await channels.click(control); return; }
   if (control.closest('#smtp-settings')) { await smtp.click(control); return; }
   const action = control.dataset.action, job = state.jobs?.find(value => value.id === control.closest("[data-job-id]")?.dataset.jobId);
+  if (action === "repair-target" && job) { await repairTarget(job, control.dataset.targetId); return; }
+  if (action === "repair-status" && job) { await fetchRepairStatus(job, control.dataset.targetId); return; }
   if (action === "activity-more") { loadActivity(false); return; }
   if (action === "activity-retry") { refresh(false, true); return; }
   if (["retry", "refresh"].includes(action)) { refresh(true); return; }

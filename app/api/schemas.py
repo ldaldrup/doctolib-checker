@@ -22,6 +22,10 @@ class TargetValidationRequest(StrictRequest):
     booking_url: str = Field(min_length=1, max_length=4096)
 
 
+class TargetRevalidationRequest(VersionedRequest):
+    booking_url: str = Field(min_length=1, max_length=4096)
+
+
 class MessageContent(StrictRequest):
     preset: Literal['standard', 'compact', 'custom'] = 'standard'
     fields: List[Literal['job_name','practitioner','practice','earliest_appointment','check_time','time_zone','booking_link']] = Field(default_factory=lambda: ['practitioner','practice','earliest_appointment','booking_link'], min_length=1, max_length=7)

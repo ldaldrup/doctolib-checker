@@ -136,7 +136,8 @@ def test_gate_busy_before_deadline_is_not_misclassified_as_budget(tmp_path, monk
         Repository(database).reserve_request_turn(3, deadline=time.monotonic() + 120)
 
 
-def test_actual_curl_dripping_response_obeys_total_wall_deadline():
+@pytest.mark.parametrize("availability", [True, False])
+def test_actual_curl_dripping_response_obeys_total_wall_deadline(availability):
     class Drip(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -158,11 +159,11 @@ def test_actual_curl_dripping_response_obeys_total_wall_deadline():
     thread.start()
     try:
         with curl_requests.Session(impersonate="safari2601") as session:
-            client = DoctolibClient(availability_session=session)
+            client = DoctolibClient(availability_session=session, metadata_session=session)
             started = time.monotonic()
             client.deadline = started + 0.2
             with pytest.raises(TargetBudgetExceeded):
-                client._get(f"http://127.0.0.1:{server.server_port}/", availability=True)
+                client._get(f"http://127.0.0.1:{server.server_port}/", availability=availability)
             elapsed = time.monotonic() - started
             assert 0.15 <= elapsed < 1.0
     finally:

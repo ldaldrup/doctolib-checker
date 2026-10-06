@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from app.storage.channel_operations import CHANNEL_SCHEMA
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 class Database:
@@ -346,10 +346,15 @@ class Database:
                         conn.execute("ALTER TABLE check_runs_next RENAME TO check_runs")
                         conn.execute("CREATE INDEX idx_runs_job_time ON check_runs(job_id, started_at DESC)")
                     current_version = 14
+                if current_version == 14:
+                    current_version = 15
                 if current_version != SCHEMA_VERSION:
                     raise RuntimeError("Unsupported database schema version")
+            metadata_migration = 'metadata_validation_state' not in {
+                row[1] for row in conn.execute('PRAGMA table_info(targets)')}
             # Additive content contracts preserve existing events and queued work.
             for table, columns in {
+                'targets': ("metadata_validation_state TEXT NOT NULL DEFAULT 'unknown'", 'metadata_validation_reason TEXT', 'metadata_checked_at TEXT'),
                 'settings': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1'),
                 'jobs': ('message_content TEXT', 'content_version INTEGER NOT NULL DEFAULT 1', 'policy_version INTEGER NOT NULL DEFAULT 1',
                          'quiet_hours_enabled INTEGER NOT NULL DEFAULT 0', "quiet_hours_start TEXT NOT NULL DEFAULT '22:00'", "quiet_hours_end TEXT NOT NULL DEFAULT '07:00'", 'last_served_at TEXT'),
@@ -376,6 +381,9 @@ class Database:
                                         break
                                     cursor += 1
                                 conn.execute("UPDATE check_runs SET target_cursor=? WHERE id=?", (cursor,run['id']))
+            if metadata_migration:
+                conn.execute("""UPDATE targets SET metadata_validation_state=CASE validation_state WHEN 'ready' THEN 'validated' ELSE 'invalid' END,
+                    metadata_checked_at=last_validated_at""")
             conn.execute("UPDATE check_results SET error_category='unknown' WHERE status='error' AND error_category IS NULL")
             import json
             default_content = json.dumps({'preset':'standard','fields':['practitioner','practice','earliest_appointment','booking_link'],'silent':False})
