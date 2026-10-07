@@ -1,10 +1,12 @@
 """Raw API contracts: no legacy helper may fill keys or versions here."""
 from datetime import timedelta
+from dataclasses import replace
 from threading import Event, Thread
 
 import pytest
 import requests
 from fastapi.testclient import TestClient
+from app.api.app import create_app
 
 from app.storage.repositories import utc_now, precise_iso
 from tests.test_backend_journey import setup_backend, URL
@@ -21,6 +23,40 @@ def draft(**changes):
 
 def create(client, key="draft-1", **changes):
     return client.post("/api/v1/jobs", json=draft(**changes), headers={"Idempotency-Key": key})
+
+
+@pytest.mark.parametrize('action', ['create', 'update', 'validate'])
+def test_metadata_deadline_rejects_gate_without_mutation_or_transport(tmp_path, monkeypatch, action):
+    fixture_client, repository, settings, fixture = backend(tmp_path)
+    saved = create(fixture_client).json()
+    client = TestClient(create_app(replace(settings, target_budget_seconds=0.01), repository=repository))
+    original = client.app.state.doctolib
+    monkeypatch.setattr('app.services.jobs.get_availability_session', lambda profile: fixture.fixture_session)
+    monkeypatch.setattr('app.storage.repositories.time.sleep', lambda seconds: pytest.fail('Unaffordable gate wait'))
+    gate = precise_iso(utc_now() + timedelta(seconds=30))
+    with repository.database.connection() as conn:
+        conn.execute('INSERT OR REPLACE INTO request_gate(singleton_id,next_allowed_at) VALUES(1,?)', (gate,))
+    calls = len(fixture.fixture_session.calls)
+    if action == 'create':
+        response = create(client, key='bounded-create')
+    elif action == 'update':
+        response = client.patch('/api/v1/jobs/' + saved['id'], json={
+            'expected_version': saved['edit_version'], 'target_urls': [URL + '&source=edit']})
+    else:
+        response = client.post('/api/v1/targets/validate', json={'booking_url': URL})
+    assert response.status_code == 502, response.text
+    assert 'doctolib_unavailable' in response.text
+    assert len(fixture.fixture_session.calls) == calls
+    assert original.deadline is None and isinstance(original.metadata_session, requests.Session)
+    assert repository.get_job(saved['id'])['edit_version'] == saved['edit_version']
+    assert len(repository.list_jobs()) == 1
+    with repository.database.connection() as conn:
+        assert conn.execute('SELECT next_allowed_at FROM request_gate').fetchone()[0] == gate
+    if action == 'create':
+        with repository.database.connection() as conn:
+            state, retryable = conn.execute(
+                "SELECT state,retryable FROM create_operations WHERE key='bounded-create'").fetchone()
+        assert state == 'failed' and retryable
 
 
 def test_create_requires_key_replays_and_rejects_different_body(tmp_path):

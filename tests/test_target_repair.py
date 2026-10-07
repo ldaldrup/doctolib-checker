@@ -246,7 +246,8 @@ def test_malformed_upstream_items_record_safe_invalid_metadata(tmp_path, malform
     assert outcome['job']['targets'][0]['agenda_ids'] == job['targets'][0]['agenda_ids']
 
 
-def test_metadata_repair_uses_total_timeout_adapter_without_mutating_shared_client(tmp_path, monkeypatch):
+@pytest.mark.parametrize('action', ['create', 'update', 'validate', 'repair'])
+def test_metadata_uses_total_timeout_adapter_without_mutating_shared_client(tmp_path, monkeypatch, action):
     client, _, _, doctolib = backend(tmp_path)
     job = create(client).json()
     original_session = requests.Session()
@@ -254,8 +255,20 @@ def test_metadata_repair_uses_total_timeout_adapter_without_mutating_shared_clie
     transports = []
     monkeypatch.setattr('app.services.jobs.get_availability_session', lambda profile: (
         transports.append(profile) or doctolib.fixture_session))
-    assert repair(client, job).json()['validation_state'] == 'validated'
-    assert transports == ['safari2601']
+    closed = []
+    monkeypatch.setattr(doctolib.fixture_session, 'close', lambda: closed.append(True), raising=False)
+    if action == 'create':
+        response = create(client, key='bounded-adapter')
+    elif action == 'update':
+        response = client.patch('/api/v1/jobs/' + job['id'], json={
+            'expected_version': job['edit_version'], 'target_urls': [job['targets'][0]['booking_url']]})
+    elif action == 'validate':
+        response = client.post('/api/v1/targets/validate', json={'booking_url': job['targets'][0]['booking_url']})
+    else:
+        response = repair(client, job)
+        assert response.json()['validation_state'] == 'validated'
+    assert response.status_code in (200, 201), response.text
+    assert transports == ['safari2601'] and closed == [True]
     assert doctolib.metadata_session is original_session and doctolib.deadline is None
     assert doctolib.fixture_session.calls[-1][1]['timeout'] <= 10
 

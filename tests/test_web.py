@@ -61,6 +61,47 @@ def test_api_and_health_routes_still_take_precedence(client):
     assert updated.json()["request_spacing_seconds"] == 3.5
 
 
+@pytest.mark.parametrize("target_budget,tick,wait,expires", [
+    (120, 2, 100, 123),
+    (180, 2, 150, 183),
+    (60, 100, 50, 161),
+])
+def test_worker_health_allows_bounded_gate_wait_but_expires_without_heartbeat(
+        client, monkeypatch, target_budget, tick, wait, expires):
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+    import time
+    from app.storage.repositories import precise_iso
+    from app.worker.scheduler import create_check_service
+
+    now = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+    elapsed = [0]
+    monkeypatch.setattr('app.storage.repositories.utc_now', lambda: now + timedelta(seconds=elapsed[0]))
+    monkeypatch.setattr('app.api.routes.utc_now', lambda: now + timedelta(seconds=elapsed[0]))
+    settings = replace(client.app.state.settings, target_budget_seconds=target_budget,
+                       check_interval_seconds=tick)
+    client.app.state.settings = settings
+    repository = client.app.state.repository
+    assert not client.get('/api/v1/status').json()['worker_alive']
+    service = create_check_service(settings, repository)
+    with repository.database.connection() as conn:
+        conn.execute('INSERT INTO request_gate(singleton_id,next_allowed_at) VALUES(1,?)',
+                     (precise_iso(now + timedelta(seconds=wait)),))
+    service.doctolib.deadline = time.monotonic() + target_budget
+
+    def wait_without_sleep(seconds):
+        assert seconds == pytest.approx(wait)
+        elapsed[0] = wait
+        status = client.get('/api/v1/status').json()
+        assert status['worker_alive']
+        assert status['last_completed_run'] is None
+
+    monkeypatch.setattr('app.storage.repositories.time.sleep', wait_without_sleep)
+    service.doctolib.before_request()
+    elapsed[0] = expires
+    assert not client.get('/api/v1/status').json()['worker_alive']
+
+
 @pytest.mark.parametrize("path", [
     "/unknown-page", "/assets/unknown.js", "/api/v1/unknown",
     "/.env", "/requirements.txt", "/README.md", "/config.json",

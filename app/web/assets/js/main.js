@@ -7,6 +7,7 @@ import { deriveJobView, historyKey, safeBookingUrl } from "./job-view.js";
 import { emptyDraft, renderJobList, renderJobs, renderTargetMetadata, savedJobFeedback, updateConflictFields, sameDraftValue } from "./pages/jobs.js";
 import { renderSettings, settingWarning } from "./pages/settings.js";
 import { renderActivity, shouldRefreshActivity } from "./pages/activity.js";
+import { applyFieldErrors, formatInterval } from "./ui.js";
 
 const app = document.querySelector("#app"), toast = document.querySelector("#toast"), dialog = document.querySelector("#confirm-dialog");
 const state = {
@@ -14,7 +15,7 @@ const state = {
   load: Object.fromEntries(["jobs", "settings", "status", "activity"].map(key => [key, {phase: "loading", error: null}])),
   views: new Map(), histories: new Map(), targetMetadata: new Map(),
   activity: {jobId: null, runId: null, items: [], nextOffset: 0, nextBeforeRunId: null, hasMore: false, phase: "loading", error: null},
-  formDraft: null, editingId: null, original: null, pendingJobs: new Set(),
+  formDraft: null, jobBaseline: null, jobUpdateUnknown: false, editingId: null, original: null, pendingJobs: new Set(),
   checkSubmitting: new Set(), checkErrors: new Map(), targetRepairs: new Map(), targetDetailsOpen: new Set(),
   jobSubmitting: false, settingsSubmitting: false, jobError: null, settingsError: null,
   settingsDraft: null, settingsDirty: false, remoteSettingsChanged: false, settingsConflict: null, jobConflict: null, jobConflictBlocked: false, createAttempt: null,
@@ -24,8 +25,8 @@ let toastTimer, refreshTimer, refreshPromise, refreshAgain = false, refreshSetti
 let historyActive = 0, settingsGeneration = 0, historyEpoch = 0, activityGeneration = 0;
 let quietPreviewTimer;
 const historyQueue = [], historyQueued = new Set(), searchSignatures = new Map(), invalidations = new Map();
-const channels = channelController(state, {render, announce, refreshJobs: () => refresh(true), onLoad: patchJobChannels});
-const smtp = smtpController(state, {render, announce, refreshJobs: () => refresh(true)});
+const channels = channelController(state, {render, announce, preserveFocus, confirmDiscard: requestDiscard, refreshJobs: () => refresh(true), onLoad: patchJobChannels});
+const smtp = smtpController(state, {render, announce, preserveFocus, confirmDiscard: requestDiscard, refreshJobs: () => refresh(true)});
 const route = () => location.hash === "#settings" ? "settings" : location.hash.startsWith("#activity") ? "activity" : "jobs";
 const activityFilter = () => {
   const query = new URLSearchParams(location.hash.split("?", 2)[1] || "");
@@ -34,21 +35,35 @@ const activityFilter = () => {
 const message = error => error?.message || "The request failed.";
 const settingsValues = settings => ({default_interval_seconds: settings.default_interval_seconds, request_spacing_seconds: settings.request_spacing_seconds, message_content: structuredClone(settings.message_content || defaultContent())});
 
-function announce(value) {
+function announce(value, tone = "success") {
   clearTimeout(toastTimer); toast.textContent = value; toast.hidden = false;
+  toast.dataset.tone = tone; toast.setAttribute("role", tone === "error" ? "alert" : "status");
   toastTimer = setTimeout(() => { toast.hidden = true; }, 6500);
 }
 function controlFocus(element = document.activeElement) {
-  return {id: element?.id, action: element?.dataset.action, job: element?.closest("[data-job-id]")?.dataset.jobId, filter: element?.dataset.filter, href: element?.getAttribute("href")};
+  return {id: element?.id, action: element?.dataset.action, job: element?.closest("[data-job-id]")?.dataset.jobId,
+    channel: element?.closest("[data-channel-id]")?.dataset.channelId, form: element?.closest("form")?.id,
+    name: element?.name, value: ["radio", "checkbox"].includes(element?.type) ? element.value : undefined,
+    index: element?.dataset.index, filter: element?.dataset.filter, href: element?.getAttribute("href")};
 }
 function restoreControl(focus) {
   let element = focus.id ? document.getElementById(focus.id) : null;
   if (!element && focus.action) element = [...document.querySelectorAll("[data-action]")].find(candidate => candidate.dataset.action === focus.action
     && (!focus.job || candidate.closest("[data-job-id]")?.dataset.jobId === focus.job)
+    && (!focus.channel || candidate.closest("[data-channel-id]")?.dataset.channelId === focus.channel)
+    && (!focus.form || candidate.closest("form")?.id === focus.form)
+    && (focus.index === undefined || candidate.dataset.index === focus.index)
     && (!focus.filter || candidate.dataset.filter === focus.filter));
   if (!element && focus.href && focus.job) element = [...document.querySelectorAll("[data-job-id] a")].find(candidate => candidate.getAttribute("href") === focus.href && candidate.closest("[data-job-id]")?.dataset.jobId === focus.job);
+  if (!element && focus.form && focus.name) element = [...(document.getElementById(focus.form)?.elements || [])].find(candidate => candidate.name === focus.name && (focus.value === undefined || candidate.value === focus.value));
   element?.focus({preventScroll: true});
   return Boolean(element);
+}
+function preserveFocus(update) {
+  const focus = controlFocus(), active = document.activeElement, start = active?.selectionStart, end = active?.selectionEnd;
+  update();
+  if (!restoreControl(focus)) return;
+  if (start != null && document.activeElement?.setSelectionRange) { try { document.activeElement.setSelectionRange(start, end); } catch {} }
 }
 function rememberTargetDetails() {
   document.querySelectorAll("[data-target-details]").forEach(element => {
@@ -68,12 +83,13 @@ function render() {
   });
   document.title = `${route() === "jobs" ? "Jobs" : route() === "activity" ? "Activity" : "Settings"} · DoctolibChecker`;
   workerStatus(); observeCards();
+  if (!state.jobBaseline && document.getElementById("job-form") && !state.jobSubmitting) state.jobBaseline = structuredClone(readDraft(document.getElementById("job-form")));
   if (focusId) {
     const next = document.getElementById(focusId);
     if (next) {
       next.focus({preventScroll: true});
       if (start !== null && start !== undefined && next.setSelectionRange) { try { next.setSelectionRange(start, end); } catch {} }
-    } else if (route() === "activity") document.getElementById("activity-heading")?.focus({preventScroll: true});
+    } else if (!restoreControl(control) && route() === "activity") document.getElementById("activity-heading")?.focus({preventScroll: true});
   } else if (!restoreControl(control) && route() === "activity") document.getElementById("activity-heading")?.focus({preventScroll: true});
   window.scrollTo({top: scroll, behavior: "instant"});
   syncQuietHoursPreview();
@@ -120,12 +136,12 @@ function patchJobs() {
     // A saved filter remains selectable even if its last job was removed.
     if (state.intervalFilter !== "all" && ![...interval.options].some(option => option.value === state.intervalFilter)) {
       const option = document.createElement("option"); option.value = state.intervalFilter;
-      option.textContent = `${state.intervalFilter} sec`; interval.append(option);
+      option.textContent = formatInterval(Number(state.intervalFilter)); interval.append(option);
     }
     interval.value = state.intervalFilter;
   }
   const canCreate = Boolean(state.settings) && state.load.jobs.phase === "loaded";
-  const newJob = document.querySelector('[data-action="new-job"]'); if (newJob) newJob.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate);
+  document.querySelectorAll('[data-action="new-job"]').forEach(button => { button.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate) || state.jobUpdateUnknown; });
   const submit = document.querySelector('#job-form [type="submit"]'); if (submit) submit.disabled = !canCreate || state.jobSubmitting || Boolean(state.uncertainCreate) || state.jobConflictBlocked;
   observeCards(); restoreControl(focus);
 }
@@ -260,7 +276,7 @@ function showSettingsRead() {
   }
   if (!state.settingsDirty) {
     const current = document.querySelector(".settings-sections"), next = template.content.querySelector(".settings-sections");
-    if (current && next && settingsDiffer(readSettings(document.getElementById("settings-form")), state.settings)) { const focus = controlFocus(); current.innerHTML = next.innerHTML; restoreControl(focus); }
+    if (current && next && settingsDiffer(readSettings(document.getElementById("settings-form")), state.settings)) preserveFocus(() => { current.innerHTML = next.innerHTML; });
   }
   settingsFeedback(); workerStatus();
 }
@@ -332,15 +348,30 @@ function readSettings(form) {
 }
 function showErrors(error, formId, errorId) {
   const form = document.getElementById(formId), output = document.getElementById(errorId); if (!form || !output) return;
-  output.textContent = message(error); output.hidden = false;
-  for (const [field] of Object.entries(error?.fields || {})) {
-    const name = field.split(".")[0];
-    const names = {interval_seconds: ["interval_choice", "custom_interval_seconds"], default_interval_seconds: ["default_interval_choice", "custom_default_interval_seconds"]}[name] || [name];
-    [...form.elements].filter(input => names.includes(input.name)).forEach(input => { input.setAttribute("aria-invalid", "true"); input.setAttribute("aria-describedby", errorId); });
-  }
-  output.focus?.(); announce(message(error));
+  applyFieldErrors(form, error, output, {interval_seconds: ["custom_interval_seconds", "interval_choice"],
+    default_interval_seconds: ["custom_default_interval_seconds", "default_interval_choice"],
+    message_content: ["job-content-preset", "settings-content-preset"]});
+  announce(message(error), error.ambiguous ? "warning" : "error");
 }
-function resetEditor() { state.createAttempt = null; state.uncertainCreate = null; state.jobConflict = null; state.jobConflictBlocked = false; state.editingId = null; state.original = null; state.formDraft = state.settings ? emptyDraft(state.settings) : null; state.jobError = null; }
+function jobDirty() {
+  if (!state.jobBaseline || !state.formDraft) return false;
+  return Object.keys(state.jobBaseline).some(key => !sameDraftValue(key, state.formDraft[key], state.jobBaseline[key]));
+}
+let discardResolve;
+function requestDiscard(copy = "Discard unsaved job changes?") {
+  if (dialog.open || discardResolve) return Promise.resolve(false);
+  deleteFocus = controlFocus(); dialog.dataset.operation = "discard"; dialog.returnValue = "";
+  dialog.querySelector("#confirm-title").textContent = "Discard changes?";
+  dialog.querySelector("#confirm-copy").textContent = copy;
+  dialog.querySelector('[value="confirm"]').textContent = "Discard changes";
+  dialog.showModal();
+  return new Promise(resolve => { discardResolve = resolve; });
+}
+function canReplaceJob() {
+  if (state.jobSubmitting || state.uncertainCreate || state.jobUpdateUnknown) return false;
+  return !jobDirty() || requestDiscard();
+}
+function resetEditor() { state.createAttempt = null; state.uncertainCreate = null; state.jobConflict = null; state.jobConflictBlocked = false; state.jobUpdateUnknown = false; state.editingId = null; state.original = null; state.jobBaseline = null; state.formDraft = state.settings ? emptyDraft(state.settings) : null; state.jobError = null; }
 function openEditor() {
   if (route() !== "jobs") location.hash = "#jobs"; else render();
   requestAnimationFrame(() => document.getElementById("job-name")?.focus());
@@ -368,7 +399,10 @@ async function submitJob(form, replay = false) {
     state.jobError = error;
     if (!id && error.ambiguous) state.uncertainCreate = {pending: false};
     if (!id && error.status === 422 && error.detail?.retryable === false) { state.uncertainCreate = null; state.createAttempt = null; }
-    if (id && error.status === 409) { state.jobConflictBlocked = true; try { state.jobConflict = await api.getJob(id); } catch {} }
+    if (id && (error.status === 409 || error.ambiguous)) {
+      state.jobConflictBlocked = true; state.jobUpdateUnknown = Boolean(error.ambiguous);
+      try { state.jobConflict = await api.getJob(id); state.jobUpdateUnknown = false; } catch {}
+    }
     if (error.ambiguous || error.status === 404) await refresh();
   } finally {
     state.jobSubmitting = false; if (id) state.pendingJobs.delete(id); render();
@@ -379,7 +413,7 @@ let settingsSaveTimer, settingsEditRevision = 0;
 function settingsDiffer(draft, saved) {
   return Object.keys(settingsValues(saved)).some(key => key === "message_content" ? JSON.stringify(draft[key]) !== JSON.stringify(saved[key] || defaultContent()) : draft[key] === "" || Number(draft[key]) !== Number(saved[key]));
 }
-function settingsFeedback() {
+function settingsFeedback(focusError = false) {
   document.getElementById("settings-form")?.setAttribute("aria-busy", String(state.settingsSubmitting));
   document.querySelectorAll('[data-setting-warning]').forEach(button => {
     const warning = settingWarning(state, button.dataset.settingWarning);
@@ -388,23 +422,28 @@ function settingsFeedback() {
     button.querySelector(".settings-warning-message").textContent = warning?.message || "";
     button.classList.toggle("settings-warning-failed", Boolean(warning?.failed));
   });
+  const form = document.getElementById("settings-form"), output = document.getElementById("settings-form-error");
+  if (form && output) {
+    applyFieldErrors(form, state.settingsError, output, {default_interval_seconds: ["custom_default_interval_seconds", "default_interval_choice"], message_content: "settings-content-preset"}, {focus: focusError});
+  }
 }
 function settingsEdited(immediate = false) {
   state.contentPreview = null; state.contentPreviewError = null;
+  document.querySelectorAll(".message-preview-controls .channel-preview, .message-preview-controls .form-error").forEach(node => node.remove());
   state.settingsDraft = readSettings(document.getElementById("settings-form"));
   state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
   if (!state.remoteSettingsChanged) state.settingsError = null; settingsEditRevision++;
   clearTimeout(settingsSaveTimer); if (state.settingsConflict) showSettingsRead(); else settingsFeedback();
   if (state.settingsDirty && !state.remoteSettingsChanged) settingsSaveTimer = setTimeout(() => submitSettings(), immediate ? 0 : 600);
 }
-async function submitSettings(form) {
+async function submitSettings(form, focusError = false) {
   clearTimeout(settingsSaveTimer);
   if (form) state.settingsDraft = readSettings(form);
   if (state.settingsSubmitting || state.remoteSettingsChanged || !state.settings || !state.settingsDraft) return;
   state.settingsDirty = settingsDiffer(state.settingsDraft, state.settings);
   if (!state.settingsDirty) { settingsFeedback(); return; }
   let payload; try { payload = settingsPayload(state.settingsDraft, state.settings); }
-  catch (error) { state.settingsError = error; settingsFeedback(); return; }
+  catch (error) { state.settingsError = error; settingsFeedback(focusError && Boolean(document.activeElement?.closest("#settings-form"))); return; }
   const revision = settingsEditRevision;
   ++settingsGeneration; state.settingsSubmitting = true; state.settingsError = null; settingsFeedback();
   try {
@@ -414,7 +453,7 @@ async function submitSettings(form) {
     state.remoteSettingsChanged = false;
   } catch (error) { state.settingsError = error; if (error.status === 409) { state.remoteSettingsChanged = true; try { state.settingsConflict = await api.getSettings(); state.remoteSettingsChanged = true; } catch {} showSettingsRead(); } }
   finally {
-    state.settingsSubmitting = false; settingsFeedback();
+    state.settingsSubmitting = false; settingsFeedback(focusError && Boolean(document.activeElement?.closest("#settings-form")));
     if (settingsEditRevision !== revision && state.settingsDirty && !state.remoteSettingsChanged && !state.settingsError) settingsSaveTimer = setTimeout(() => submitSettings(), 600);
   }
 }
@@ -431,7 +470,7 @@ async function mutateJob(job, action) {
     else canonicalJob(result);
     announce(action === "delete" ? "Job deleted. Check history is retained." : `Job ${action === "pause" ? "paused" : "resumed"}.`);
     await refresh();
-  } catch (error) { announce(message(error)); if (error.ambiguous || error.status === 404 || error.status === 409) await refresh(); }
+  } catch (error) { announce(message(error), error.ambiguous ? "warning" : "error"); if (error.ambiguous || error.status === 404 || error.status === 409) await refresh(); }
   finally { state.pendingJobs.delete(job.id); patchJobs(); }
 }
 async function fetchRepairStatus(job, targetId) {
@@ -464,7 +503,7 @@ async function repairTarget(job, targetId) {
       : "Metadata revalidated; identity unchanged. No extra check queued."
       : "Validation failed. Saved metadata retained; availability evidence was not renewed.";
     state.targetRepairs.set(targetId, {before: result.before || target, after: result.after, message: text, warning: !success});
-    announce(text);
+    announce(text, success ? "success" : "warning");
     await refresh();
   } catch (error) {
     state.targetRepairs.set(targetId, {before: target, warning: true, conflict: error.status === 409,
@@ -483,7 +522,7 @@ async function requestJobCheck(job) {
     await refresh();
   } catch (error) {
     const feedback = error.ambiguous ? `${message(error)} Refresh to inspect the saved request before trying again.` : message(error);
-    state.checkErrors.set(job.id, feedback); announce(feedback);
+    state.checkErrors.set(job.id, feedback); announce(feedback, error.ambiguous ? "warning" : "error");
     if (error.ambiguous || error.status === 404) await refresh();
   } finally { state.pendingJobs.delete(job.id); state.checkSubmitting.delete(job.id); patchJobs(); }
 }
@@ -535,7 +574,7 @@ document.addEventListener("click", async event => {
   if (["retry", "refresh"].includes(action)) { refresh(true); return; }
   if (action === "sign-in") { location.assign(location.href); return; }
   if (action === "filter") { state.filter = control.dataset.filter; patchJobs(); refresh(); return; }
-  if (["new-job", "cancel-edit"].includes(action)) { if (!state.jobSubmitting && !state.uncertainCreate) { resetEditor(); openEditor(); refresh(); } return; }
+  if (["new-job", "cancel-edit"].includes(action)) { const allowed = canReplaceJob(); if (allowed === true || await allowed) { resetEditor(); openEditor(); refresh(); } return; }
   if (["add-target", "remove-target"].includes(action)) {
     if (state.jobSubmitting || !state.formDraft) return;
     state.formDraft = readDraft(document.getElementById("job-form"));
@@ -553,10 +592,10 @@ document.addEventListener("click", async event => {
     finally { state.contentPreviewBusy = false; render(); }
     return;
   }
-  if (action === "retry-settings") { submitSettings(); return; }
+  if (action === "retry-settings") { submitSettings(null, true); return; }
   if (action === "retry-create" && state.uncertainCreate) { submitJob(null, true); return; }
   if (action === "refetch-job-conflict" && state.editingId) {
-    try { state.jobConflict = await api.getJob(state.editingId); state.jobError = null; render(); } catch (error) { state.jobError = error; render(); } return;
+    try { state.jobConflict = await api.getJob(state.editingId); state.jobUpdateUnknown = false; state.jobError = null; render(); } catch (error) { state.jobError = error; render(); } return;
   }
   if (action === "reconcile-job" && state.jobConflict) {
     const prior = {...state.original, target_urls: state.original.targets.map(target => target.booking_url)}, latest = state.jobConflict;
@@ -571,7 +610,8 @@ document.addEventListener("click", async event => {
       }
       merged[key] = value;
     }
-    state.formDraft = merged; state.original = structuredClone(latest); state.jobConflict = null; state.jobConflictBlocked = false; state.jobError = null; render(); return;
+    state.formDraft = merged; state.original = structuredClone(latest); state.jobBaseline = null; state.jobConflict = null; state.jobConflictBlocked = false; state.jobUpdateUnknown = false; state.jobError = null; render();
+    state.jobBaseline = Object.fromEntries(Object.keys(state.jobBaseline).map(key => [key, key === "target_urls" ? latest.targets.map(target => target.booking_url) : latest[key]])); return;
   }
   if (action === "use-server-settings" && state.settingsConflict) {
     state.settings = state.settingsConflict; state.settingsConflict = null; state.remoteSettingsChanged = false;
@@ -590,8 +630,10 @@ document.addEventListener("click", async event => {
   if (!job || state.pendingJobs.has(job.id)) return;
   if (action === "check-now") { requestJobCheck(job); return; }
   if (["pause", "resume"].includes(action)) { mutateJob(job, action); return; }
-  if (action === "edit" && !state.jobSubmitting && !state.uncertainCreate) {
+  if (action === "edit") {
+    const allowed = canReplaceJob(); if (allowed !== true && !await allowed) return;
     state.editingId = job.id; state.original = structuredClone(job);
+    state.jobBaseline = null;
     state.formDraft = {...job, target_urls: job.targets.map(target => target.booking_url), earliest_date: job.earliest_date || "", latest_date: job.latest_date || ""};
     for (const target of job.targets) {
       if (state.targetMetadata.get(target.booking_url)?.phase !== "loading") state.targetMetadata.set(target.booking_url, {phase: "loaded", data: target, error: null, seeded: true});
@@ -613,7 +655,7 @@ document.addEventListener("input", event => {
   if (event.target.closest("#job-form")) {
     state.formDraft = readDraft(document.getElementById("job-form"));
     if (event.target.name.startsWith("quiet_hours_")) syncQuietHoursPreview();
-    event.target.removeAttribute("aria-invalid");
+    if (!state.jobConflictBlocked) { state.jobError = null; applyFieldErrors(document.getElementById("job-form"), null, document.getElementById("job-form-error")); }
     if (event.target.name === "target_urls") {
       const index = [...document.querySelectorAll('[name="target_urls"]')].indexOf(event.target);
       const url = event.target.value.trim();
@@ -629,6 +671,10 @@ document.addEventListener("change", event => {
   if (channels.input(event)) return;
   if (smtp.input(event)) return;
   if (event.target.id === "interval-filter") { state.intervalFilter = event.target.value; patchJobs(); refresh(); return; }
+  if (event.target.id === "message-preview-type") {
+    state.contentPreviewType = event.target.value; state.contentPreview = null; state.contentPreviewError = null; settingsEditRevision++;
+    document.querySelectorAll(".message-preview-controls .channel-preview, .message-preview-controls .form-error").forEach(node => node.remove());
+  }
   if (event.target.closest("#job-form")) {
     state.formDraft = readDraft(document.getElementById("job-form"));
     if (event.target.name.startsWith("quiet_hours_")) syncQuietHoursPreview();
@@ -654,9 +700,14 @@ document.addEventListener("submit", event => {
   if (event.target.id === "channel-form") { event.preventDefault(); channels.submit(event.target); }
   if (event.target.id === 'smtp-form') { event.preventDefault(); smtp.submit(event.target); }
   if (event.target.id === "job-form") { event.preventDefault(); submitJob(event.target); }
-  if (event.target.id === "settings-form") { event.preventDefault(); submitSettings(event.target); }
+  if (event.target.id === "settings-form") { event.preventDefault(); submitSettings(event.target, true); }
 });
 dialog.addEventListener("close", () => {
+  if (dialog.dataset.operation === "discard") {
+    const resolve = discardResolve; discardResolve = null;
+    if (deleteFocus) restoreControl(deleteFocus);
+    resolve?.(dialog.returnValue === "confirm"); return;
+  }
   if (dialog.returnValue === "confirm") {
 
     if (dialog.dataset.operation === "delete") {
@@ -678,4 +729,6 @@ document.addEventListener("visibilitychange", () => {
 render();
 refresh(true);
 
-window.addEventListener("beforeunload", event => { if (state.uncertainCreate || state.channelUI?.createAttempt || state.channelUI?.draft || state.smtpUI?.draft) { event.preventDefault(); event.returnValue = ""; } });
+window.addEventListener("beforeunload", event => {
+  if (jobDirty() || state.settingsDirty || state.jobSubmitting || state.settingsSubmitting || state.uncertainCreate || state.jobUpdateUnknown || channels.hasUnsavedChanges() || smtp.hasUnsavedChanges()) { event.preventDefault(); event.returnValue = ""; }
+});

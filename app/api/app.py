@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.routes import create_router
 from app.doctolib import DoctolibClient
 from app.settings import Settings
+from app.services.jobs import metadata_deadline
 from app.notification_secrets import NotificationSecrets
 from app.storage.db import Database
 from app.storage.repositories import Repository
@@ -37,7 +38,7 @@ def create_app(settings=None, repository=None, doctolib=None):
             values = repository.settings(
                 settings.minimum_poll_interval_seconds, settings.request_spacing_seconds
             )
-            repository.reserve_request_turn(float(values["request_spacing_seconds"]))
+            repository.reserve_request_turn(float(values["request_spacing_seconds"]), deadline=metadata_deadline.get())
         doctolib = DoctolibClient(
             user_agent=settings.user_agent,
             before_request=before_request,

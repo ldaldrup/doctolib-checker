@@ -1,3 +1,4 @@
+import { applyFieldErrors, formatDateTime, formatDate, formatInterval } from '/assets/js/ui.js';
 import { contentControls, CONTENT_PRESETS, readContent, previewText } from '/assets/js/message-content.js';
 import { renderChannels } from "/assets/js/pages/channels.js";
 import { deliveryNotice } from "/assets/js/delivery-view.js";
@@ -9,6 +10,8 @@ import { jobStatus, checkedAgo, renderJobList, compactDuration, nextCheck, nextC
 import {renderActivity, shouldRefreshActivity} from '/assets/js/pages/activity.js';
 
 const lines = [];
+const output = document.querySelector('#results');
+if (document.documentElement.dataset.contracts !== 'failed') output.textContent = '';
 const assert = (condition, message = 'Assertion failed') => { if (!condition) throw new Error(message); };
 const equal = (actual, expected) => assert(JSON.stringify(actual) === JSON.stringify(expected), `${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
 const t = number => `2026-10-01T10:00:${String(number).padStart(2, '0')}Z`;
@@ -20,8 +23,10 @@ const run = (outcome, results, extras = {}) => ({id: 'r', job_id: 'j', search_re
 const settings = {minimum_poll_interval_seconds: 300, time_zone: 'Europe/Berlin', telegram_configured: true};
 const draft = {...job, target_urls: job.targets.map(item => item.booking_url)};
 async function test(name, fn) {
+  output.textContent += `RUN ${name}\n`;
   try { await fn(); lines.push(`PASS ${name}`); }
-  catch (error) { lines.push(`FAIL ${name}: ${error.stack || error.message}`); }
+  catch (error) { document.documentElement.dataset.contracts = 'failed'; lines.push(`FAIL ${name}: ${error.stack || error.message}`); }
+  output.textContent += `${lines.at(-1)}\n`;
 }
 async function rejects(fn, kind) {
   try { await fn(); throw new Error('Expected rejection'); }
@@ -70,8 +75,8 @@ await test('delivery notices separate dispatcher failure and recovery from check
 });
 await test('next-check tooltip shows scheduled datetime and job timezone', () => {
   const scheduled = {...job, next_check_at: '2026-10-01T10:05:01Z'};
-  equal(nextCheckTitle(scheduled), 'Scheduled next check: 01.10.2026, 12:05:01 (Europe/Berlin)');
-  equal(nextCheckTitle({...scheduled, time_zone: 'UTC'}), 'Scheduled next check: 01.10.2026, 10:05:01 (UTC)');
+  equal(nextCheckTitle(scheduled), 'Scheduled next check: 01 Oct 2026, 12:05:01 (Europe/Berlin)');
+  equal(nextCheckTitle({...scheduled, time_zone: 'UTC'}), 'Scheduled next check: 01 Oct 2026, 10:05:01 (UTC)');
   equal(nextCheckTitle({...scheduled, status: 'paused'}), 'No check scheduled while paused.');
   equal(nextCheckTitle({...scheduled, next_check_at: 'invalid'}), 'Next check time unavailable.');
   const state = {jobs: [scheduled], filter: 'all', intervalFilter: 'all', load: {jobs: {phase: 'loaded'}, status: {phase: 'loaded'}}, status: {worker_alive: true}, views: new Map()};
@@ -79,10 +84,10 @@ await test('next-check tooltip shows scheduled datetime and job timezone', () =>
 });
 await test('compact next-check countdown uses two adjacent units and reports scheduler blockers', () => {
   const now = Date.parse('2026-10-01T10:00:00Z');
-  for (const [seconds, text] of [[301, '5m1s'], [3723, '1h2m'], [10800, '3h'], [86461, '1d'], [86400 + 7200, '1d2h'], [59, '59s']]) equal(compactDuration(seconds), text);
+  for (const [seconds, text] of [[301, '5m 1s'], [3723, '1h 2m'], [10800, '3h'], [86461, '1d'], [86400 + 7200, '1d 2h'], [59, '59s']]) equal(compactDuration(seconds), text);
   const state = {load: {status: {phase: 'loaded'}}, status: {worker_alive: true}, views: new Map()};
   const scheduled = {...job, next_check_at: new Date(now + 301000).toISOString()};
-  equal(nextCheck(scheduled, state, now), '5m1s'); equal(nextCheck(scheduled, state, now + 302000), 'due');
+  equal(nextCheck(scheduled, state, now), '5m 1s'); equal(nextCheck(scheduled, state, now + 302000), 'due');
   equal(nextCheck({...scheduled, status: 'paused'}, state, now), 'paused');
   state.status.worker_alive = false; equal(nextCheck(scheduled, state, now), 'blocked');
   state.status.worker_alive = true; state.views.set(job.id, {running: true}); equal(nextCheck(scheduled, state, now), 'checking');
@@ -399,7 +404,7 @@ await test('card check requests survive unavailable worker, complete once while 
     await waitUntil(() => !card().querySelector('[data-action="check-now"]').disabled);
     card().querySelector('[data-action="check-now"]').click();
     await waitUntil(() => card().querySelector('.job-check-feedback')?.textContent.includes('cooldown ends'));
-    doc.querySelector('[data-action="cancel-edit"]').click(); card().querySelector('[data-action="edit"]').click();
+    doc.querySelector('[data-action="cancel-edit"]').click(); await waitUntil(()=>doc.querySelector('#confirm-dialog').open); doc.querySelector('#confirm-dialog [value="confirm"]').click(); await waitUntil(()=>!doc.querySelector('#confirm-dialog').open && doc.querySelector('#job-name').value===''); card().querySelector('[data-action="edit"]').click();
     await waitUntil(() => doc.querySelector('#job-name')?.value === saved.name);
     editControl(doc, win, '#job-name', 'Unsaved manual draft');
     const horizon = doc.querySelector('#horizon-days'); horizon.value = '16'; horizon.dispatchEvent(new win.Event('input', {bubbles: true}));
@@ -659,6 +664,15 @@ await test('channel create lost response replays original credentials and key, t
     doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
     await waitUI(()=>!doc.querySelector('#channel-form'));
     equal((await api.listChannels()).items.find(item=>item.id===created.id).name,'My preserved channel draft');
+    const beforeUpdateFetch=win.fetch; let uncertainUpdates=0;
+    win.fetch=async(path,options)=>{const response=await beforeUpdateFetch(path,options);if(path===`/api/v1/channels/${created.id}`&&options?.method==='PATCH'){uncertainUpdates++;blockChannelReads=true;return new win.Response('{}',{status:503,headers:{'Content-Type':'application/json'}});}return response;};
+    doc.querySelector(`[data-channel-id="${created.id}"] [data-action="edit-channel"]`).click(); editControl(doc,win,'#channel-name','Accepted update with lost response');
+    doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true})); await waitUI(()=>doc.querySelector('[data-action="refetch-channel"]'));
+    doc.querySelector('[data-action="cancel-channel"]').click(); assert(doc.querySelector('#channel-form')&&!doc.querySelector('#confirm-dialog').open,'Uncertain write abandoned before fresh read');
+    equal(uncertainUpdates,1);blockChannelReads=false;doc.querySelector('[data-action="refetch-channel"]').click();await waitUI(()=>doc.querySelector('[data-action="use-server-channel"]'));
+    doc.querySelector('[data-action="use-server-channel"]').click();await waitUI(()=>doc.querySelector('#confirm-dialog').open);doc.querySelector('#confirm-dialog [value="confirm"]').click();await waitUI(()=>doc.querySelector('#channel-name').value==='Accepted update with lost response'&&!doc.querySelector('#channel-name').matches(':disabled')&&!doc.querySelector('#confirm-dialog').open);
+    doc.querySelector('[data-action="cancel-channel"]').click();await waitUI(()=>!doc.querySelector('#channel-form'));equal(uncertainUpdates,1);win.fetch=beforeUpdateFetch;
+
     doc.querySelector(`[data-channel-id="${created.id}"] [data-action="preview-channel"]`).click();
     await waitUI(()=>doc.querySelector('.channel-preview'));
     assert(doc.querySelector('.channel-preview').textContent.includes('Example <Practitioner>'));
@@ -731,7 +745,7 @@ await test('Settings creates ntfy and webhook channels, tests saved destinations
       await waitUI(()=>doc.querySelector('.channel-preview'));assert(doc.querySelector('.channel-preview').textContent.includes('Example'));
       win.fetch=previewFetch;equal(doc.querySelector('#channel-name').value,`${name} unsaved`);assert(!doc.querySelector('#channel-name').matches(':disabled'));
       assert(!doc.querySelector('.channel-preview').textContent.includes('private-topic'));
-      doc.querySelector('[data-action="cancel-channel"]').click();
+      doc.querySelector('[data-action="cancel-channel"]').click(); await waitUI(()=>!doc.querySelector('#channel-form') || doc.querySelector('#confirm-dialog').open); if (doc.querySelector('#confirm-dialog').open) doc.querySelector('#confirm-dialog [value="confirm"]').click();
       doc.querySelector('[data-action="close-channel-preview"]').click();
       doc.querySelector(`[data-channel-id="${saved.id}"] [data-action="test-channel"]`).click();
       await waitUI(()=>doc.querySelector(`[data-channel-id="${saved.id}"]`).textContent.includes('Test queued'));
@@ -988,5 +1002,94 @@ await test('saved target repair updates identity, stays paused, reconciles confl
     equal(calls, 4);
   } finally { frame.remove(); await provider('agenda_id=1234'); await remove(saved.id); }
 });
-document.querySelector('#results').textContent = lines.join('\n');
-document.documentElement.dataset.contracts = lines.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';
+await test('shared field errors preserve help IDs, normalize dates and keep passive focus', () => {
+  equal(formatInterval(300), '5 min'); equal(formatInterval(null), 'Unknown');
+  equal(formatDate('2026-10-01'), '01 Oct 2026'); equal(formatDate('2026-02-30'), 'Unknown date');
+  equal(formatDateTime('invalid', 'UTC'), 'Unknown time');
+  assert(formatDateTime(t(0), 'UTC').includes('10:00 (UTC)'));
+  assert(formatDateTime(t(0), 'Europe/Berlin').includes('12:00 (Europe/Berlin)'));
+  const form = document.createElement('form'); form.id = 'error-proof';
+  form.innerHTML = '<div class="field"><input name="target_urls" aria-describedby="metadata-first"><input name="target_urls" aria-describedby="metadata-second"></div><p id="error-proof-summary" hidden></p>';
+  document.body.append(form);
+  try {
+    const inputs = form.querySelectorAll('input'), summary = form.querySelector('p'); inputs[0].focus();
+    applyFieldErrors(form, {message:'Bad target', fields:{'target_urls.1':'Correct second URL'}}, summary, {}, {focus:false});
+    equal(document.activeElement, inputs[0]); equal(inputs[1].getAttribute('aria-invalid'), 'true');
+    assert(inputs[1].getAttribute('aria-describedby').includes('metadata-second'));
+    applyFieldErrors(form, {message:'Bad target', fields:{'target_urls.1':'Correct second URL'}}, summary);
+    equal(document.activeElement, inputs[1]);
+    applyFieldErrors(form, null, summary); equal(inputs[1].getAttribute('aria-describedby'), 'metadata-second');
+    assert(!inputs[1].hasAttribute('aria-invalid') && summary.hidden);
+  } finally { form.remove(); }
+});
+await test('part01 protects actual job and credential drafts, focus and rejected mutations', async () => {
+  const saved = await create({...draft, name:'Part01 focus job', target_urls:[fixtureBooking], telegram_enabled:false});
+  const frame = document.createElement('iframe'); frame.src='/#jobs'; document.body.append(frame); let second;
+  try {
+    await waitUI(()=>frame.contentDocument?.querySelector(`[data-job-id="${saved.id}"]`) && frame.contentDocument?.querySelector('#job-name'));
+    const doc=frame.contentDocument, win=frame.contentWindow;
+    const unload = () => { const event=new win.Event('beforeunload',{cancelable:true}); win.dispatchEvent(event); return event.defaultPrevented; };
+    const choose = async value => { await waitUI(()=>doc.querySelector('#confirm-dialog').open); const closed=new Promise(resolve=>doc.querySelector('#confirm-dialog').addEventListener('close',resolve,{once:true})); doc.querySelector(`#confirm-dialog [value="${value}"]`).click(); await closed; };
+    assert(!unload(),'Untouched job prompted unload');
+    editControl(doc,win,'#job-name','Keep my draft'); assert(unload(),'Changed job not protected');
+    doc.querySelector('.header-new').click(); await choose('cancel'); equal(doc.querySelector('#job-name').value,'Keep my draft');
+    doc.querySelector('.header-new').click(); await choose('confirm'); await waitUI(()=>doc.querySelector('#job-name').value===''); assert(!unload());
+    doc.querySelector(`[data-job-id="${saved.id}"] [data-action="edit"]`).click(); await waitUI(()=>doc.querySelector('#job-name').value==='Part01 focus job'); assert(!unload());
+    doc.querySelector('#content-inherit').focus(); doc.querySelector('#content-inherit').click(); equal(doc.activeElement.id,'content-inherit'); assert(unload());
+    doc.querySelector('[data-action="cancel-edit"]').click(); await choose('confirm'); await waitUI(()=>doc.querySelector('#job-name').value==='');
+    editControl(doc,win,'#job-name','Invalid target'); editControl(doc,win,'#target-0','not a booking URL');
+    doc.querySelector('#job-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>doc.querySelector('#target-0').getAttribute('aria-invalid')==='true');
+    equal(doc.activeElement.id,'target-0'); assert(doc.querySelector('#target-0').getAttribute('aria-describedby').includes('target-meta-0'));
+    equal(doc.querySelector('#toast').dataset.tone,'error');
+    doc.querySelector('a[href="#settings"]').click(); await waitUI(()=>doc.querySelector('#smtp-form') && doc.querySelector('[data-action="new-channel"]'));
+    doc.querySelector('[data-action="new-channel"]').click(); await waitUI(()=>doc.querySelector('#channel-name')); equal(doc.activeElement.id,'channel-name');
+    // Job draft is retained across navigation; discard it separately before testing clean controller unload.
+    doc.querySelector('a[href="#jobs"]').click(); await waitUI(()=>doc.querySelector('#job-form'));
+    doc.querySelector('.header-new').click(); await choose('confirm'); await waitUI(()=>doc.querySelector('#job-name').value==='');
+    doc.querySelector('a[href="#settings"]').click(); await waitUI(()=>doc.querySelector('#channel-name')); assert(!unload(),'Opening clean channel caused unload warning');
+    editControl(doc,win,'#channel-name','Unsaved channel'); assert(unload());
+    doc.querySelector('[data-action="cancel-channel"]').click(); await choose('cancel'); equal(doc.querySelector('#channel-name').value,'Unsaved channel');
+    doc.querySelector('[data-action="cancel-channel"]').click(); await choose('confirm'); await waitUI(()=>!doc.querySelector('#channel-form')); assert(!unload());
+    const secret=doc.querySelector('#smtp-password-action'); secret.value='replace'; secret.dispatchEvent(new win.Event('input',{bubbles:true})); assert(unload(),'Secret action not protected');
+    secret.value='keep'; secret.dispatchEvent(new win.Event('input',{bubbles:true})); assert(!unload(),'Reverted secret remained dirty');
+    const recovery=doc.querySelector('[name="recover_failed"]'); recovery.checked=true; recovery.dispatchEvent(new win.Event('input',{bubbles:true})); assert(unload());
+    doc.querySelector('[data-action="smtp-cancel"]').click(); await choose('confirm'); await waitUI(()=>!doc.querySelector('[name="recover_failed"]').checked); assert(!unload());
+    const fetch=win.fetch.bind(win); win.fetch=async (url,options)=>options?.method==='POST' && String(url).includes('/check-now') ? new win.Response(JSON.stringify({detail:'Rejected check'}),{status:422,headers:{'Content-Type':'application/json'}}) : fetch(url,options);
+    doc.querySelector('a[href="#jobs"]').click(); await waitUI(()=>doc.querySelector(`[data-job-id="${saved.id}"] [data-action="check-now"]`));
+    doc.querySelector(`[data-job-id="${saved.id}"] [data-action="check-now"]`).click(); await waitUI(()=>doc.querySelector('#toast').textContent.includes('Rejected check')); equal(doc.querySelector('#toast').dataset.tone,'error');
+    doc.querySelector('a[href="#settings"]').click(); await waitUI(()=>doc.querySelector('#smtp-host'));
+    let statusReads=0; win.fetch=async (url,options)=>{const response=await fetch(url,options); if(String(url).includes('/status')) statusReads++; return response;};
+    doc.querySelector('#smtp-host').focus(); const hostValue=doc.querySelector('#smtp-host').value;
+    doc.querySelector('#smtp-host').setSelectionRange(0,Math.min(3,hostValue.length));
+    const priorReads=statusReads; doc.dispatchEvent(new win.Event('visibilitychange')); await waitUI(()=>statusReads>priorReads); await new Promise(resolve=>setTimeout(resolve,100));
+    equal(doc.activeElement.id,'smtp-host'); equal(doc.activeElement.selectionStart,0);
+    doc.querySelector('#smtp-form [name="enabled"]').focus(); const checkboxReads=statusReads; doc.dispatchEvent(new win.Event('visibilitychange')); await waitUI(()=>statusReads>checkboxReads); await new Promise(resolve=>setTimeout(resolve,100)); equal(doc.activeElement.name,'enabled'); equal(doc.activeElement.closest('form')?.id,'smtp-form');
+    second=await api.createChannel({type:'telegram',name:'Part01 second channel',enabled:true,token_action:'replace',bot_token:'12345:synthetic_fixture_token_for_ui_only',chat_action:'replace',chat_id:'-100000002'},crypto.randomUUID());
+    doc.dispatchEvent(new win.Event('visibilitychange')); await waitUI(()=>doc.querySelector(`[data-channel-id="${second.id}"] [data-action="edit-channel"]`));
+    const action=()=>doc.querySelector(`[data-channel-id="${second.id}"] [data-action="edit-channel"]`); action().focus();
+    const channelReads=statusReads; doc.dispatchEvent(new win.Event('visibilitychange')); await waitUI(()=>statusReads>channelReads); await new Promise(resolve=>setTimeout(resolve,100));
+    equal(doc.activeElement.closest('[data-channel-id]')?.dataset.channelId,second.id);
+    action().click(); equal(doc.activeElement.id,'channel-name'); assert(!unload());
+    doc.querySelector('[data-action="cancel-channel"]').click(); equal(doc.activeElement.closest('[data-channel-id]')?.dataset.channelId,second.id);
+    const spacing=doc.querySelector('#request-spacing').value;
+    win.fetch=async (url,options)=>{if(options?.method==='PUT'&&String(url).endsWith('/settings')) {await new Promise(resolve=>setTimeout(resolve,100));return new win.Response(JSON.stringify({detail:[{loc:['body','request_spacing_seconds'],msg:'Use valid spacing'}]}),{status:422,headers:{'Content-Type':'application/json'}});} return fetch(url,options);};
+    editControl(doc,win,'#request-spacing',String(Number(spacing)+1)); doc.querySelector('#smtp-host').focus();
+    await waitUI(()=>!doc.querySelector('#settings-form-error').hidden); equal(doc.activeElement.id,'smtp-host');
+    equal(doc.querySelector('#request-spacing').getAttribute('aria-invalid'),'true'); editControl(doc,win,'#request-spacing',spacing); assert(!unload());
+    win.fetch=async(url,options)=>options?.method==='PATCH'&&String(url).includes('/channels/') ? new win.Response(JSON.stringify({detail:[{loc:['body','name'],msg:'Correct channel name'}]}),{status:422,headers:{'Content-Type':'application/json'}}) : fetch(url,options);
+    action().click(); editControl(doc,win,'#channel-name','Rejected channel name'); doc.querySelector('#channel-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>doc.querySelector('#channel-name')?.getAttribute('aria-invalid')==='true'); equal(doc.activeElement.id,'channel-name');
+    doc.querySelector('[data-action="cancel-channel"]').click(); await choose('confirm'); await waitUI(()=>!doc.querySelector('#channel-form'));
+    editControl(doc,win,'#smtp-port','70000'); doc.querySelector('#smtp-form').dispatchEvent(new win.Event('submit',{bubbles:true,cancelable:true}));
+    await waitUI(()=>doc.querySelector('#smtp-port')?.getAttribute('aria-invalid')==='true'); equal(doc.activeElement.id,'smtp-port');
+    doc.querySelector('[data-action="smtp-cancel"]').click(); await choose('confirm'); await waitUI(()=>doc.querySelector('#smtp-port').value!=='70000');
+    const narrow=doc.createElement('div'); narrow.style.width='228px';
+    narrow.innerHTML='<span class="badge badge-warning"><span class="badge-dot"></span>Acceptance unknown; automatic resend blocked</span><span class="slot-pill">09 Oct 2026, 05:00 (America/Argentina/Buenos_Aires)</span>';
+    doc.body.append(narrow);
+    try { for(const label of narrow.children) {assert(label.getBoundingClientRect().width<=230,'Long label exceeds narrow container');assert(label.scrollWidth<=label.clientWidth,'Long label text clipped');} } finally {narrow.remove();}
+
+  } finally { frame.remove(); if(second?.id) await api.deleteChannel(second.id,second.edit_version); await remove(saved.id); }
+});
+document.documentElement.dataset.contracts = document.documentElement.dataset.contracts === 'failed' || lines.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';
+output.textContent += `DONE ${document.documentElement.dataset.contracts}\n`;

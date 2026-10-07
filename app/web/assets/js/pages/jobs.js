@@ -1,7 +1,7 @@
 import { contentControls, defaultContent, contentSummary } from "../message-content.js";
 import { renderDeliveryNotice } from "../delivery-view.js";
-import { badge, escapeHtml as h, formatGermanDate, formatSlot, icon } from "../ui.js";
-const pollInterval = seconds => seconds % 3600 === 0 ? `${seconds / 3600} hr` : seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} sec`;
+import { badge, escapeHtml as h, formatDate, formatDateTime, formatInterval, formatSlot, icon } from "../ui.js";
+const pollInterval = formatInterval;
 
 export function emptyDraft(settings) {
   return { name: "", target_urls: [""], interval_seconds: settings.default_interval_seconds,
@@ -18,7 +18,7 @@ function deliveryLabel(channel, job) {
   const labels = {held: "Held until quiet hours end", waiting_for_fresh_check: "Waiting for a fresh check",
     needs_manual_check: "New manual check needed", cancelled: "Cancelled"};
   if (channel.delivery_status === "held" && channel.quiet_until) {
-    try { return `Held until ${new Intl.DateTimeFormat("de-DE", {timeZone: job.time_zone, dateStyle: "short", timeStyle: "short"}).format(new Date(channel.quiet_until))} (${job.time_zone})`; }
+    try { return `Held until ${formatDateTime(channel.quiet_until, job.time_zone)}`; }
     catch { return labels.held; }
   }
   if (labels[channel.delivery_status]) return labels[channel.delivery_status];
@@ -52,7 +52,7 @@ export function renderJobCounts(state) {
     const view = viewFor(state, job);
     return view && !view.stale && !view.error && view.state !== "unknown";
   });
-  return [["all", "All", complete(state) ? jobs.length : "—"], ["active", "Enabled", count(job => job.status === "active")],
+  return [["all", "All", complete(state) ? jobs.length : "—"], ["active", "Monitoring", count(job => job.status === "active")],
     ["paused", "Paused", count(job => job.status === "paused")], ["slot", "Slot", viewsResolved ? jobs.filter(job => viewFor(state, job)?.detected).length : "—"]]
     .map(([key, label, total]) => `<button type="button" data-action="filter" data-filter="${key}" aria-pressed="${state.filter === key}" class="${key === "slot" ? "filter-slot" : ""}">${key === "slot" ? '<span class="filter-slot-dot" aria-hidden="true"></span>' : ""}${label} (${total})</button>`).join("");
 }
@@ -65,7 +65,7 @@ export function compactDuration(seconds) {
   return units.slice(index, index + 2).map(([size, suffix], offset) => {
     const amount = Math.floor((offset ? total % units[index][0] : total) / size);
     return amount ? `${amount}${suffix}` : "";
-  }).join("");
+  }).filter(Boolean).join(" ");
 }
 
 export function nextCheck(job, state, now = Date.now()) {
@@ -82,11 +82,7 @@ export function nextCheckTitle(job) {
   const due = Date.parse(job.next_check_at || "");
   if (job.status === "paused") return "No check scheduled while paused.";
   if (!Number.isFinite(due)) return "Next check time unavailable.";
-  const zone = job.time_zone || "Europe/Berlin";
-  try {
-    const formatted = new Intl.DateTimeFormat("de-DE", {timeZone: zone, day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false}).format(new Date(due));
-    return `Scheduled next check: ${formatted} (${zone})`;
-  } catch { return `Scheduled next check: ${new Date(due).toISOString()} (UTC)`; }
+  return `Scheduled next check: ${formatDateTime(due, job.time_zone || "Europe/Berlin", {seconds: true})}`;
 }
 
 export function checkedAgo(value, now = Date.now()) {
@@ -150,6 +146,7 @@ export function jobStatus(job, state, now = Date.now()) {
   if ((job.current_run?.outcome === "yielded" && job.current_run.search_revision === job.search_revision) || view?.yielded) return {label: "Continuation queued", tone: "running", detail: "Awaiting the next worker turn"};
   if (view?.state === "error") return {label: "Check failed", tone: "warning", detail: "Targets could not be checked"};
   if (view?.state === "partial") return {label: "Check incomplete", tone: "warning", detail: "Some target results are missing or failed"};
+  if (view?.running) return {label: "Checking", tone: "running", detail: checkedAgo(view?.checkedAt, now) || "Awaiting results"};
   const labels = {unknown: "Loading check history…", never: "Awaiting first check", awaiting: "Awaiting a fresh check", running: "Check in progress", no_availability: "Awaiting a check", available: "Historical slot detection"};
   return {label: "Monitoring", tone: "running", detail: checkedAgo(view?.checkedAt, now) || labels[view?.state || "unknown"]};
 }
@@ -182,7 +179,7 @@ function card(job, state) {
   const checkFeedback = checkIntentFeedback(job, state);
   const queuedCheck = job.check_intent?.status === "queued";
   const canPromoteQuietCheck = queuedCheck && job.check_intent?.triggered_by === "quiet_hours";
-  const range = job.date_mode === "custom" ? `${h(formatGermanDate(job.earliest_date))} – ${h(formatGermanDate(job.latest_date))}` : `Next ${h(job.horizon_days)} days`;
+  const range = job.date_mode === "custom" ? `${h(formatDate(job.earliest_date))} – ${h(formatDate(job.latest_date))}` : `Next ${h(job.horizon_days)} days`;
   return `<article class="panel job-card ${detected ? "job-card-last-detected" : ""}" data-job-id="${h(job.id)}" aria-busy="${Boolean(pending)}">
     ${detected ? `<div class="job-hero"><span class="job-hero-label">${icon("bellActive")} Historical slot detection</span><div class="job-hero-actions"><span class="slot-pill">${icon("calendar")} ${h(formatSlot(view.slot.earliest_slot, job.time_zone))}</span>${view.slot.booking_url ? `<a class="button button-primary button-small" href="${h(view.slot.booking_url)}" target="_blank" rel="noopener noreferrer" aria-label="Open detected target on Doctolib"><span>Open on Doctolib</span>${icon("external")}</a>` : ""}</div></div>` : ""}
     <div class="job-body"><div class="job-top"><div class="job-summary"><div class="job-title"><h2>${h(job.name)}</h2><span class="job-count">${list.length} target${list.length === 1 ? "" : "s"}</span></div>
@@ -195,7 +192,7 @@ function card(job, state) {
       ${state.checkErrors?.has(job.id) ? `<p class="notice notice-warning" role="status">${h(state.checkErrors.get(job.id))}</p>` : ""}
       ${(job.notification_channels || []).length ? `<ul class="channel-deliveries" aria-label="Notification destination status">${job.notification_channels.map(channel => `<li>${h(channel.name)}: ${h(deliveryLabel(channel, job))}${channel.error_code ? ` (${h(channel.error_code)})` : ""}</li>`).join("")}</ul>` : ""}
       ${job.quiet_hours_enabled ? `<p class="job-quiet-hours">Quiet hours: ${h(job.quiet_hours_start)}–${h(job.quiet_hours_end)} (${h(job.time_zone)}). Monitoring continues.</p>` : ""}
-      <div class="job-meta"><span>Range: <strong>${range}</strong></span><span class="meta-dot">•</span><span>Interval: <strong>${h(compactDuration(job.interval_seconds))}</strong> <span title="${h(nextCheckTitle(job))}">(next: ${h(nextCheck(job, state))})</span></span><span class="meta-dot">•</span><span>Content: <strong>${job.message_content == null ? "Inherited" : "Override"} · ${h(job.effective_message_content?.preset || job.message_content?.preset || state.settings?.message_content?.preset || "standard")}</strong></span><span class="meta-dot">•</span><span>Alert: <strong>${job.telegram_enabled ? h((job.notification_channels || []).map(channel => channel.name).join(", ") || "No selected channel") : "Off"}</strong></span></div>
+      <div class="job-meta"><span>Range: <strong>${range}</strong></span><span class="meta-dot">•</span><span>Interval: <strong>${h(formatInterval(job.interval_seconds))}</strong> <span title="${h(nextCheckTitle(job))}">(next: ${h(nextCheck(job, state))})</span></span><span class="meta-dot">•</span><span>Content: <strong>${job.message_content == null ? "Inherited" : "Override"} · ${h(job.effective_message_content?.preset || job.message_content?.preset || state.settings?.message_content?.preset || "standard")}</strong></span><span class="meta-dot">•</span><span>Alert: <strong>${job.telegram_enabled ? h((job.notification_channels || []).map(channel => channel.name).join(", ") || "No selected channel") : "Off"}</strong></span></div>
       ${targetDetails(job, state)}
       <div class="job-actions"><a class="button button-quiet" href="#activity?job=${encodeURIComponent(job.id)}" aria-label="Activity for ${h(job.name)}">${icon("list")}<span class="action-label">Activity</span></a>${[["check-now", "bolt", job.status === "paused" ? "Check once" : "Check now"], ...(job.status === "paused" && ["queued", "running"].includes(job.check_intent?.status) ? [["pause", "pause", "Stop check"]] : []), [job.status === "paused" ? "resume" : "pause", job.status === "paused" ? "play" : "pause", job.status === "paused" ? "Resume" : "Pause"], ["edit", "edit", "Edit"], ["delete", "trash", "Delete"]].map(([action, symbol, label]) => `<button class="button button-quiet" type="button" data-action="${action}" aria-label="${label} ${h(job.name)}" ${pending || (action === "edit" && state.uncertainCreate) || (action === "check-now" && queuedCheck && !canPromoteQuietCheck) ? "disabled" : ""}>${icon(symbol)}<span class="action-label">${label}</span></button>`).join("")}</div>
     </div></article>`;
@@ -248,8 +245,8 @@ function form(state) {
     <div class="form-section"><span class="field-label">Appointment options</span><label class="checkbox-line"><span class="checkbox-copy">${icon("video")} Telehealth appointments</span><input name="telehealth" type="checkbox" ${draft.telehealth ? "checked" : ""}></label></div>
     <div class="form-section quiet-hours-section"><span class="field-label">Quiet hours</span><label class="checkbox-line"><span>Delay appointment alerts during quiet hours</span><input name="quiet_hours_enabled" type="checkbox" ${draft.quiet_hours_enabled ? "checked" : ""}></label><div class="field-row">${[["quiet-hours-start", "Start"], ["quiet-hours-end", "End"]].map(([id, label]) => `<div class="field"><label for="${id}">${label} (local time)</label><input class="input" id="${id}" name="${id === "quiet-hours-start" ? "quiet_hours_start" : "quiet_hours_end"}" type="time" value="${h(draft[id === "quiet-hours-start" ? "quiet_hours_start" : "quiet_hours_end"] || (id === "quiet-hours-start" ? "22:00" : "07:00"))}" required aria-describedby="quiet-hours-preview"></div>`).join("")}</div><p class="muted" id="quiet-hours-preview" role="status">Quiet hours use ${h(draft.time_zone || state.settings.time_zone)}. Monitoring continues; held alerts release only after a fresh confirmation.</p></div>
     <div class="form-section"><span class="field-label">Notifications</span><label class="checkbox-line"><span class="checkbox-copy">${icon("send")} Send matching appointment alerts</span><input name="telegram_enabled" type="checkbox" ${draft.telegram_enabled ? "checked" : ""}></label><fieldset id="job-channel-options"><legend>Selected notification channels</legend>${(state.channels || []).map(channel => `<label class="checkbox-line"><span>${h(channel.name)} · ${h({telegram: "Telegram", ntfy: "ntfy", webhook: "HTTPS webhook", email:'Email'}[channel.type] || "Telegram")}${channel.enabled && channel.usable ? "" : channel.enabled ? " (incomplete)" : " (disabled)"}</span><input name="notification_channel_ids" value="${h(channel.id)}" type="checkbox" ${(draft.notification_channel_ids || []).includes(channel.id) ? "checked" : ""}></label>`).join("")}${state.channels === null ? '<p>Loading notification channels…</p>' : !(state.channels || []).length ? '<p class="muted">Add channels in Settings. An empty selection sends no alerts.</p>' : ""}</fieldset><p class="muted">Disabling cancels unsent appointment alerts. Reenabling alerts only on future episodes; unchanged appointments stay silent.</p></div>
-    <div class="form-section"><label class="checkbox-line"><span>Inherit message content from Settings</span><input name="content-inherit" type="checkbox" ${draft.message_content == null ? 'checked' : ''}></label><p class="muted">${draft.message_content == null ? `Inherited: ${h(state.settings.message_content?.preset || 'standard')} preset${state.settings.message_content?.silent ? ', silent' : ''}. Saved Settings changes apply to future events.` : 'Explicit job override. Settings changes will not change this job’s content.'}</p>${draft.message_content == null ? '' : contentControls(draft.message_content || state.settings.message_content || defaultContent(), 'job-content')}</div>
-    </fieldset><p id="job-form-error" class="form-error" role="alert" ${state.jobError ? "" : "hidden"}>${state.jobError ? h(message(state.jobError)) : ""}</p>
+    <div class="form-section"><label class="checkbox-line"><span>Inherit message content from Settings</span><input id="content-inherit" name="content-inherit" type="checkbox" ${draft.message_content == null ? 'checked' : ''}></label><p class="muted">${draft.message_content == null ? `Inherited: ${h(state.settings.message_content?.preset || 'standard')} preset${state.settings.message_content?.silent ? ', silent' : ''}. Saved Settings changes apply to future events.` : 'Explicit job override. Settings changes will not change this job’s content.'}</p>${draft.message_content == null ? '' : contentControls(draft.message_content || state.settings.message_content || defaultContent(), 'job-content')}</div>
+    </fieldset><p id="job-form-error" class="form-error" role="alert" tabindex="-1" ${state.jobError ? "" : "hidden"}>${state.jobError ? h(message(state.jobError)) : ""}</p>
     ${state.uncertainCreate ? '<div class="notice notice-warning"><span>The saved create request is unresolved. Retry uses the same request and key; keep this page open until its result is confirmed.</span><button class="text-button" type="button" data-action="refresh">Refresh</button><button class="text-button" type="button" data-action="retry-create">Retry saved request</button></div>' : ""}
     ${state.jobConflictBlocked && !state.jobConflict ? '<div class="notice notice-warning"><span>The job changed on the server. Your draft is preserved; fetch its latest version to reconcile.</span><button class="text-button" type="button" data-action="refetch-job-conflict">Fetch latest version</button></div>' : ""}
     ${state.jobConflict ? `<div class="notice notice-warning" role="status"><div><p>This job changed on the server. Your draft is preserved. Choose a value for each conflicting field, then review the merged form before saving.</p>${Object.entries(updateConflictFields(state)).map(([key, value]) => `<fieldset><legend>${h(key.replaceAll("_", " "))}</legend><label><input type="radio" name="job-reconcile-${h(key)}" value="server"> Server: ${h(key === "message_content" ? contentSummary(value.server) : JSON.stringify(value.server))}</label><label><input type="radio" name="job-reconcile-${h(key)}" value="draft"> My draft: ${h(key === "message_content" ? contentSummary(value.draft) : JSON.stringify(value.draft))}</label></fieldset>`).join("")}<button class="text-button" type="button" data-action="reconcile-job">Review merged draft</button></div></div>` : ""}
@@ -258,6 +255,6 @@ function form(state) {
 
 export function renderJobs(state) {
   const intervals = [...new Set((state.jobs || []).map(job => job.interval_seconds))].sort((a, b) => a - b);
-  return `<div class="page-heading"><div><h1>Jobs</h1><p>Monitor appointment availability from saved Doctolib booking links.</p></div><div class="page-actions"><button class="button button-primary" type="button" data-action="new-job" ${state.settings && complete(state) && !state.uncertainCreate ? "" : "disabled"}>${icon("plus")} New Job</button></div></div>
+  return `<div class="page-heading"><div><h1>Jobs</h1><p>Monitor appointment availability from saved Doctolib booking links.</p></div></div>
     <div id="delivery-status">${renderDeliveryNotice(state)}</div><div id="jobs-load-state">${renderJobsLoadState(state)}</div><div class="panel filter-toolbar"><div class="search-wrap">${icon("search")}<label class="visually-hidden" for="job-search">Filter jobs</label><input class="input" id="job-search" type="search" value="${h(state.query)}" placeholder="Filter by job, practitioner, practice, or motive"></div><div class="filter-controls"><div id="job-counts" class="filter-tabs" role="group" aria-label="Filter by job status">${renderJobCounts(state)}</div><label class="visually-hidden" for="interval-filter">Filter by polling interval</label><select class="select interval-filter" id="interval-filter"><option value="all">All intervals</option>${intervals.map(seconds => `<option value="${seconds}" ${state.intervalFilter === String(seconds) ? "selected" : ""}>${h(pollInterval(seconds))}</option>`).join("")}</select></div></div><div class="jobs-layout"><div class="jobs-list" id="job-list">${renderJobList(state)}</div>${form(state)}</div>`;
 }

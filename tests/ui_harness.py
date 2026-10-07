@@ -1,6 +1,7 @@
 """Disposable local browser harness; never included in the application image.
 
-Run with PYTHONPATH=. python tests/ui_harness.py --directory /tmp/<test-owned-dir>.
+Run from the repo root with .venv/bin/python -m tests.ui_harness
+--directory /tmp/<fresh-test-owned-dir> --port <unused-port>.
 Only a loopback server is opened. Upstream metadata/checks use existing fixtures.
 Control faults with control.json in the test-owned directory. Stop the process
 and remove only that directory after testing.
@@ -100,7 +101,16 @@ def create_harness(directory):
     def contracts():
         return HTMLResponse('<!doctype html><html lang="en"><title>UI contracts</title>'
                             '<h1>Native browser contracts</h1><pre id="results">Running…</pre>'
-                            f'<script type="module" src="/__test/contracts.js?v={Path(__file__).with_name("ui_contracts.js").stat().st_mtime_ns}"></script></html>')
+                            '''<script>
+function reportFailure(message) {
+  document.documentElement.dataset.contracts = 'failed';
+  document.querySelector('#results').textContent += '\\nFAIL browser: ' + message + '\\n';
+}
+window.addEventListener('error', event => reportFailure(event.message || 'Script failed to load'));
+window.addEventListener('unhandledrejection', event => reportFailure(event.reason?.message || String(event.reason)));
+</script>'''
+                            f'<script type="module">import("/__test/contracts.js?v={Path(__file__).with_name("ui_contracts.js").stat().st_mtime_ns}")'
+                            '.catch(error => reportFailure(error.message));</script></html>')
 
     @app.get("/__test/contracts.js", include_in_schema=False)
     def contracts_script():
@@ -110,7 +120,7 @@ def create_harness(directory):
     def responsive():
         return HTMLResponse('''<!doctype html><html lang="en"><title>Responsive UI checks</title>
 <style>body{margin:8px;font:14px system-ui}iframe{display:block;border:1px solid #999;margin-top:8px}</style>
-<label>Width <select id="width"><option>1280</option><option>1092</option><option>768</option><option>390</option></select></label>
+<label>Width <select id="width"><option>1280</option><option>1092</option><option>768</option><option>390</option><option>320</option></select></label>
 <label>Page <select id="page"><option value="jobs">Jobs</option><option value="activity">Activity</option><option value="settings">Settings</option></select></label>
 <iframe title="Connected UI at selected width" width="1280" height="928" src="/#jobs"></iframe>
 <script>const frame=document.querySelector('iframe');

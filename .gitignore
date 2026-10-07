@@ -40,10 +40,11 @@ env/
 AGENTS.md
 **/AGENTS.md
 .agents/
-*
 *-plan.md
 *-issues.md
 *-overview.md
+*/implementation-plans/
+docs/
 
 # OS
 .DS_Store

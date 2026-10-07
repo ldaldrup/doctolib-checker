@@ -1,6 +1,6 @@
 import { previewText } from "../message-content.js";
 import { api } from "../api.js";
-import { escapeHtml as h, icon } from "../ui.js";
+import { escapeHtml as h, icon, applyFieldErrors } from "../ui.js";
 
 const blank = () => ({type: "telegram", name: "", enabled: true, token_action: "replace", bot_token: "", chat_action: "replace", chat_id: "", recipient_action: 'replace', recipient: '', endpoint_action: "replace", endpoint: "", auth_type: "none", auth_action: "clear", auth_token: "", auth_username: "", auth_password: "", ntfy_priority: 3, recover_failed: false});
 const typeLabel = type => ({telegram: "Telegram", ntfy: "ntfy", webhook: "HTTPS webhook", email: 'Email'}[type] || "Telegram");
@@ -9,6 +9,7 @@ const credentialsChanged = draft => (draft.type === 'telegram' ? [draft.token_ac
 const destinationSummary = channel => channel.type === 'email' ? channel.recipient_set ? 'Recipient saved' : 'Recipient not set' : channel.type === 'telegram' || !channel.type ? channel.chat_id_masked || 'Recipient not set' : channel.endpoint_host || 'Endpoint not set';
 const errorText = error => error?.message || "The request failed.";
 const terminal = status => ["sent", "failed", "unknown", "cancelled"].includes(status);
+const draftFrom = channel => channel ? {...blank(), type: channel.type || "telegram", name: channel.name, enabled: channel.enabled, auth_type: channel.auth_type || "none", ntfy_priority: channel.ntfy_priority || 3, token_action: "keep", chat_action: "keep", recipient_action: 'keep', endpoint_action: "keep", auth_action: "keep"} : blank();
 export function renderChannels(state) {
   const ui = state.channelUI || {}, channels = state.channels || [], draft = ui.draft;
   const locked = Boolean(ui.busy || ui.createAttempt || ui.conflictBlocked);
@@ -16,8 +17,8 @@ export function renderChannels(state) {
   return `<section class="panel" id="channel-settings" aria-labelledby="notification-heading"><div class="panel-header">${icon("bellActive")}<div><h2 id="notification-heading">Notification channels</h2><p>Save named destinations, then choose them on each job.</p></div></div>
     ${unavailable ? '<p class="notice notice-warning">The server notification encryption key is unavailable. An operator must configure NOTIFICATION_SECRET_KEY before saving credentials.</p>' : ""}
     ${state.settings?.legacy_telegram_available && !state.settings?.legacy_telegram_imported ? `<p class="notice"><span>Legacy environment Telegram settings are available. Import once as Telegram1 and map existing opted-in jobs.</span><button type="button" class="text-button" data-action="import-telegram" ${ui.busy || unavailable ? "disabled" : ""}>Import Telegram1</button></p>` : ""}
-    ${ui.error ? `<p class="form-error" role="alert">${h(errorText(ui.error))}</p>` : ""}
-    ${state.channels === null ? '<p>Loading saved channels…</p>' : channels.length ? channels.map(channel => `<div class="settings-row" data-channel-id="${h(channel.id)}"><div><h3>${h(channel.name)}</h3><p>${h(typeLabel(channel.type))} · ${channel.enabled ? channel.usable ? "Ready" : "Incomplete" : "Disabled"} · ${h(destinationSummary(channel))}</p>${ui.tests?.[channel.id] ? `<p role="status">${h(testFeedback(ui.tests[channel.id], channel.type))}</p><button type="button" class="text-button" data-action="channel-test-status">${ui.tests[channel.id].uncertain ? "Retry same test request" : "Check test status"}</button>` : ""}</div><div class="settings-control"><button class="text-button" type="button" data-action="edit-channel" ${locked || draft ? "disabled" : ""}>Edit</button><button class="text-button" type="button" data-action="preview-channel" ${ui.busy ? "disabled" : ""}>Preview</button><button class="text-button" type="button" data-action="test-channel" ${ui.busy || !channel.enabled || !channel.usable || ui.testAttempts?.[channel.id] ? "disabled" : ""}>Send test</button><button class="text-button" type="button" data-action="delete-channel" ${locked || draft ? "disabled" : ""}>Delete</button></div></div>`).join("") : '<p class="muted">No saved notification channels. Jobs can still check with notifications off.</p>'}
+    ${ui.error ? `<p id="channel-form-error" class="form-error" role="alert" tabindex="-1">${h(errorText(ui.error))}</p>` : ""}
+    ${state.channels === null ? '<p>Loading saved channels…</p>' : channels.length ? channels.map(channel => `<div class="settings-row" data-channel-id="${h(channel.id)}"><div><h3>${h(channel.name)}</h3><p>${h(typeLabel(channel.type))} · ${channel.enabled ? channel.usable ? "Ready" : "Incomplete" : "Disabled"} · ${h(destinationSummary(channel))}</p>${ui.tests?.[channel.id] ? `<p role="status">${h(testFeedback(ui.tests[channel.id], channel.type))}</p><button type="button" class="text-button" data-action="channel-test-status" aria-label="${h((ui.tests[channel.id].uncertain ? 'Retry same test request for ' : 'Check test status for ') + channel.name)}">${ui.tests[channel.id].uncertain ? "Retry same test request" : "Check test status"}</button>` : ""}</div><div class="settings-control"><button class="text-button" type="button" data-action="edit-channel" aria-label="${h('Edit ' + channel.name)}" ${locked || draft ? "disabled" : ""}>Edit</button><button class="text-button" type="button" data-action="preview-channel" aria-label="${h('Preview ' + channel.name)}" ${ui.busy ? "disabled" : ""}>Preview</button><button class="text-button" type="button" data-action="test-channel" aria-label="${h('Send test to ' + channel.name)}" ${ui.busy || !channel.enabled || !channel.usable || ui.testAttempts?.[channel.id] ? "disabled" : ""}>Send test</button><button class="text-button" type="button" data-action="delete-channel" aria-label="${h('Delete ' + channel.name)}" ${locked || draft ? "disabled" : ""}>Delete</button></div></div>`).join("") : '<p class="muted">No saved notification channels. Jobs can still check with notifications off.</p>'}
     ${ui.preview ? `<div class="notice"><div><h3>Synthetic notification preview</h3><p>Saved Settings content. No appointment data or message is sent.</p><pre class="channel-preview">${h(ui.preview)}</pre><button class="text-button" type="button" data-action="close-channel-preview">Close preview</button></div></div>` : ""}
     ${draft ? `<form id="channel-form" class="channel-form" autocomplete="off" aria-busy="${Boolean(ui.busy)}"><h3>${ui.original ? `Edit ${h(ui.original.name)}` : "New notification channel"}</h3><fieldset ${locked ? "disabled" : ""}><div class="field"><label for="channel-name">Name</label><input class="input" id="channel-name" name="name" maxlength="120" value="${h(draft.name)}" required></div><label class="checkbox-line"><span>Enabled</span><input name="enabled" type="checkbox" ${draft.enabled ? "checked" : ""}></label>
       ${ui.original ? `<p>${h(typeLabel(draft.type))}. To change type, create another channel.</p>` : `<div class="field"><label for="channel-type">Type</label><select class="select" id="channel-type" name="type">${["telegram", "ntfy", "webhook", 'email'].map(type => `<option value="${type}" ${draft.type === type ? "selected" : ""}>${typeLabel(type)}</option>`).join("")}</select></div>`}
@@ -43,10 +44,28 @@ function testFeedback(test, type = "telegram") {
   const status = {queued: "Test queued", running: "Test send in progress", sent: type === "telegram" ? "Test delivered" : type === 'email' ? 'Test accepted by SMTP server; inbox delivery is not confirmed' : "Test accepted by endpoint", failed: "Test failed", unknown: "Test outcome unknown; it may have been delivered. No automatic resend.", cancelled: "Test cancelled"}[test.status] || "Test status unavailable";
   return `${status}${test.error_code ? ` (${test.error_code})` : ""}${test.pollError ? "; status lookup failed, check again." : ""}${test.pollStopped ? "; automatic status polling stopped, check again." : ""}`;
 }
-export function channelController(state, {render, announce, refreshJobs, onLoad}) {
+export function channelController(state, {render, announce, refreshJobs, onLoad, confirmDiscard, preserveFocus}) {
   state.channels = null;
   state.channelUI = {draft: null, original: null, busy: false, error: null, tests: {}, testAttempts: {}};
   const ui = state.channelUI;
+  const hasUnsavedChanges = () => Boolean(ui.busy || ui.createAttempt || ui.updateUncertain || ui.importUncertain || Object.keys(ui.testAttempts).length || (ui.draft && JSON.stringify(ui.draft) !== JSON.stringify(ui.baseline)));
+  const canDiscard = () => {
+    if (ui.busy || ui.createAttempt || (ui.updateUncertain && !ui.latest)) {
+      announce('Resolve the uncertain channel request before discarding this draft.', 'warning');
+      return false;
+    }
+    return !ui.draft || JSON.stringify(ui.draft) === JSON.stringify(ui.baseline) || confirmDiscard('Discard unsaved notification channel changes?');
+  };
+  const returnFocus = id => {
+    const row = [...document.querySelectorAll('[data-channel-id]')].find(node => node.dataset.channelId === id);
+    (row?.querySelector('[data-action="edit-channel"]') || document.querySelector('[data-action="new-channel"]'))?.focus();
+  };
+  const showError = () => {
+    const form = document.getElementById('channel-form'), output = document.getElementById('channel-form-error');
+    const aliases = Object.fromEntries(Object.entries(secretActions).flatMap(([action, fields]) => fields.map(field => [field,
+      form?.elements[field]?.matches(':disabled') ? action : field])));
+    if (form) applyFieldErrors(form, ui.error, output, aliases); else output?.focus();
+  };
   const readDraft = form => {
     const data = new FormData(form);
     return {...ui.draft, name: String(data.get("name") || ""), enabled: data.has("enabled"), type: data.get("type") || ui.original?.type || ui.draft.type,
@@ -59,11 +78,12 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
     if (!node) return;
     // Normal refreshes preserve mounted credential controls and their in-memory draft.
     if (ui.draft && document.getElementById("channel-form")) return;
-    node.outerHTML = renderChannels(state);
+    preserveFocus(() => { node.outerHTML = renderChannels(state); });
   };
   async function load() {
     try {
       const saved = await api.listChannels(); state.channels = Array.isArray(saved) ? saved : saved.items;
+      if (state.settings?.legacy_telegram_imported) ui.importUncertain = false;
       for (const channel of state.channels) if (channel.latest_test && !ui.testAttempts[channel.id]) ui.tests[channel.id] = channel.latest_test;
     }
     catch (error) { ui.error = error; mount(); return false; }
@@ -71,8 +91,10 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
   }
   function edit(channel) {
     ui.original = channel ? structuredClone(channel) : null;
-    ui.draft = channel ? {...blank(), type: channel.type || "telegram", name: channel.name, enabled: channel.enabled, auth_type: channel.auth_type || "none", ntfy_priority: channel.ntfy_priority || 3, token_action: "keep", chat_action: "keep", recipient_action: 'keep', endpoint_action: "keep", auth_action: "keep"} : blank();
-    ui.error = null; ui.latest = null; ui.conflictBlocked = false; render();
+    ui.draft = draftFrom(channel);
+    ui.baseline = structuredClone(ui.draft);
+    ui.error = null; ui.latest = null; ui.conflictBlocked = false; ui.updateUncertain = false; render();
+    document.getElementById('channel-name')?.focus();
   }
   async function submit(form, replay = false) {
     if (ui.busy || ui.conflictBlocked || (ui.createAttempt && !replay)) return;
@@ -91,6 +113,7 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
       if (!ui.original) delete payload.recover_failed;
     }
     const original = ui.original;
+    const focusChannelId = original?.id;
     const attempt = ui.createAttempt || (!original ? {key: crypto.randomUUID(), payload: structuredClone(payload)} : null);
     ui.busy = true; ui.error = null; render();
     try {
@@ -102,12 +125,15 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
       ui.error = error;
       if (!original && error.ambiguous) ui.createAttempt = attempt;
       if (!original && !error.ambiguous) ui.createAttempt = null;
-      if (original && error.status === 409) {
-        ui.conflictBlocked = true;
+      if (original && (error.status === 409 || error.ambiguous)) {
+        ui.conflictBlocked = true; ui.updateUncertain = Boolean(error.ambiguous);
         ui.latest = null;
         if (await load()) ui.latest = state.channels.find(item => item.id === original.id);
       }
-    } finally { ui.busy = false; render(); }
+    } finally {
+      ui.busy = false; render();
+      if (ui.error) showError(); else if (!ui.draft) returnFocus(focusChannelId);
+    }
   }
   async function poll(channelId, operationId, turn = 0) {
     try {
@@ -125,21 +151,33 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
     const channelId = control.closest("[data-channel-id]")?.dataset.channelId;
     const channel = state.channels?.find(item => item.id === channelId);
     if (action === "close-channel-preview") { ui.preview = null; render(); return true; }
-    if (action === "new-channel") { if (!ui.busy && !ui.createAttempt) edit(); return true; }
-    if (action === "edit-channel") { if (!ui.busy && !ui.createAttempt && channel) edit(channel); return true; }
-    if (action === "cancel-channel") { if (!ui.busy && !ui.createAttempt) { ui.draft = null; ui.original = null; ui.conflictBlocked = false; ui.error = null; render(); } return true; }
+    if (action === "new-channel") { const allowed = canDiscard(); if (allowed === true || await allowed) edit(); return true; }
+    if (action === "edit-channel") { if (channel) { const allowed = canDiscard(); if (allowed === true || await allowed) edit(channel); } return true; }
+    if (action === "cancel-channel") {
+      const allowed = canDiscard();
+      if (allowed === true || await allowed) {
+        const id = ui.original?.id;
+        ui.draft = null; ui.original = null; ui.conflictBlocked = false; ui.updateUncertain = false; ui.error = null; ui.latest = null;
+        render(); returnFocus(id);
+      }
+      return true;
+    }
     if (action === "retry-channel-create") { await submit(null, true); return true; }
     if (action === "refetch-channel") { ui.latest = null; if (await load()) ui.latest = state.channels?.find(item => item.id === ui.original?.id); render(); return true; }
-    if (action === "use-server-channel") { edit(ui.latest); return true; }
+    if (action === "use-server-channel") { if (ui.latest) { const allowed = canDiscard(); if (allowed === true || await allowed) edit(ui.latest); } return true; }
     if (action === "reconcile-channel") {
-      if (!document.getElementById("channel-conflict-confirm")?.checked) { announce("Confirm that you reviewed the saved configuration."); return true; }
-      ui.original = structuredClone(ui.latest); ui.latest = null; ui.conflictBlocked = false; ui.error = null; render(); return true;
+      if (!document.getElementById("channel-conflict-confirm")?.checked) { announce("Confirm that you reviewed the saved configuration.", "warning"); return true; }
+      if (!ui.latest) return true;
+      ui.original = structuredClone(ui.latest); ui.baseline = draftFrom(ui.latest); ui.latest = null; ui.conflictBlocked = false; ui.updateUncertain = false; ui.error = null; render(); return true;
     }
     if (ui.busy) return true;
     ui.busy = true; ui.error = null; render();
     try {
       if (action === "import-telegram") {
-        ui.importKey ||= crypto.randomUUID(); await api.importLegacyChannel(ui.importKey); announce("Legacy Telegram1 imported."); await load(); await refreshJobs();
+        ui.importKey ||= crypto.randomUUID();
+        try { await api.importLegacyChannel(ui.importKey); ui.importUncertain = false; }
+        catch (error) { ui.importUncertain = Boolean(error.ambiguous); throw error; }
+        announce("Legacy Telegram1 imported."); await load(); await refreshJobs();
       } else if (channel && action === "preview-channel") {
         const preview = await api.channelPreview(channel.id);
         ui.preview = previewText(preview);
@@ -161,12 +199,14 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
         }
       }
     } catch (error) { ui.error = error; }
-    finally { ui.busy = false; render(); }
+    finally { ui.busy = false; render(); if (ui.error) showError(); }
     return true;
   }
   function input(event) {
     if (!event.target.closest("#channel-form")) return false;
     if (ui.busy || ui.createAttempt || ui.conflictBlocked) return true;
+    ui.error = null;
+    applyFieldErrors(document.getElementById('channel-form'), null, document.getElementById('channel-form-error'));
     ui.draft = readDraft(document.getElementById("channel-form"));
     if (["type", "auth_type"].includes(event.target.name)) {
       if (event.target.name === "type") ui.draft = {...blank(), name: ui.draft.name, enabled: ui.draft.enabled, type: event.target.value};
@@ -182,5 +222,5 @@ export function channelController(state, {render, announce, refreshJobs, onLoad}
     }
     return true;
   }
-  return {load, click, input, submit};
+  return {load, click, input, submit, hasUnsavedChanges};
 }
