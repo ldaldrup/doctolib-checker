@@ -1,5 +1,5 @@
 import { api } from '../api.js';
-import { escapeHtml as h, icon } from '../ui.js';
+import { escapeHtml as h, icon, applyFieldErrors } from '../ui.js';
 
 const secrets = ['sender_email', 'username', 'password'];
 const draftFrom = saved => ({enabled: saved.enabled, host: saved.host || '', port: saved.port || 587,
@@ -8,7 +8,7 @@ const draftFrom = saved => ({enabled: saved.enabled, host: saved.host || '', por
 export function renderSmtp(state) {
   const ui = state.smtpUI || {}, saved = state.smtp, draft = ui.draft || (saved && draftFrom(saved));
   return `<section class="panel" id="smtp-settings" aria-labelledby="smtp-heading"><div class="panel-header">${icon('send')}<div><h2 id="smtp-heading">Email transport</h2><p>One SMTP connection serves all named email recipients.</p></div></div>
-    ${ui.loadError ? `<p class="form-error" role="alert">${h(ui.loadError.message)}</p>` : ui.error ? `<p class="form-error" role="alert">${h(ui.error.message)}</p>` : ''}
+    ${ui.loadError || ui.error ? `<p id="smtp-form-error" class="form-error" role="alert" tabindex="-1">${h((ui.loadError || ui.error).message)}</p>` : ''}
     ${!draft ? '<p>Loading SMTP configuration…</p><button type="button" class="text-button" data-action="smtp-refresh">Retry</button>' : `<form id="smtp-form" class="channel-form" autocomplete="off"><fieldset ${ui.busy || ui.blocked ? 'disabled' : ''}>
       <label class="checkbox-line"><span>Enable email delivery</span><input name="enabled" type="checkbox" ${draft.enabled ? 'checked' : ''}></label>
       <div class="field"><label for="smtp-host">SMTP host</label><input class="input" id="smtp-host" name="host" maxlength="253" value="${h(draft.host)}"></div>
@@ -21,19 +21,28 @@ export function renderSmtp(state) {
       <button class="button button-primary" type="submit" ${ui.busy || ui.blocked || (!state.settings?.notification_secret_configured && (draft.enabled || secrets.some(field => draft[field + '_action'] === 'replace'))) ? 'disabled' : ''}>${ui.busy ? 'Saving…' : 'Save SMTP transport'}</button><button type="button" class="button button-secondary" data-action="smtp-cancel" ${ui.busy ? 'disabled' : ''}>Discard draft</button>
     </form>`}</section>`;
 }
-export function smtpController(state, {render, announce, refreshJobs}) {
+export function smtpController(state, {render, announce, refreshJobs, confirmDiscard, preserveFocus}) {
   state.smtp = null; state.smtpUI = {draft: null, busy: false, error: null, loadError: null};
   const ui = state.smtpUI;
+  const dirty = () => Boolean(ui.draft && state.smtp && JSON.stringify(ui.draft) !== JSON.stringify(draftFrom(state.smtp)));
+  const hasUnsavedChanges = () => Boolean(ui.busy || ui.uncertain || dirty());
+  const showError = () => {
+    const form = document.getElementById('smtp-form'), output = document.getElementById('smtp-form-error');
+    const aliases = Object.fromEntries(secrets.map(field => [field, form?.elements[field]?.matches(':disabled') ? field + '_action' : field]));
+    if (form) applyFieldErrors(form, ui.loadError || ui.error, output, aliases); else output?.focus();
+  };
   const read = form => { const data = new FormData(form); return {enabled: data.has('enabled'), host: String(data.get('host') || '').trim(), port: Number(data.get('port')), tls_mode: data.get('tls_mode'), sender_name: String(data.get('sender_name') || '').trim(), ...Object.fromEntries(secrets.flatMap(field => [[field, String(data.get(field) || '')], [field + '_action', data.get(field + '_action')]])), recover_failed: data.has('recover_failed')}; };
   async function load() {
     try { const saved = await api.getSmtp(); ui.loadError = null; if (ui.blocked) ui.latest = saved; else if (!ui.draft && !ui.busy) state.smtp = saved; }
     catch (error) { ui.loadError = error; }
     const node = document.getElementById('smtp-settings');
-    if (node && !ui.draft && !ui.busy) node.outerHTML = renderSmtp(state);
+    if (node && !ui.draft && !ui.busy) preserveFocus(() => { node.outerHTML = renderSmtp(state); });
   }
   function input(event) {
     if (!event.target.closest('#smtp-form')) return false;
     if (ui.busy || ui.blocked) return true;
+    ui.error = null;
+    applyFieldErrors(document.getElementById('smtp-form'), null, document.getElementById('smtp-form-error'));
     if (['username_action', 'password_action'].includes(event.target.name)) {
       const form = document.getElementById('smtp-form'), other = event.target.name === 'username_action' ? 'password_action' : 'username_action';
       const otherAction = form.elements[other];
@@ -86,15 +95,21 @@ export function smtpController(state, {render, announce, refreshJobs}) {
       }
       ui.draft = null; announce('SMTP transport saved.'); await refreshJobs();
     }
-    catch (error) { ui.error = error; if (error.status === 409 || error.ambiguous) { ui.blocked = true; ui.latest = null; await load(); } }
-    finally { ui.busy = false; render(); }
+    catch (error) { ui.error = error; if (error.status === 409 || error.ambiguous) { ui.blocked = true; ui.uncertain = Boolean(error.ambiguous); ui.latest = null; await load(); } }
+    finally { ui.busy = false; render(); if (ui.error) showError(); }
   }
   async function click(control) {
     const action = control.dataset.action;
     if (ui.busy) return;
     if (action === 'smtp-refresh') { await load(); render(); }
-    if (action === 'smtp-cancel' || action === 'smtp-use-saved') { if (ui.latest) state.smtp = ui.latest; ui.draft = null; ui.blocked = false; ui.error = null; ui.latest = null; await load(); render(); }
-    if (action === 'smtp-apply' && ui.latest) { if (!document.getElementById('smtp-review-confirm')?.checked) { announce('Confirm that you reviewed the saved configuration.'); return; } state.smtp = ui.latest; ui.latest = null; ui.blocked = false; ui.error = null; render(); }
+    if (action === 'smtp-cancel' || action === 'smtp-use-saved') {
+      if (ui.uncertain && !ui.latest) { announce('Fetch the saved SMTP configuration before discarding an uncertain request.', 'warning'); return; }
+      if (dirty() && !await confirmDiscard('Discard unsaved SMTP changes?')) return;
+      if (ui.latest) state.smtp = ui.latest;
+      ui.draft = null; ui.blocked = false; ui.uncertain = false; ui.error = null; ui.latest = null;
+      await load(); render(); document.getElementById('smtp-host')?.focus();
+    }
+    if (action === 'smtp-apply' && ui.latest) { if (!document.getElementById('smtp-review-confirm')?.checked) { announce('Confirm that you reviewed the saved configuration.', 'warning'); return; } state.smtp = ui.latest; ui.latest = null; ui.blocked = false; ui.uncertain = false; ui.error = null; render(); }
   }
-  return {load,input,submit,click};
+  return {load,input,submit,click,hasUnsavedChanges};
 }

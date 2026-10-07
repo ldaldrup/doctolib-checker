@@ -1,11 +1,6 @@
-import {badge, escapeHtml as h, formatSlot, icon} from "../ui.js";
+import {badge, escapeHtml as h, formatDateTime, formatSlot, icon} from "../ui.js";
 
-const when = value => {
-  const date = new Date(value || "");
-  return Number.isFinite(date.getTime())
-    ? `${new Intl.DateTimeFormat("en-GB", {dateStyle: "medium", timeStyle: "short", timeZone: "UTC"}).format(date)} UTC`
-    : "Not recorded";
-};
+const when = (value, zone = "UTC") => value ? formatDateTime(value, zone) : "Not recorded";
 const runOutcomes = {running: "In progress", yielded: "Continuation queued", completed: "Completed", partial_error: "Partial errors", error: "Failed", interrupted: "Interrupted"};
 const errorTypes = {budget_exceeded: "Target check time budget exceeded; partial availability was discarded", upstream_rejected: "Doctolib rejected the request", throttled: "Rate limited by Doctolib", upstream_error: "Doctolib returned an error", timeout: "Request timed out", connectivity: "Could not reach Doctolib", invalid_metadata: "Booking metadata could not be resolved", malformed_response: "Invalid availability response", incomplete_response: "Availability response was incomplete", unknown: "Check failed for an unknown reason"};
 const reasonText = code => typeof code === "string" && /^[A-Za-z0-9_]{1,80}$/.test(code) ? code.replaceAll("_", " ") : "";
@@ -44,13 +39,13 @@ function deliveryStatus(delivery) {
 
 function renderDelivery(delivery, run) {
   const [label, tone] = deliveryStatus(delivery), reason = reasonText(delivery.reason_code);
-  const eligible = delivery.next_eligible_at ? ` · Next eligible ${when(delivery.next_eligible_at)}` : "";
+  const eligible = delivery.next_eligible_at ? ` · Next eligible ${when(delivery.next_eligible_at, run.time_zone || "UTC")}` : "";
   const origin = delivery.originating_run_id && delivery.originating_run_id !== run.id
     ? `<a href="${runUrl(run.job_id, delivery.originating_run_id)}">Observed in run ${h(delivery.originating_run_id.slice(0, 8))}</a>`
     : "Observed in this run";
   const confirmation = delivery.confirmation_run_id && delivery.confirmation_run_id !== delivery.originating_run_id
     ? ` · <a href="${runUrl(run.job_id, delivery.confirmation_run_id)}">Confirmed by run ${h(delivery.confirmation_run_id.slice(0, 8))}</a>` : "";
-  const acceptedAt = delivery.accepted_at ? ` · Accepted ${when(delivery.accepted_at)}` : "";
+  const acceptedAt = delivery.accepted_at ? ` · Accepted ${when(delivery.accepted_at, run.time_zone || "UTC")}` : "";
   return `<li class="activity-delivery">${badge(label, tone)} <strong>${h(delivery.channel_name || "Notification destination")}</strong><span>${h(delivery.attempts)} attempt${delivery.attempts === 1 ? "" : "s"}${acceptedAt}${h(eligible)}</span>${reason ? `<small>Reason: ${h(reason)}</small>` : ""}<small>${origin}${confirmation}</small></li>`;
 }
 
@@ -68,7 +63,7 @@ function renderResult(result, run) {
   else if (result.status === "available") summary = "Availability found; total count is incomplete";
   else if (result.status === "no_availability" && result.count_complete) summary = "No appointments in this target’s search window";
   else if (result.status === "no_availability") summary = "No complete availability count recorded";
-  return `<li class="activity-target"><div class="activity-target-head"><div><h4>${h(name)}</h4><small>${h(when(result.checked_at))}${result.target_removed ? " · Removed from current job" : ""}</small></div>${badge(result.status === "error" ? "Check error" : result.status === "available" ? "Available" : "No availability", result.status === "error" ? "warning" : result.status === "available" ? "success" : "paused")}</div><p>${h(summary)}${result.upstream_status ? ` (HTTP ${h(result.upstream_status)})` : ""}</p>${historical ? '<small class="activity-historical">Historical evidence only; not current published availability.</small>' : ""}${result.retry_at ? `<small>Retry after ${h(when(result.retry_at))}</small>` : ""}${result.deliveries?.length ? `<ul class="activity-deliveries" aria-label="Notification destinations">${result.deliveries.map(item => renderDelivery(item, run)).join("")}</ul>` : ""}</li>`;
+  return `<li class="activity-target"><div class="activity-target-head"><div><h4>${h(name)}</h4><small>${h(when(result.checked_at, run.time_zone || "UTC"))}${result.target_removed ? " · Removed from current job" : ""}</small></div>${badge(result.status === "error" ? "Check error" : result.status === "available" ? "Available" : "No availability", result.status === "error" ? "warning" : result.status === "available" ? "success" : "paused")}</div><p>${h(summary)}${result.upstream_status ? ` (HTTP ${h(result.upstream_status)})` : ""}</p>${historical ? '<small class="activity-historical">Historical evidence only; not current published availability.</small>' : ""}${result.retry_at ? `<small>Retry after ${h(when(result.retry_at, run.time_zone || "UTC"))}</small>` : ""}${result.deliveries?.length ? `<ul class="activity-deliveries" aria-label="Notification destinations">${result.deliveries.map(item => renderDelivery(item, run)).join("")}</ul>` : ""}</li>`;
 }
 
 function renderMissingTarget(target, run) {
@@ -90,7 +85,7 @@ function renderRun(run) {
     ? [...targets.map(target => resultByTarget.has(target.id) ? renderResult(resultByTarget.get(target.id), run) : renderMissingTarget(target, run)),
       ...results.filter(result => !knownTargets.has(result.target_id)).map(result => renderResult(result, run))]
     : results.map(result => renderResult(result, run));
-  return `<article class="panel activity-run" id="run-${h(run.id)}"><div class="panel-header activity-run-header"><div><p class="eyebrow">${h(run.triggered_by?.replaceAll("_", " ") || "Check")}${run.paused_manual ? " · one-time check while paused" : ""}</p><h2>${h(run.job_name || "Deleted job")}</h2></div><div>${badge(outcome, run.outcome === "completed" ? "success" : ["running", "yielded"].includes(run.outcome) ? "running" : "warning")}<small>${h(history)}</small></div></div><div class="panel-content"><dl class="activity-run-meta"><div><dt>Requested</dt><dd>${h(when(run.requested_at))}</dd></div><div><dt>Started</dt><dd>${h(when(run.started_at))}</dd></div><div><dt>Finished</dt><dd>${h(when(run.finished_at))}</dd></div><div><dt>Search revision</dt><dd>${run.search_revision == null ? "Unknown" : h(run.search_revision)}${run.current_search_revision == null ? "" : ` · current ${h(run.current_search_revision)}`}</dd></div></dl><p class="activity-coverage">${h(summary)}</p>${rows.length ? `<ul class="activity-targets">${rows.join("")}</ul>` : `<p class="notice" role="status">${["running", "yielded"].includes(run.outcome) ? "This run awaits target results; completed targets will be preserved between worker turns." : "No target results were saved for this run."}</p>`}</div></article>`;
+  return `<article class="panel activity-run" id="run-${h(run.id)}"><div class="panel-header activity-run-header"><div><p class="eyebrow">${h(run.triggered_by?.replaceAll("_", " ") || "Check")}${run.paused_manual ? " · one-time check while paused" : ""}</p><h2>${h(run.job_name || "Deleted job")}</h2></div><div>${badge(outcome, run.outcome === "completed" ? "success" : ["running", "yielded"].includes(run.outcome) ? "running" : "warning")}<small>${h(history)}</small></div></div><div class="panel-content"><dl class="activity-run-meta"><div><dt>Requested</dt><dd>${h(when(run.requested_at, run.time_zone || "UTC"))}</dd></div><div><dt>Started</dt><dd>${h(when(run.started_at, run.time_zone || "UTC"))}</dd></div><div><dt>Finished</dt><dd>${h(when(run.finished_at, run.time_zone || "UTC"))}</dd></div><div><dt>Search revision</dt><dd>${run.search_revision == null ? "Unknown" : h(run.search_revision)}${run.current_search_revision == null ? "" : ` · current ${h(run.current_search_revision)}`}</dd></div></dl><p class="activity-coverage">${h(summary)}</p>${rows.length ? `<ul class="activity-targets">${rows.join("")}</ul>` : `<p class="notice" role="status">${["running", "yielded"].includes(run.outcome) ? "This run awaits target results; completed targets will be preserved between worker turns." : "No target results were saved for this run."}</p>`}</div></article>`;
 }
 
 export function renderActivity(state) {

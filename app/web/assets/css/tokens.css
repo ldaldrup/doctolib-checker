@@ -2,7 +2,7 @@
   --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --color-primary: #006192;
-  --color-primary-hover: #0088ce;
+  --color-primary-hover: #005c8a;
   --color-primary-deep: #005c8a;
   --color-primary-soft: #e6f4fc;
   --color-ground: #f8f9fa;
@@ -13,8 +13,8 @@
   --color-text: #101828;
   --color-body: #344054;
   --color-muted: #667085;
-  --color-placeholder: #98a2b3;
-  --color-mint: #00a389;
+  --color-placeholder: #667085;
+  --color-mint: #00816d;
   --color-mint-dark: #005e4f;
   --color-mint-soft: #e6f7f4;
   --color-success: #12b76a;

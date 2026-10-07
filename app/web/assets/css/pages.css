@@ -8,11 +8,11 @@
 .search-wrap .input { padding-left: 36px; background: var(--color-ground); }
 .filter-controls { display: flex; align-items: center; gap: 8px; }
 .filter-tabs { display: flex; gap: 2px; padding: 4px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: #f7f8fa; }
-.filter-tabs button { display: inline-flex; align-items: center; gap: 5px; min-height: 32px; padding: 5px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--color-muted); font-size: 12px; font-weight: 500; white-space: nowrap; }
+.filter-tabs button { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 5px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--color-muted); font-size: 12px; font-weight: 500; white-space: nowrap; }
 .filter-tabs button[aria-pressed="true"] { background: #fff; color: var(--color-text); box-shadow: 0 1px 2px rgb(16 24 40 / 7%); }
 .filter-tabs .filter-slot { color: var(--color-mint-dark); }
 .filter-slot-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-mint); }
-.interval-filter { width: 120px; min-height: 40px; padding-block: 6px; background-color: var(--color-ground); font-size: 12px; }
+.interval-filter { width: 120px; min-height: 44px; padding-block: 6px; background-color: var(--color-ground); font-size: 12px; }
 .jobs-layout { display: grid; grid-template-columns: minmax(0, 8fr) minmax(300px, 4fr); align-items: start; gap: 24px; }
 .jobs-list { display: grid; gap: 16px; min-width: 0; }
 .job-card { overflow: hidden; }
@@ -21,10 +21,10 @@
 .job-hero-label { display: inline-flex; align-items: center; gap: 9px; line-height: 1.25; }
 .job-hero-label svg { width: 19px; height: 19px; }
 .job-hero-actions { display: flex; align-items: center; gap: 8px; }
-.slot-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border: 1px solid #9bded2; border-radius: 6px; background: var(--color-card); color: var(--color-mint-dark); font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.slot-pill { display: inline-flex; max-width: 100%; overflow-wrap: anywhere; align-items: center; gap: 6px; padding: 5px 8px; border: 1px solid #9bded2; border-radius: 6px; background: var(--color-card); color: var(--color-mint-dark); font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; white-space: normal; font-variant-numeric: tabular-nums; }
 .slot-pill svg { width: 16px; height: 16px; color: var(--color-mint); }
 .job-hero .button { background: var(--color-mint); }
-.job-hero .button:hover { background: #008772; }
+.job-hero .button:hover { background: #006d5c; }
 .job-body { padding: 20px; }
 .job-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .job-summary { flex: 1; min-width: 0; }
@@ -43,7 +43,7 @@
 .job-meta strong { color: var(--color-body); font-weight: 600; }
 .job-meta .meta-dot { color: var(--color-placeholder); }
 .job-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 3px; padding-top: 11px; }
-.job-actions .button { min-height: 32px; padding: 5px 8px; font-size: 12px; }
+.job-actions .button { min-height: 44px; padding: 5px 8px; font-size: 12px; }
 .job-actions svg { width: 15px; height: 15px; }
 .setup-panel { scroll-margin-top: 82px; }
 .setup-panel .panel-header { background: var(--color-card); }
@@ -55,11 +55,11 @@
 .form-section { display: grid; gap: 8px; }
 .form-section > .field-label { display: block; }
 .target-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.add-target { width: 100%; min-height: 34px; padding: 6px 10px; border: 1px dashed var(--color-input-border); background: var(--color-ground); color: var(--color-text); font-size: 12px; font-weight: 600; }
+.add-target { width: 100%; min-height: 44px; padding: 6px 10px; border: 1px dashed var(--color-input-border); background: var(--color-ground); color: var(--color-text); font-size: 12px; font-weight: 600; }
 .add-target:hover { border-color: var(--color-primary); background: var(--color-card); }
 .add-target svg { width: 16px; height: 16px; color: var(--color-primary); }
 .date-mode-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.date-mode-options label { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 7px 9px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-ground); color: var(--color-body); font-size: 12px; font-weight: 500; cursor: pointer; }
+.date-mode-options label { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 7px 9px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-ground); color: var(--color-body); font-size: 12px; font-weight: 500; cursor: pointer; }
 .date-mode-options label:has(input:focus-visible) { outline: 3px solid var(--color-primary-hover); outline-offset: 2px; }
 .date-mode-options input { width: 15px; height: 15px; margin: 0; accent-color: var(--color-primary); }
 .setup-form fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
@@ -85,11 +85,12 @@
 .settings-control .badge { font-size: 11px; }
 .settings-form { display: grid; gap: 22px; }
 .settings-form .panel-header, #channel-settings .panel-header { justify-content: flex-start; gap: 12px; }
-.settings-warning { position: absolute; left: calc(100% + 2px); top: 50%; transform: translateY(-50%); display: grid; place-items: center; width: 22px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--color-warning); }
+.settings-row:has(.settings-warning:not([hidden])) { padding-right: 72px; }
+.settings-warning { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--color-warning); }
 .settings-warning > svg { width: 16px; height: 16px; }
 .settings-warning-message { display: none; position: absolute; right: calc(100% + 4px); top: 50%; transform: translateY(-50%); width: max-content; max-width: min(260px, 70vw); padding: 7px 10px; border: 1px solid var(--color-border); border-radius: 5px; background: var(--color-card); color: var(--color-body); font-size: 12px; text-align: left; box-shadow: var(--shadow-card); z-index: 2; }
 .settings-warning:hover .settings-warning-message, .settings-warning:focus-visible .settings-warning-message { display: block; }
-@media (max-width: 767px) { .settings-warning { left: auto; right: -4px; } }
+@media (max-width: 767px) { .settings-warning { right: 8px; } }
 .settings-form .panel-header h2, #channel-settings .panel-header h2 { font-weight: 500; }
 .settings-form .panel-header > svg, #channel-settings .panel-header > svg { width: 20px; height: 20px; flex-shrink: 0; color: var(--color-primary); }
 .settings-interval { min-width: 0; margin: 0; padding: 0; border: 0; }
@@ -218,7 +219,7 @@
 .activity-target > p { margin: 8px 0; }
 .activity-historical { display: block; margin-bottom: 6px; }
 .activity-deliveries { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--color-border); }
-.activity-delivery { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 4px 9px; min-width: 0; }
+.activity-delivery { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: center; gap: 4px 9px; min-width: 0; }
 .activity-delivery > span:not(.badge), .activity-delivery small { grid-column: 2; color: var(--color-muted); font-size: 12px; overflow-wrap: anywhere; }
 .activity-delivery > strong { overflow-wrap: anywhere; }
 .activity-delivery a { display: inline-flex; align-items: center; min-height: 44px; padding-block: 8px; color: var(--color-primary-deep); text-decoration: underline; text-underline-offset: 2px; }
@@ -246,3 +247,9 @@
 .target-validation { color: var(--color-muted); }
 .target-repair .button, .target-repair .text-button { min-height: 44px; }
 .target-repair-result { margin-top: 8px; display: block; }
+
+.settings-control { flex-wrap: wrap; }
+.settings-control > .form-error { flex-basis: 100%; text-align: start; color: var(--color-danger); }
+#job-form-error, #settings-form-error { scroll-margin-top: 84px; }
+
+.settings-row .form-error { color: var(--color-danger); }

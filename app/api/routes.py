@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, Header, Body, status
 from requests import RequestException
+from curl_cffi import requests as curl_requests
 
 from app.api.schemas import TargetRevalidationRequest, JobCreateRequest, JobUpdateRequest, SettingsUpdateRequest, TargetValidationRequest, VersionedRequest, ChannelCreateRequest, ChannelUpdateRequest, ChannelDeleteRequest, SmtpTransportUpdateRequest, StrictRequest, NotificationPreviewRequest, ChannelTestRequest, QuietHoursPreviewRequest
 from app.notification_secrets import SecretUnavailable
@@ -15,8 +16,8 @@ from app.services.channel_tests import notification_preview
 from app.services.email_delivery import mailbox, smtp_transport_usable, validate_smtp_host
 from app.storage.channel_operations import SmtpImpactChangedError, channel_secret_columns
 from app.webhooks import validate_endpoint
-from app.doctolib import BookingUrlError, MetadataResolutionError, parse_booking_url
-from app.services.jobs import create_job, resolve_target, update_job, revalidate_target
+from app.doctolib import BookingUrlError, MetadataResolutionError, TargetBudgetExceeded, parse_booking_url
+from app.services.jobs import create_job, resolve_target, update_job, revalidate_target, metadata_client
 from app.services.jobs import validate_timezone
 from app.quiet_hours import next_release, validate_quiet_hours
 from app.storage.repositories import ConflictError, NotFoundError, VersionConflictError, CreateReservationLostError, iso, utc_now
@@ -52,8 +53,12 @@ def create_router():
             last_seen = utc_now() - datetime.fromisoformat(
                 heartbeat["last_seen_at"].replace("Z", "+00:00")
             )
-            # Availability requests refresh the polling worker heartbeat.
-            result["worker_alive"] = last_seen <= timedelta(seconds=90)
+            # A live worker cannot refresh while waiting within a target's
+            # budget or sleeping between scheduler ticks. This is liveness,
+            # not evidence that a check succeeded or made progress.
+            settings = request.app.state.settings
+            freshness = max(90, settings.target_budget_seconds + settings.check_interval_seconds)
+            result["worker_alive"] = last_seen <= timedelta(seconds=freshness)
         else:
             result["worker_alive"] = False
         dispatcher = result.get("dispatcher")
@@ -91,11 +96,13 @@ def create_router():
     def validate_target(body: TargetValidationRequest, request: Request):
         doctolib = request.app.state.doctolib
         try:
-            target = resolve_target(body.booking_url, doctolib)
+            with metadata_client(doctolib, request.app.state.settings) as guarded:
+                target = resolve_target(body.booking_url, guarded)
+                guarded.remaining_budget()
             parts = parse_booking_url(target["booking_url"])
         except (BookingUrlError, MetadataResolutionError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        except RequestException:
+        except (RequestException, curl_requests.exceptions.RequestException, TargetBudgetExceeded):
             raise HTTPException(status_code=502, detail="doctolib_unavailable")
         return {
             "valid": True,
@@ -155,7 +162,7 @@ def create_router():
         except (BookingUrlError, MetadataResolutionError, ValueError):
             outcome = fail_creation(repository, operation, "invalid_job", retryable=False)
             return creation_outcome(outcome, response, request)
-        except RequestException:
+        except (RequestException, curl_requests.exceptions.RequestException, TargetBudgetExceeded):
             outcome = fail_creation(repository, operation, "doctolib_unavailable", retryable=True)
             return creation_outcome(outcome, response, request)
 
@@ -216,7 +223,7 @@ def create_router():
             raise HTTPException(status_code=404, detail="job_not_found")
         except (BookingUrlError, MetadataResolutionError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        except RequestException:
+        except (RequestException, curl_requests.exceptions.RequestException, TargetBudgetExceeded):
             raise HTTPException(status_code=502, detail="doctolib_unavailable")
         if job is None:
             raise HTTPException(status_code=404, detail="job_not_found")

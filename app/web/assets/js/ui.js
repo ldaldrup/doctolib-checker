@@ -30,7 +30,7 @@ export function escapeHtml(value) {
 }
 
 export function formatInterval(seconds) {
-  if (!Number.isFinite(Number(seconds))) return "Unknown";
+  if (seconds == null || seconds === "" || !Number.isFinite(Number(seconds)) || Number(seconds) <= 0) return "Unknown";
   if (seconds % 3600 === 0) return `${seconds / 3600} hr`;
   if (seconds % 60 === 0) return `${seconds / 60} min`;
   return `${seconds} sec`;
@@ -46,29 +46,65 @@ export function relativeTime(iso) {
   return `${hours} hr ago`;
 }
 
-export function formatSlot(iso, zone = "Europe/Berlin") {
-  if (!iso) return "";
-  try {
-    const date = new Date(iso);
-    const day = new Intl.DateTimeFormat("de-DE", {
-      timeZone: zone, day: "2-digit", month: "2-digit", year: "numeric"
-    }).format(date);
-    const time = new Intl.DateTimeFormat("de-DE", {
-      timeZone: zone, hour: "2-digit", minute: "2-digit", hour12: false
-    }).format(date);
-    return `${day}, ${time}`;
-  } catch {
-    return new Date(iso).toLocaleString("de-DE", {
-      day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit"
-    });
-  }
+export function formatDateTime(value, zone = "Europe/Berlin", {seconds = false} = {}) {
+  if (value == null || value === "") return "Unknown time";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Unknown time";
+  const options = {timeZone: zone, day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+    ...(seconds ? {second: "2-digit"} : {})};
+  try { return `${new Intl.DateTimeFormat("en-GB", options).format(date)} (${zone})`; }
+  catch { return `${new Intl.DateTimeFormat("en-GB", {...options, timeZone: "UTC"}).format(date)} (UTC; time zone unavailable)`; }
 }
 
-export function formatGermanDate(iso) {
-  if (!iso) return "";
-  return new Intl.DateTimeFormat("de-DE", {
-    timeZone: "UTC", day: "2-digit", month: "2-digit", year: "numeric"
-  }).format(new Date(`${iso}T00:00:00Z`));
+export const formatSlot = (value, zone = "Europe/Berlin") => formatDateTime(value, zone);
+
+export function formatDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return "Unknown date";
+  const date = new Date(`${value}T00:00:00Z`);
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== value) return "Unknown date";
+  return new Intl.DateTimeFormat("en-GB", {timeZone: "UTC", day: "2-digit", month: "short", year: "numeric"}).format(date);
+}
+
+export function applyFieldErrors(form, error, output, aliases = {}, {focus = true} = {}) {
+  if (!form) return null;
+  for (const input of form.querySelectorAll("[data-field-error-id]")) {
+    const ids = input.dataset.fieldErrorId.split(/\s+/);
+    const descriptions = (input.getAttribute("aria-describedby") || "").split(/\s+/).filter(value => value && !ids.includes(value));
+    if (descriptions.length) input.setAttribute("aria-describedby", descriptions.join(" ")); else input.removeAttribute("aria-describedby");
+    input.removeAttribute("aria-invalid"); delete input.dataset.fieldErrorId;
+  }
+  form.querySelectorAll("[data-generated-field-error]").forEach(node => node.remove());
+  form.querySelectorAll("[data-error-for]").forEach(node => { node.hidden = true; node.textContent = ""; });
+  if (output) { output.hidden = !error; output.textContent = error?.message || "Check the supplied values."; output.tabIndex = -1; }
+  if (!error) return null;
+  let first = null;
+  let index = 0;
+  for (const [field, message] of Object.entries(error.fields || {})) {
+    const parts = field.split("."), base = parts[0];
+    const names = aliases[field] || aliases[base] || base;
+    let controls = [...form.elements].filter(input => input.name && (Array.isArray(names) ? names.includes(input.name) : input.name === names));
+    if (/^\d+$/.test(parts[1] || "")) controls = controls.slice(Number(parts[1]), Number(parts[1]) + 1);
+    if (!controls.length) continue;
+    let notice = [...form.querySelectorAll("[data-error-for]")].find(node => node.dataset.errorFor === base);
+    if (!notice) {
+      notice = document.createElement("p"); notice.className = "form-error"; notice.dataset.generatedFieldError = "";
+      (controls[0].closest(".field, .settings-control, .checkbox-line, .target-entry, fieldset") || controls[0].parentElement).append(notice);
+    }
+    notice.id ||= `${form.id || "form"}-field-error-${index++}`;
+    notice.textContent = String(message); notice.hidden = false;
+    for (const input of controls) {
+      input.setAttribute("aria-invalid", "true");
+      input.dataset.fieldErrorId = [...new Set([...(input.dataset.fieldErrorId || "").split(/\s+/).filter(Boolean), notice.id])].join(" ");
+      const descriptions = new Set((input.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean));
+      descriptions.add(notice.id); input.setAttribute("aria-describedby", [...descriptions].join(" "));
+      if (!first && !input.matches(":disabled") && input.type !== "hidden" && !input.closest("[hidden]")) first = input;
+    }
+  }
+  if (first && focus) {
+    for (let parent = first.parentElement; parent && parent !== form; parent = parent.parentElement) if (parent.tagName === "DETAILS") parent.open = true;
+    first.focus();
+  } else if (focus) output?.focus();
+  return first;
 }
 
 export function badge(label, kind = "") {
